@@ -1,0 +1,12 @@
+prefix=/tmp/sattool/android/deps/output/armeabi-v7a
+exec_prefix=/tmp/sattool/android/deps/output/armeabi-v7a
+libdir=/tmp/sattool/android/deps/output/armeabi-v7a/lib
+includedir=/tmp/sattool/android/deps/output/armeabi-v7a/include/libpng16
+
+Name: libpng
+Description: Loads and saves PNG files
+Version: 1.6.43
+Requires.private: zlib
+Libs: -L${libdir} -lpng16
+Libs.private: -lz -lm
+Cflags: -I${includedir}

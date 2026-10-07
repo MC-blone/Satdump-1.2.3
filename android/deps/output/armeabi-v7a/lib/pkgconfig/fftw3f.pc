@@ -1,0 +1,11 @@
+prefix=/tmp/sattool/android/deps/output/armeabi-v7a
+exec_prefix=/tmp/sattool/android/deps/output/armeabi-v7a
+libdir=/tmp/sattool/android/deps/output/armeabi-v7a/lib
+includedir=/tmp/sattool/android/deps/output/armeabi-v7a/include
+
+Name: FFTW
+Description: fast Fourier transform library
+Version: 3.3.9
+Libs: -L${libdir} -lfftw3f 
+Libs.private: -lm
+Cflags: -I${includedir}
