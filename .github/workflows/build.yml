@@ -1,0 +1,107 @@
+name: Build Old SatDump Android
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  SOURCE_COMMIT: 9a9eefdbdbf9192a0d35078f172bc84cdd4f3cda
+  DEPS_REPO: https://github.com/MC-blone/Satdump-1.2.3.git
+  DEPS_BRANCH: Build-temp
+
+permissions:
+  contents: write
+
+jobs:
+  build_android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout SatDump at specified commit
+        uses: actions/checkout@v4
+        with:
+          repository: SatDump/SatDump
+          ref: ${{ env.SOURCE_COMMIT }}
+          submodules: recursive
+
+      - name: Show repository structure
+        run: |
+          echo "===== root ====="
+          ls -la
+          echo "===== android/ ====="
+          ls -la android/ || true
+          echo "===== android/deps/ ====="
+          ls -la android/deps/ || true
+          echo "===== android/app/ ====="
+          ls -la android/app/ || true
+
+      - name: Restore android/deps from Build-temp
+        shell: bash
+        run: |
+          set -e
+          git clone --no-checkout --depth 1 --branch "$DEPS_BRANCH" "$DEPS_REPO" /tmp/deps-cache
+          cd /tmp/deps-cache
+          git checkout "$DEPS_BRANCH" -- android/deps
+          mkdir -p "$GITHUB_WORKSPACE/android"
+          rm -rf "$GITHUB_WORKSPACE/android/deps"
+          cp -r android/deps "$GITHUB_WORKSPACE/android/deps"
+          rm -rf /tmp/deps-cache
+          echo "===== restored deps lib/ ====="
+          ls -la "$GITHUB_WORKSPACE/android/deps/output/arm64-v8a/lib/" | head -30 || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK / NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;30.0.3'
+
+      - name: Install NDK
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if sdkmanager 'ndk;25.2.9519653'; then
+              test -d "$ANDROID_SDK_ROOT/ndk/25.2.9519653"
+              exit 0
+            fi
+            rm -rf "$ANDROID_SDK_ROOT/ndk/25.2.9519653" "$ANDROID_SDK_ROOT/.temp"
+            sleep $((attempt * 5))
+          done
+          echo 'FATAL: NDK could not be installed'
+          exit 1
+
+      - name: Install Gradle 7.6.4
+        run: |
+          mkdir -p "$RUNNER_TEMP/gradle"
+          curl -fsSL --retry 3 https://services.gradle.org/distributions/gradle-7.6.4-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+          echo "PATH=$RUNNER_TEMP/gradle/gradle-7.6.4/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Configure SDK location
+        run: |
+          if [ -d android ]; then
+            echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+          fi
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          ls -la "$(dirname "$apk")" || true
+          test -f "$apk"
+          cp "$apk" SatDump-old-ui-Android-arm64.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: satdump-old-ui
+          path: SatDump-old-ui-Android-arm64.apk
+          if-no-files-found: error
+          retention-days: 30
