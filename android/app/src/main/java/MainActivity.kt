@@ -373,7 +373,7 @@ class MainActivity : NativeActivity(), TextWatcher {
         if (requestCode == 2) {
             if(resultCode == RESULT_OK)
                 select_directory_result = data.getFilePathDir(getApplicationContext());
-            else if(resultCode == ResultCode.RESULT_CANCELED) // Note: kept for reference, use RESULT_CANCELED below
+            else if(resultCode == RESULT_CANCELED) // Note: kept for reference, use RESULT_CANCELED below
                 select_directory_result = "NO_PATH_SELECTED";
         }
     }
