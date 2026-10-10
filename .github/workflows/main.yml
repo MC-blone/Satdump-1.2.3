@@ -1,12 +1,11 @@
-name: Build SatDump Android (Official Deps)
+name: Build SatDump Android (Use Prebuilt Deps)
 
 on:
   workflow_dispatch:
 
 env:
   BUILD_TYPE: Release
-  DEPS_BRANCH: Android-build
-  DEPS_COMMIT: e1980c335f5afef1829efc5c67601aa7ef3005f4
+  DEPS_BRANCH: Build-temp
 
 permissions:
   contents: write
@@ -17,7 +16,7 @@ jobs:
     timeout-minutes: 300
 
     steps:
-      # ========== 1. Checkout SatDump 源码 ==========
+      # ========== 1. 拉 SatDump 源码 ==========
       - name: Checkout SatDump source
         uses: actions/checkout@v4
         with:
@@ -26,34 +25,28 @@ jobs:
 
       - name: Show structure
         run: |
-          echo "===== root ====="
-          ls -la
           echo "===== android/ ====="
           ls -la android/ || true
           echo "===== .gitmodules ====="
           cat .gitmodules || true
 
-      # ========== 2. 准备官方 Android-Dependencies ==========
-      - name: Clone official Android-Dependencies
+      # ========== 2. 从 Build-temp 恢复编译好的 deps ==========
+      - name: Restore prebuilt deps from Build-temp
+        shell: bash
         run: |
-          git clone https://github.com/SatDump/Android-Dependencies.git /tmp/Android-Dependencies
-          cd /tmp/Android-Dependencies
-          git checkout ${{ env.DEPS_COMMIT }}
-          echo "===== deps repo content ====="
-          ls -la
-          echo "===== build.sh ====="
-          cat build.sh | head -100
+          set -e
+          git clone --no-checkout --depth 1 --branch "$DEPS_BRANCH" \
+            https://github.com/MC-blone/Satdump-1.2.3.git /tmp/deps-cache
+          cd /tmp/deps-cache
+          git checkout "$DEPS_BRANCH" -- android/deps
+          mkdir -p "$GITHUB_WORKSPACE/android"
+          rm -rf "$GITHUB_WORKSPACE/android/deps"
+          cp -r android/deps "$GITHUB_WORKSPACE/android/deps"
+          rm -rf /tmp/deps-cache
+          echo "===== restored lib/ ====="
+          ls -la "$GITHUB_WORKSPACE/android/deps/output/arm64-v8a/lib/" | head -50 || true
 
-      # ========== 3. 把官方 deps 放到 android/deps ==========
-      - name: Place deps into android/deps
-        run: |
-          rm -rf android/deps
-          cp -r /tmp/Android-Dependencies android/deps
-          rm -rf android/deps/.git
-          echo "===== android/deps ====="
-          ls -la android/deps
-
-      # ========== 4. 安装基础环境 ==========
+      # ========== 3. 环境 ==========
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -90,45 +83,7 @@ jobs:
           mkdir -p android
           echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
 
-      # ========== 5. 用官方 build.sh 编译 deps ==========
-      - name: Build native deps using official build.sh
-        run: |
-          sudo apt-get install -y python3 python3-pip wget
-          pip3 install mako
-          cd android/deps
-          export ANDROID_HOME=$ANDROID_SDK_ROOT
-          export ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/25.2.9519653
-          sh build.sh
-          echo "===== output ====="
-          find output -maxdepth 3 -type d || true
-          find output -name "*.a" || true
-
-      # ========== 6. 提交 deps 到 Android-build（先删旧分支再建） ==========
-      - name: Delete old Android-build branch if exists
-        run: |
-          git push origin --delete ${{ env.DEPS_BRANCH }} || true
-
-      - name: Push deps to Android-build
-        shell: bash
-        run: |
-          set -e
-          rm -rf /tmp/deps-cache
-          mkdir -p /tmp/deps-cache
-          cp -r android/deps /tmp/deps-cache/deps
-          cd /tmp/deps-cache
-          rm -f deps/.gitignore
-          rm -f deps/output/.gitignore
-          git init -q
-          git checkout -q -b "${{ env.DEPS_BRANCH }}"
-          git add -f -A deps/output
-          git add -A deps
-          git -c user.name="github-actions[bot]" \
-              -c user.email="github-actions[bot]@users.noreply.github.com" \
-              commit -q -m "Android-Dependencies built from ${{ env.DEPS_COMMIT }}"
-          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git push -f origin "${{ env.DEPS_BRANCH }}"
-
-      # ========== 7. 编译 APK ==========
+      # ========== 4. 直接编 APK，跳过 deps ==========
       - name: Build debug APK
         working-directory: android
         run: |
@@ -137,7 +92,7 @@ jobs:
       - name: Verify APK
         run: |
           apk=android/app/build/outputs/apk/debug/app-debug.apk
-          ls -la "$(dirname "$apk")"
+          ls -la "$(dirname "$apk")" || true
           test -f "$apk"
           cp "$apk" SatDump-1.2.3-Android-arm64.apk
 
