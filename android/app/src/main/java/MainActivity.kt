@@ -3,378 +3,375 @@ package com.altillimity.satdump
 import android.app.NativeActivity
 import android.os.Bundle
 import android.content.Context
+import android.util.AttributeSet
 import android.view.inputmethod.InputMethodManager
-import android.view.KeyEvent
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputConnectionWrapper
+import android.view.inputmethod.EditorInfo
 import java.util.concurrent.LinkedBlockingQueue
 import android.util.Log
 import android.content.res.AssetManager
 import java.io.*
-import java.util.concurrent.atomic.AtomicBoolean
 
-import android.content.Intent;
-import android.app.Activity;
-import android.net.Uri;
+import android.content.Intent
+import android.net.Uri
 
-import RealPathUtil;
+import RealPathUtil
 
-import android.Manifest;
-import android.support.v4.content.PermissionChecker;
-import android.support.v4.app.ActivityCompat;
-import android.content.pm.PackageManager;
-import android.provider.DocumentsContract;
+import android.Manifest
+import android.support.v4.content.PermissionChecker
+import android.support.v4.app.ActivityCompat
 
-import android.content.BroadcastReceiver;
-import android.app.PendingIntent;
-import android.content.IntentFilter;
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 
-import android.view.View;
-import android.view.ViewGroup;
-import android.view.Window;
+import android.view.View
+import android.view.ViewGroup
+import android.view.KeyEvent
 
-import android.widget.RelativeLayout;
-import android.widget.EditText;
-import android.text.TextWatcher;
-import android.text.Editable;
-import android.text.InputType;
+import android.widget.RelativeLayout
+import android.widget.EditText
+import android.text.InputType
 
-import android.view.WindowManager;
+import android.view.WindowManager
 
-// Extension on intent
 fun Intent?.getFilePath(context: Context): String {
     return this?.data?.let { data -> RealPathUtil.getRealPath(context, data) ?: "" } ?: ""
 }
 
-// Extension on intent
 fun Intent?.getFilePathDir(context: Context): String {
-    return this?.data?.let { data -> RealPathUtil.getRealPath(context, DocumentsContract.buildDocumentUriUsingTree(data, DocumentsContract.getTreeDocumentId(data))) ?: "" } ?: ""
+    return this?.data?.let { data ->
+        RealPathUtil.getRealPath(
+            context,
+            android.provider.DocumentsContract.buildDocumentUriUsingTree(
+                data,
+                android.provider.DocumentsContract.getTreeDocumentId(data)
+            )
+        ) ?: ""
+    } ?: ""
 }
 
-class MainActivity : NativeActivity(), TextWatcher {
-    private val TAG : String = "SatDump";
+/**
+ * 一个"只接收输入、不保存文本"的 EditText。
+ *
+ * 所有来自 IME 的输入都通过 [onChar] 以 Unicode 码点送出:
+ *   - 普通字符 / 粘贴 -> 发送字符本身
+ *   - 删除            -> 发送 8 (退格)
+ *   - 回车            -> 发送 10 (换行)
+ *
+ * EditText 内部文本保持不变,所以:
+ *   - 光标永远停在原位,方向键不会误触发输入
+ *   - 不会出现文本 diff 推断错误
+ *   - 复制 / 粘贴正常工作
+ */
+class SatDumpEditText : EditText {
+    // 输出通道:把收到的 Unicode 码点或退格(8)送出去
+    var onChar: ((Int) -> Unit)? = null
 
-    // Sentinel character prefixed on the EditText. Kept identical to the original
-    // behavior so native code doesn't need any change.
-    private val SENTINEL: Char = ' '
-    private val KEY_BACKSPACE: Int = 8
+    constructor(context: Context) : super(context)
+    constructor(context: Context, attrs: AttributeSet?) : super(context, attrs)
+    constructor(context: Context, attrs: AttributeSet?, defStyle: Int) : super(context, attrs, defStyle)
 
-    fun checkAndAsk(permission: String) {
-        if (PermissionChecker.checkSelfPermission(this, permission) != PermissionChecker.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(permission), 1);
+    private fun emit(text: CharSequence?) {
+        if (text == null) return
+        var i = 0
+        while (i < text.length) {
+            onChar?.invoke(text[i].toInt())
+            i++
         }
     }
 
-    private var ACTION_USB_PERMISSION = "libusb.android.USB_PERMISSION";
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+        val base = super.onCreateInputConnection(outAttrs) ?: return null
+        return object : InputConnectionWrapper(base, false) {
+
+            // 打字 / 粘贴 都在这里进来
+            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                emit(text)
+                return true // 不写入 EditText
+            }
+
+            // 拼音 / 预测输入的组合状态:忽略,等 commitText 再发
+            override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                return true
+            }
+
+            override fun finishComposingText(): Boolean {
+                return true
+            }
+
+            // 删除键
+            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                var i = 0
+                while (i < beforeLength) {
+                    onChar?.invoke(8)
+                    i++
+                }
+                return true
+            }
+
+            // 硬件键盘 / 某些 IME 的按键
+            override fun sendKeyEvent(event: KeyEvent?): Boolean {
+                if (event == null) return false
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_DEL -> {
+                            onChar?.invoke(8)
+                            return true
+                        }
+                        KeyEvent.KEYCODE_ENTER -> {
+                            onChar?.invoke(10)
+                            return true
+                        }
+                    }
+                }
+                return false
+            }
+        }
+    }
+
+    // 硬件键盘走这条路径
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DEL -> {
+                    onChar?.invoke(8)
+                    return true
+                }
+                KeyEvent.KEYCODE_FORWARD_DEL -> {
+                    return true
+                }
+                KeyEvent.KEYCODE_ENTER -> {
+                    onChar?.invoke(10)
+                    return true
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+}
+
+class MainActivity : NativeActivity() {
+    private val TAG: String = "SatDump"
+
+    fun checkAndAsk(permission: String) {
+        if (PermissionChecker.checkSelfPermission(this, permission) != PermissionChecker.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(permission), 1)
+        }
+    }
+
+    private var ACTION_USB_PERMISSION = "libusb.android.USB_PERMISSION"
 
     private var usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (ACTION_USB_PERMISSION == intent.action) {
                 synchronized(this) {
-                    var _this = context as MainActivity;
-                    Log.w(TAG, "Got Intent Reply USB!!!! Reset Activity (libusb bug?)");
-                    _this.recreate();
+                    val _this = context as MainActivity
+                    Log.w(TAG, "Got Intent Reply USB!!!! Reset Activity (libusb bug?)")
+                    _this.recreate()
                 }
             }
         }
     }
 
-    public var mLayout : ViewGroup? = null;
-    public var editText : EditText? = null;
-    public var lastFiller : String? = null;
-    // Guard against re-entrant afterTextChanged when we call setText() ourselves.
-    private var isProcessingText : Boolean = false;
+    public var mLayout: ViewGroup? = null
+    public var editText: SatDumpEditText? = null
+
+    // 供 native 代码通过 JNI 拉取
+    private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue()
 
     public override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        checkAndAsk(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        checkAndAsk(Manifest.permission.READ_EXTERNAL_STORAGE);
-        checkAndAsk(Manifest.permission.INTERNET);
+        checkAndAsk(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        checkAndAsk(Manifest.permission.READ_EXTERNAL_STORAGE)
+        checkAndAsk(Manifest.permission.INTERNET)
 
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         registerReceiver(usbReceiver, filter)
 
         getWindow().getDecorView().setSystemUiVisibility(
-            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        )
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Text input hack setup
-        mLayout = RelativeLayout(this);
-        editText = EditText(this.applicationContext!!);
-        mLayout!!.addView(editText, RelativeLayout.LayoutParams(10000, 10000));
-        editText!!.setVisibility(View.VISIBLE);
-        // TYPE_CLASS_TEXT is required in addition to flags, otherwise some IMEs
-        // (and the paste action) will misbehave.
-        editText!!.setInputType(
+        mLayout = RelativeLayout(this)
+        val et = SatDumpEditText(this)
+        et.onChar = { code -> unicodeCharacterQueue.offer(code) }
+
+        mLayout!!.addView(et, RelativeLayout.LayoutParams(10000, 10000))
+        et.setVisibility(View.VISIBLE)
+        et.setInputType(
             InputType.TYPE_CLASS_TEXT or
             InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
             InputType.TYPE_TEXT_FLAG_MULTI_LINE
-        );
-        editText!!.requestFocus();
-        editText!!.setText(SENTINEL.toString());
-        editText!!.setSelection(1);
-        lastFiller = SENTINEL.toString();
-        editText!!.addTextChangedListener(this);
+        )
+        // 放一个空格进去,某些 IME 对完全空的输入框会不弹键盘
+        et.setText(" ")
+        et.setSelection(1)
+        et.requestFocus()
 
-        setContentView(mLayout);
+        editText = et
+        setContentView(mLayout)
     }
 
     public fun getAppDir(): String {
-        val fdir = getFilesDir().getAbsolutePath();
+        val fdir = getFilesDir().getAbsolutePath()
+        val aman = getAssets()
 
-        val aman = getAssets();
-
-        // Extract each directory that ships inside the APK. Missing ones are
-        // logged but do not crash the app.
-        val assetDirs = arrayOf("resources", "pipelines");
+        // 解压 APK assets 里的目录 (包含 pipelines)
+        val assetDirs = arrayOf("resources", "pipelines")
         for (dir in assetDirs) {
             try {
-                extractDir(aman, fdir + "/" + dir, dir);
+                extractDir(aman, fdir + "/" + dir, dir)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to extract '$dir': ${e.message}");
+                Log.e(TAG, "Failed to extract '" + dir + "': " + e.message)
             }
         }
 
         try {
-            extractFile(aman, fdir + "/satdump_cfg.json", "satdump_cfg.json");
+            extractFile(aman, fdir + "/satdump_cfg.json", "satdump_cfg.json")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to extract satdump_cfg.json: ${e.message}");
+            Log.e(TAG, "Failed to extract satdump_cfg.json: " + e.message)
         }
 
-        return fdir;
+        return fdir
     }
 
-    public fun get_plugins_directory() : String {
-        return getApplicationInfo().nativeLibraryDir;
+    public fun get_plugins_directory(): String {
+        return getApplicationInfo().nativeLibraryDir
     }
 
-    public fun get_dpi() : Float {
-        return getResources().getDisplayMetrics().density;
+    public fun get_dpi(): Float {
+        return getResources().getDisplayMetrics().density
     }
 
     fun showSoftInput() {
-        val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        inputMethodManager.showSoftInput(editText, 0)
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.showSoftInput(editText, 0)
     }
 
     fun hideSoftInput() {
-        val inputMethodManager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        inputMethodManager.hideSoftInputFromWindow(editText!!.windowToken, 0)
-    }
-
-    // Queue for the Unicode characters to be polled from native code (via pollUnicodeChar())
-    private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue()
-
-    // ---------------------------------------------------------------------------
-    //  Text input handling
-    //
-    //  Strategy:
-    //   - The EditText always keeps a leading SENTINEL character (' ').
-    //   - On every change we compare the new text with the previous snapshot and
-    //     compute the smallest common prefix. From that we derive whether it was
-    //     an append, a delete, or a replace (paste, cut, multi-char delete).
-    //   - Appends  -> push new characters in order.
-    //   - Deletes  -> push exactly one backspace per removed character.
-    //   - Replace  -> push backspaces for the removed tail then the new chars.
-    //   - If the sentinel got removed (e.g. user selected everything and pasted
-    //     text, or pressed backspace at position 1) we clear the native buffer
-    //     first and then feed the whole new content.
-    // ---------------------------------------------------------------------------
-
-    override fun afterTextChanged(s : Editable) {
-        if (isProcessingText) return;
-
-        val newText = editText!!.text.toString();
-
-        // --- Sentinel lost ---
-        if (newText.isEmpty() || newText[0] != SENTINEL) {
-            isProcessingText = true;
-            try {
-                val oldText = lastFiller ?: SENTINEL.toString();
-                // Number of characters that native currently holds (excluding sentinel)
-                val oldContentLen = if (oldText.length > 0) oldText.length - 1 else 0;
-
-                // Clear whatever native currently has
-                repeat(oldContentLen) { unicodeCharacterQueue.offer(KEY_BACKSPACE); }
-                // Then push the whole new content
-                for (c in newText) {
-                    unicodeCharacterQueue.offer(c.code);
-                }
-
-                // Restore sentinel in the EditText
-                val restored = SENTINEL + newText;
-                editText!!.setText(restored);
-                editText!!.setSelection(restored.length);
-                lastFiller = restored;
-            } finally {
-                isProcessingText = false;
-            }
-            return;
-        }
-
-        val oldText = lastFiller ?: SENTINEL.toString();
-        if (newText == oldText) return;
-
-        // Smallest common prefix
-        var p = 0;
-        val minLen = Math.min(oldText.length, newText.length);
-        while (p < minLen && oldText[p] == newText[p]) p++;
-
-        val oldTail = oldText.substring(p);
-        val newTail = newText.substring(p);
-
-        when {
-            // Pure append (typing, paste at end)
-            newTail.length >= oldTail.length && newTail.startsWith(oldTail) -> {
-                for (i in oldTail.length until newTail.length) {
-                    unicodeCharacterQueue.offer(newTail[i].code);
-                }
-            }
-            // Pure delete (backspace at end)
-            oldTail.length > newTail.length && oldTail.startsWith(newTail) -> {
-                repeat(oldTail.length - newTail.length) {
-                    unicodeCharacterQueue.offer(KEY_BACKSPACE);
-                }
-            }
-            // Replace (paste over selection, mid-string edit, cut)
-            else -> {
-                repeat(oldTail.length) { unicodeCharacterQueue.offer(KEY_BACKSPACE); }
-                for (c in newTail) {
-                    unicodeCharacterQueue.offer(c.code);
-                }
-            }
-        }
-
-        lastFiller = newText;
-    }
-
-    override fun beforeTextChanged(s : CharSequence, start: Int, count: Int, after: Int) {
-        // Not needed
-    }
-
-    override fun onTextChanged(s : CharSequence, start: Int, before: Int, count: Int) {
-        // All logic is handled in afterTextChanged to avoid double-counting
-        // events fired by certain IMEs during a single key press.
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(editText!!.windowToken, 0)
     }
 
     fun pollUnicodeChar(): Int {
         return unicodeCharacterQueue.poll() ?: 0
     }
 
-    // ---------------------------------------------------------------------------
-    //  Asset extraction
-    // ---------------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    //  资源解压
+    // ------------------------------------------------------------------
 
     public fun extractFile(aman: AssetManager, local: String, rsrc: String): Int {
-        Log.w(TAG, "Extracting '$rsrc' to '$local'");
+        Log.w(TAG, "Extracting '" + rsrc + "' -> '" + local + "'")
         try {
-            aman.open(rsrc).use { input ->
-                FileOutputStream(local).use { output ->
-                    input.copyTo(output);
+            val input = aman.open(rsrc)
+            try {
+                val output = FileOutputStream(local)
+                try {
+                    input.copyTo(output)
+                } finally {
+                    output.close()
                 }
+            } finally {
+                input.close()
             }
         } catch (e: IOException) {
-            Log.e(TAG, "Failed to extract file '$rsrc': ${e.message}");
-            return -1;
+            Log.e(TAG, "Failed to extract file '" + rsrc + "': " + e.message)
+            return -1
         }
-        return 0;
+        return 0
     }
 
-    /**
-     * Recursively extracts a directory from the assets.
-     *
-     * AssetManager.list() returns null for a file, and a (possibly empty) array
-     * for a directory. In an APK empty directories are stripped, so any entry
-     * that returns an array is a real directory.
-     */
     public fun extractDir(aman: AssetManager, local: String, rsrc: String): Int {
-        val flist = aman.list(rsrc) ?: return 0;
-        if (flist.isEmpty()) return 0;
+        val flist = aman.list(rsrc) ?: return 0
+        if (flist.size == 0) return 0
 
-        createIfDoesntExist(local);
+        createIfDoesntExist(local)
 
-        var count = 0;
+        var count = 0
         for (fp in flist) {
-            val lpath = "$local/$fp";
-            val rpath = "$rsrc/$fp";
+            val lpath = local + "/" + fp
+            val rpath = rsrc + "/" + fp
 
-            val sublist = aman.list(rpath);
-            if (sublist != null && sublist.isNotEmpty()) {
-                // Directory -> recurse
-                extractDir(aman, lpath, rpath);
+            val sublist = aman.list(rpath)
+            if (sublist != null && sublist.size > 0) {
+                extractDir(aman, lpath, rpath)
             } else {
-                // File -> extract
-                extractFile(aman, lpath, rpath);
+                extractFile(aman, lpath, rpath)
             }
-            count++;
+            count++
         }
-        return count;
+        return count
     }
 
     public fun createIfDoesntExist(path: String) {
-        val folder = File(path);
-        var success = true;
+        val folder = File(path)
+        var success = true
         if (!folder.exists()) {
-            success = folder.mkdirs();
+            success = folder.mkdirs()
         }
         if (!success) {
-            Log.e(TAG, "Could not create folder with path " + path);
+            Log.e(TAG, "Could not create folder with path " + path)
         }
     }
 
-    // ---------------------------------------------------------------------------
-    //  File / directory pickers (unchanged)
-    // ---------------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    //  文件 / 目录选择器
+    // ------------------------------------------------------------------
 
-    var select_file_result : String = "";
+    var select_file_result: String = ""
     public fun select_file() {
-        var file_intent = Intent(Intent.ACTION_GET_CONTENT);
-        file_intent.setType("*/*");
-        file_intent.addCategory(Intent.CATEGORY_OPENABLE);
-        val final_intent = Intent.createChooser(file_intent, "Select File");
-        startActivityForResult(final_intent, 1);
+        val file_intent = Intent(Intent.ACTION_GET_CONTENT)
+        file_intent.setType("*/*")
+        file_intent.addCategory(Intent.CATEGORY_OPENABLE)
+        val final_intent = Intent.createChooser(file_intent, "Select File")
+        startActivityForResult(final_intent, 1)
     }
 
-    public fun select_file_get() : String {
-        var tmp = select_file_result;
-        select_file_result = "";
-        return tmp;
+    public fun select_file_get(): String {
+        val tmp = select_file_result
+        select_file_result = ""
+        return tmp
     }
 
-    var select_directory_result : String = "";
+    var select_directory_result: String = ""
     public fun select_directory() {
-        var file_intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        file_intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        file_intent.addCategory(Intent.CATEGORY_DEFAULT);
-        val final_intent = Intent.createChooser(file_intent, "Select Directory");
-        startActivityForResult(final_intent, 2);
+        val file_intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        file_intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        file_intent.addCategory(Intent.CATEGORY_DEFAULT)
+        val final_intent = Intent.createChooser(file_intent, "Select Directory")
+        startActivityForResult(final_intent, 2)
     }
 
-    public fun select_directory_get() : String {
-        var tmp = select_directory_result;
-        select_directory_result = "";
-        return tmp;
+    public fun select_directory_get(): String {
+        val tmp = select_directory_result
+        select_directory_result = ""
+        return tmp
     }
 
     public fun openURL(url: String) {
-        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url));
-        startActivity(browserIntent);
+        val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        startActivity(browserIntent)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data);
+        super.onActivityResult(requestCode, resultCode, data)
 
         if (requestCode == 1) {
-            if(resultCode == RESULT_OK)
-                select_file_result = data.getFilePath(getApplicationContext());
-            else if(resultCode == RESULT_CANCELED)
-                select_file_result = "NO_PATH_SELECTED";
+            if (resultCode == RESULT_OK)
+                select_file_result = data.getFilePath(getApplicationContext())
+            else if (resultCode == RESULT_CANCELED)
+                select_file_result = "NO_PATH_SELECTED"
         }
 
         if (requestCode == 2) {
-            if(resultCode == RESULT_OK)
-                select_directory_result = data.getFilePathDir(getApplicationContext());
-            else if(resultCode == RESULT_CANCELED) // Note: kept for reference, use RESULT_CANCELED below
-                select_directory_result = "NO_PATH_SELECTED";
+            if (resultCode == RESULT_OK)
+                select_directory_result = data.getFilePathDir(getApplicationContext())
+            else if (resultCode == RESULT_CANCELED)
+                select_directory_result = "NO_PATH_SELECTED"
         }
     }
 }
