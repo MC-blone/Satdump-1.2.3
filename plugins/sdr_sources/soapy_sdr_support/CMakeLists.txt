@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.12)
+project(soapy_sdr_support)
+
+find_library(SOAPYSDR_LIBRARY SoapySDR)
+
+if(SOAPYSDR_LIBRARY)
+    message("Building with SoapySDR support")
+    file(GLOB_RECURSE soapy_sdr_support_CPPS *.cpp)
+    add_library(soapy_sdr_support SHARED ${soapy_sdr_support_CPPS})
+    target_include_directories(soapy_sdr_support PUBLIC src)
+
+    # if(MSVC)
+    #   target_link_libraries(soapy_sdr_support PUBLIC satdump_core soapysdr.dll)
+    #   install(TARGETS soapy_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins RUNTIME_DEPENDENCY_SET satdump_deps)
+    # else()
+        target_link_libraries(soapy_sdr_support PUBLIC satdump_core ${SOAPYSDR_LIBRARY})
+        install(TARGETS soapy_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    # endif()
+else()
+    message("SoapySDR Library could not be found! Not building.")
+endif()

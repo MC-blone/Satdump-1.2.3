@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.12)
+project(usrp_sdr_support)
+
+
+find_library(UHD_LIBRARY uhd)
+
+if(UHD_LIBRARY OR MSVC) # OR ANDROID)
+    message("Building with USRP support")
+    file(GLOB_RECURSE usrp_sdr_support_CPPS *.cpp)
+    add_library(usrp_sdr_support SHARED ${usrp_sdr_support_CPPS})
+    target_include_directories(usrp_sdr_support PUBLIC src)
+
+    if(MSVC)
+        target_link_libraries(usrp_sdr_support PUBLIC satdump_core uhd.dll)
+        install(TARGETS usrp_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins RUNTIME_DEPENDENCY_SET satdump_deps)
+    # elseif(ANDROID)
+    #   target_link_libraries(usrp_sdr_support PUBLIC satdump_core airspy usb)
+    #   target_include_directories(usrp_sdr_support PUBLIC ../../../android/deps/libairspy)
+    #   install(TARGETS usrp_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    else()
+        target_link_libraries(usrp_sdr_support PUBLIC satdump_core ${UHD_LIBRARY})
+        install(TARGETS usrp_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    endif()
+else()
+    message("UHD Library could not be found! Not building.")
+endif()

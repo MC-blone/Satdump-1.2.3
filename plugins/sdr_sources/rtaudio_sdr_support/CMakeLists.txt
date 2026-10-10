@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.12)
+project(rtaudio_sdr_support)
+
+
+find_library(RTAUDIO_LIBRARY rtaudio)
+
+if(RTAUDIO_LIBRARY) # OR MSVC) # OR ANDROID)
+    message("Building with RtAudio support")
+    file(GLOB_RECURSE rtaudio_sdr_support_CPPS *.cpp)
+    add_library(rtaudio_sdr_support SHARED ${rtaudio_sdr_support_CPPS})
+    target_include_directories(rtaudio_sdr_support PUBLIC src)
+
+    if(MSVC)
+        target_link_libraries(rtaudio_sdr_support PUBLIC satdump_core rtaudio.dll)
+        install(TARGETS rtaudio_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins RUNTIME_DEPENDENCY_SET satdump_deps)
+    # elseif(ANDROID)
+    #   target_link_libraries(rtaudio_sdr_support PUBLIC satdump_core rtlsdr usb)
+    #   target_include_directories(rtaudio_sdr_support PUBLIC ../../../android/deps/librtlsdr)
+    #   install(TARGETS rtaudio_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    else()
+        target_link_libraries(rtaudio_sdr_support PUBLIC satdump_core ${RTAUDIO_LIBRARY})
+        install(TARGETS rtaudio_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    endif()
+else()
+    message("RtAudio Library could not be found! Not building.")
+endif()

@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.12)
+project(mirisdr_sdr_support)
+
+
+find_library(USB_LIBRARY usb-1.0)
+
+# if(RTLSDR_LIBRARY OR MSVC OR ANDROID)
+if(USB_LIBRARY OR MSVC OR ANDROID)
+    message("Building with MiriSDR support")
+    file(GLOB_RECURSE mirisdr_sdr_support_CPPS *.cpp mirisdr/libmirisdr.c)
+    add_library(mirisdr_sdr_support SHARED ${mirisdr_sdr_support_CPPS})
+    target_include_directories(mirisdr_sdr_support PUBLIC src)
+
+    if(MSVC)
+        target_link_libraries(mirisdr_sdr_support PUBLIC satdump_core libusb-1.0.dll)
+        install(TARGETS mirisdr_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins RUNTIME_DEPENDENCY_SET satdump_deps)
+    elseif(ANDROID)
+        target_link_libraries(mirisdr_sdr_support PUBLIC satdump_core usb)
+        target_include_directories(mirisdr_sdr_support PUBLIC ../../../android/deps/libusb)
+        install(TARGETS mirisdr_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    else()
+        target_link_libraries(mirisdr_sdr_support PUBLIC satdump_core ${USB_LIBRARY})
+        install(TARGETS mirisdr_sdr_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+    endif()
+else()
+    message("MiriSDR Library could not be found! Not building.")
+endif()
