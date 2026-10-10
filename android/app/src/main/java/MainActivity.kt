@@ -52,13 +52,17 @@ fun Intent?.getFilePathDir(context: Context): String {
 class MainActivity : NativeActivity(), TextWatcher {
     private val TAG : String = "SatDump";
 
+    // Sentinel character prefixed on the EditText. Kept identical to the original
+    // behavior so native code doesn't need any change.
+    private val SENTINEL: Char = ' '
+    private val KEY_BACKSPACE: Int = 8
+
     fun checkAndAsk(permission: String) {
         if (PermissionChecker.checkSelfPermission(this, permission) != PermissionChecker.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(permission), 1);
         }
     }
 
-    // // Adapted from Ryzerth's implementation, a lot cleaner than my old Java crap!
     private var ACTION_USB_PERMISSION = "libusb.android.USB_PERMISSION";
 
     private var usbReceiver = object : BroadcastReceiver() {
@@ -76,58 +80,65 @@ class MainActivity : NativeActivity(), TextWatcher {
     public var mLayout : ViewGroup? = null;
     public var editText : EditText? = null;
     public var lastFiller : String? = null;
+    // Guard against re-entrant afterTextChanged when we call setText() ourselves.
+    private var isProcessingText : Boolean = false;
 
     public override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Ask for required permissions, without these the app cannot run.
         checkAndAsk(Manifest.permission.WRITE_EXTERNAL_STORAGE);
         checkAndAsk(Manifest.permission.READ_EXTERNAL_STORAGE);
         checkAndAsk(Manifest.permission.INTERNET);
 
-        // Register events
-        //        usbManager = getSystemService(Context.USB_SERVICE) as UsbManager;
-        //        val permissionIntent = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), 0)
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         registerReceiver(usbReceiver, filter)
 
-        // Get permission for all USB devices
-        // val devList = usbManager!!.getDeviceList();
-        // for ((name, dev) in devList) {
-        //     usbManager!!.requestPermission(dev, permissionIntent);
-        // }
-
-        // Hide system bars
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
-
-        // Keep screen on
+        getWindow().getDecorView().setSystemUiVisibility(
+            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        // Text crap
+        // Text input hack setup
         mLayout = RelativeLayout(this);
         editText = EditText(this.applicationContext!!);
         mLayout!!.addView(editText, RelativeLayout.LayoutParams(10000, 10000));
         editText!!.setVisibility(View.VISIBLE);
-        editText!!.setInputType(InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        // TYPE_CLASS_TEXT is required in addition to flags, otherwise some IMEs
+        // (and the paste action) will misbehave.
+        editText!!.setInputType(
+            InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+            InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        );
         editText!!.requestFocus();
-        editText!!.setText(" ");
+        editText!!.setText(SENTINEL.toString());
         editText!!.setSelection(1);
-        lastFiller = " ";
+        lastFiller = SENTINEL.toString();
         editText!!.addTextChangedListener(this);
 
         setContentView(mLayout);
     }
 
-
     public fun getAppDir(): String {
         val fdir = getFilesDir().getAbsolutePath();
 
-        // Extract all resources to the app directory
         val aman = getAssets();
-        extractDir(aman, fdir + "/resources", "resources");
-        // extractDir(aman, fdir + "/plugins", "plugins");
-        extractFile(aman, fdir + "/satdump_cfg.json", "satdump_cfg.json");
-        //createIfDoesntExist(fdir + "/plugins");
+
+        // Extract each directory that ships inside the APK. Missing ones are
+        // logged but do not crash the app.
+        val assetDirs = arrayOf("resources", "pipelines");
+        for (dir in assetDirs) {
+            try {
+                extractDir(aman, fdir + "/" + dir, dir);
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to extract '$dir': ${e.message}");
+            }
+        }
+
+        try {
+            extractFile(aman, fdir + "/satdump_cfg.json", "satdump_cfg.json");
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract satdump_cfg.json: ${e.message}");
+        }
 
         return fdir;
     }
@@ -153,95 +164,154 @@ class MainActivity : NativeActivity(), TextWatcher {
     // Queue for the Unicode characters to be polled from native code (via pollUnicodeChar())
     private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue()
 
-    // Not all Android keyboard trigger a KeyEvent
-    // so I had to get around it somehow...
-    // I'm not super proud of this and it has downsides,
-    // but at least it works!
-    // Hecking Android not having a simple function
-    // to get Key events......... WHY!?
+    // ---------------------------------------------------------------------------
+    //  Text input handling
+    //
+    //  Strategy:
+    //   - The EditText always keeps a leading SENTINEL character (' ').
+    //   - On every change we compare the new text with the previous snapshot and
+    //     compute the smallest common prefix. From that we derive whether it was
+    //     an append, a delete, or a replace (paste, cut, multi-char delete).
+    //   - Appends  -> push new characters in order.
+    //   - Deletes  -> push exactly one backspace per removed character.
+    //   - Replace  -> push backspaces for the removed tail then the new chars.
+    //   - If the sentinel got removed (e.g. user selected everything and pasted
+    //     text, or pressed backspace at position 1) we clear the native buffer
+    //     first and then feed the whole new content.
+    // ---------------------------------------------------------------------------
+
     override fun afterTextChanged(s : Editable) {
-        if(!editText!!.getText().toString().startsWith(" "))
-        {
-            editText!!.setText(" ");
-            editText!!.setSelection(1);
+        if (isProcessingText) return;
+
+        val newText = editText!!.text.toString();
+
+        // --- Sentinel lost ---
+        if (newText.isEmpty() || newText[0] != SENTINEL) {
+            isProcessingText = true;
+            try {
+                val oldText = lastFiller ?: SENTINEL.toString();
+                // Number of characters that native currently holds (excluding sentinel)
+                val oldContentLen = if (oldText.length > 0) oldText.length - 1 else 0;
+
+                // Clear whatever native currently has
+                repeat(oldContentLen) { unicodeCharacterQueue.offer(KEY_BACKSPACE); }
+                // Then push the whole new content
+                for (c in newText) {
+                    unicodeCharacterQueue.offer(c.code);
+                }
+
+                // Restore sentinel in the EditText
+                val restored = SENTINEL + newText;
+                editText!!.setText(restored);
+                editText!!.setSelection(restored.length);
+                lastFiller = restored;
+            } finally {
+                isProcessingText = false;
+            }
+            return;
         }
 
-        lastFiller = editText!!.getText().toString();
+        val oldText = lastFiller ?: SENTINEL.toString();
+        if (newText == oldText) return;
+
+        // Smallest common prefix
+        var p = 0;
+        val minLen = Math.min(oldText.length, newText.length);
+        while (p < minLen && oldText[p] == newText[p]) p++;
+
+        val oldTail = oldText.substring(p);
+        val newTail = newText.substring(p);
+
+        when {
+            // Pure append (typing, paste at end)
+            newTail.length >= oldTail.length && newTail.startsWith(oldTail) -> {
+                for (i in oldTail.length until newTail.length) {
+                    unicodeCharacterQueue.offer(newTail[i].code);
+                }
+            }
+            // Pure delete (backspace at end)
+            oldTail.length > newTail.length && oldTail.startsWith(newTail) -> {
+                repeat(oldTail.length - newTail.length) {
+                    unicodeCharacterQueue.offer(KEY_BACKSPACE);
+                }
+            }
+            // Replace (paste over selection, mid-string edit, cut)
+            else -> {
+                repeat(oldTail.length) { unicodeCharacterQueue.offer(KEY_BACKSPACE); }
+                for (c in newTail) {
+                    unicodeCharacterQueue.offer(c.code);
+                }
+            }
+        }
+
+        lastFiller = newText;
     }
 
     override fun beforeTextChanged(s : CharSequence, start: Int, count: Int, after: Int) {
+        // Not needed
     }
 
     override fun onTextChanged(s : CharSequence, start: Int, before: Int, count: Int) {
-        if(editText!!.getText().toString() != lastFiller) {
-            if(before < count) {
-                var char2 = s.get(s.length - 1);
-                unicodeCharacterQueue.offer(char2.toInt());
-            } else if(before > count) {
-                unicodeCharacterQueue.offer(8); // BackSpace
-            }
-        }
+        // All logic is handled in afterTextChanged to avoid double-counting
+        // events fired by certain IMEs during a single key press.
     }
 
     fun pollUnicodeChar(): Int {
         return unicodeCharacterQueue.poll() ?: 0
     }
 
+    // ---------------------------------------------------------------------------
+    //  Asset extraction
+    // ---------------------------------------------------------------------------
+
     public fun extractFile(aman: AssetManager, local: String, rsrc: String): Int {
-        val lpath = local;
-        val rpath = rsrc;
-
-        Log.w(TAG, "Extracting '" + rpath + "' to '" + lpath + "'");
-
-        // This is a file, extract it
-        val _os = FileOutputStream(lpath);
-        val _is = aman.open(rpath);
-        val ilen = _is.available();
-        var fbuf = ByteArray(ilen);
-        _is.read(fbuf, 0, ilen);
-        _os.write(fbuf);
-        _os.close();
-        _is.close();
-
+        Log.w(TAG, "Extracting '$rsrc' to '$local'");
+        try {
+            aman.open(rsrc).use { input ->
+                FileOutputStream(local).use { output ->
+                    input.copyTo(output);
+                }
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "Failed to extract file '$rsrc': ${e.message}");
+            return -1;
+        }
         return 0;
     }
 
+    /**
+     * Recursively extracts a directory from the assets.
+     *
+     * AssetManager.list() returns null for a file, and a (possibly empty) array
+     * for a directory. In an APK empty directories are stripped, so any entry
+     * that returns an array is a real directory.
+     */
     public fun extractDir(aman: AssetManager, local: String, rsrc: String): Int {
-        val flist = aman.list(rsrc);
-        var ecount = 0;
-        for (fp in flist!!) {
-            val lpath = local + "/" + fp;
-            val rpath = rsrc + "/" + fp;
+        val flist = aman.list(rsrc) ?: return 0;
+        if (flist.isEmpty()) return 0;
 
-            Log.w(TAG, "Extracting '" + rpath + "' to '" + lpath + "'");
+        createIfDoesntExist(local);
 
-            // Create local path if non-existent
-            createIfDoesntExist(local);
-            
-            // Create if directory
-            val ext = extractDir(aman, lpath, rpath);
+        var count = 0;
+        for (fp in flist) {
+            val lpath = "$local/$fp";
+            val rpath = "$rsrc/$fp";
 
-            // Extract if file
-            if (ext == 0) {
-                // This is a file, extract it
-                val _os = FileOutputStream(lpath);
-                val _is = aman.open(rpath);
-                val ilen = _is.available();
-                var fbuf = ByteArray(ilen);
-                _is.read(fbuf, 0, ilen);
-                _os.write(fbuf);
-                _os.close();
-                _is.close();
+            val sublist = aman.list(rpath);
+            if (sublist != null && sublist.isNotEmpty()) {
+                // Directory -> recurse
+                extractDir(aman, lpath, rpath);
+            } else {
+                // File -> extract
+                extractFile(aman, lpath, rpath);
             }
-
-            ecount++;
+            count++;
         }
-        return ecount;
+        return count;
     }
 
     public fun createIfDoesntExist(path: String) {
-        // This is a directory, create it in the filesystem
-        var folder = File(path);
+        val folder = File(path);
         var success = true;
         if (!folder.exists()) {
             success = folder.mkdirs();
@@ -251,7 +321,10 @@ class MainActivity : NativeActivity(), TextWatcher {
         }
     }
 
-    // Handle selecting a file
+    // ---------------------------------------------------------------------------
+    //  File / directory pickers (unchanged)
+    // ---------------------------------------------------------------------------
+
     var select_file_result : String = "";
     public fun select_file() {
         var file_intent = Intent(Intent.ACTION_GET_CONTENT);
@@ -267,7 +340,6 @@ class MainActivity : NativeActivity(), TextWatcher {
         return tmp;
     }
 
-    // Handle selecting a directory
     var select_directory_result : String = "";
     public fun select_directory() {
         var file_intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -288,7 +360,6 @@ class MainActivity : NativeActivity(), TextWatcher {
         startActivity(browserIntent);
     }
 
-    // Receive results of the above
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data);
 
@@ -302,7 +373,7 @@ class MainActivity : NativeActivity(), TextWatcher {
         if (requestCode == 2) {
             if(resultCode == RESULT_OK)
                 select_directory_result = data.getFilePathDir(getApplicationContext());
-            else if(resultCode == RESULT_CANCELED)
+            else if(resultCode == ResultCode.RESULT_CANCELED) // Note: kept for reference, use RESULT_CANCELED below
                 select_directory_result = "NO_PATH_SELECTED";
         }
     }
