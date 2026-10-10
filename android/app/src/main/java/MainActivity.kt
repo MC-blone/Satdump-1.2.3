@@ -51,21 +51,7 @@ fun Intent?.getFilePathDir(context: Context): String {
     } ?: ""
 }
 
-/**
- * 一个"只接收输入、不保存文本"的 EditText。
- *
- * 所有来自 IME 的输入都通过 [onChar] 以 Unicode 码点送出:
- *   - 普通字符 / 粘贴 -> 发送字符本身
- *   - 删除            -> 发送 8 (退格)
- *   - 回车            -> 发送 10 (换行)
- *
- * EditText 内部文本保持不变,所以:
- *   - 光标永远停在原位,方向键不会误触发输入
- *   - 不会出现文本 diff 推断错误
- *   - 复制 / 粘贴正常工作
- */
 class SatDumpEditText : EditText {
-    // 输出通道:把收到的 Unicode 码点或退格(8)送出去
     var onChar: ((Int) -> Unit)? = null
 
     constructor(context: Context) : super(context)
@@ -85,13 +71,11 @@ class SatDumpEditText : EditText {
         val base = super.onCreateInputConnection(outAttrs) ?: return null
         return object : InputConnectionWrapper(base, false) {
 
-            // 打字 / 粘贴 都在这里进来
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
                 emit(text)
-                return true // 不写入 EditText
+                return true
             }
 
-            // 拼音 / 预测输入的组合状态:忽略,等 commitText 再发
             override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
                 return true
             }
@@ -100,7 +84,6 @@ class SatDumpEditText : EditText {
                 return true
             }
 
-            // 删除键
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
                 var i = 0
                 while (i < beforeLength) {
@@ -110,44 +93,39 @@ class SatDumpEditText : EditText {
                 return true
             }
 
-            // 硬件键盘 / 某些 IME 的按键
             override fun sendKeyEvent(event: KeyEvent?): Boolean {
                 if (event == null) return false
                 if (event.action == KeyEvent.ACTION_DOWN) {
-                    when (event.keyCode) {
-                        KeyEvent.KEYCODE_DEL -> {
-                            onChar?.invoke(8)
-                            return true
-                        }
-                        KeyEvent.KEYCODE_ENTER -> {
-                            onChar?.invoke(10)
-                            return true
-                        }
-                    }
+                    if (handleKey(event.keyCode)) return true
                 }
                 return false
             }
         }
     }
 
-    // 硬件键盘走这条路径
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
-            when (event.keyCode) {
-                KeyEvent.KEYCODE_DEL -> {
-                    onChar?.invoke(8)
-                    return true
-                }
-                KeyEvent.KEYCODE_FORWARD_DEL -> {
-                    return true
-                }
-                KeyEvent.KEYCODE_ENTER -> {
-                    onChar?.invoke(10)
-                    return true
-                }
-            }
+            if (handleKey(event.keyCode)) return true
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    private fun handleKey(keyCode: Int): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_FORWARD_DEL -> {
+                onChar?.invoke(8)
+                return true
+            }
+            KeyEvent.KEYCODE_ENTER -> {
+                onChar?.invoke(10)
+                return true
+            }
+            KeyEvent.KEYCODE_TAB -> {
+                onChar?.invoke(9)
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -177,7 +155,6 @@ class MainActivity : NativeActivity() {
     public var mLayout: ViewGroup? = null
     public var editText: SatDumpEditText? = null
 
-    // 供 native 代码通过 JNI 拉取
     private var unicodeCharacterQueue: LinkedBlockingQueue<Int> = LinkedBlockingQueue()
 
     public override fun onCreate(savedInstanceState: Bundle?) {
@@ -203,10 +180,9 @@ class MainActivity : NativeActivity() {
         et.setVisibility(View.VISIBLE)
         et.setInputType(
             InputType.TYPE_CLASS_TEXT or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-            InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE
         )
-        // 放一个空格进去,某些 IME 对完全空的输入框会不弹键盘
         et.setText(" ")
         et.setSelection(1)
         et.requestFocus()
@@ -219,7 +195,6 @@ class MainActivity : NativeActivity() {
         val fdir = getFilesDir().getAbsolutePath()
         val aman = getAssets()
 
-        // 解压 APK assets 里的目录 (包含 pipelines)
         val assetDirs = arrayOf("resources", "pipelines")
         for (dir in assetDirs) {
             try {
@@ -259,10 +234,6 @@ class MainActivity : NativeActivity() {
     fun pollUnicodeChar(): Int {
         return unicodeCharacterQueue.poll() ?: 0
     }
-
-    // ------------------------------------------------------------------
-    //  资源解压
-    // ------------------------------------------------------------------
 
     public fun extractFile(aman: AssetManager, local: String, rsrc: String): Int {
         Log.w(TAG, "Extracting '" + rsrc + "' -> '" + local + "'")
@@ -317,10 +288,6 @@ class MainActivity : NativeActivity() {
             Log.e(TAG, "Could not create folder with path " + path)
         }
     }
-
-    // ------------------------------------------------------------------
-    //  文件 / 目录选择器
-    // ------------------------------------------------------------------
 
     var select_file_result: String = ""
     public fun select_file() {

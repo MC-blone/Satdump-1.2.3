@@ -1,6 +1,7 @@
 name: Build SatDump Android (Use Prebuilt Deps)
 
 on:
+  push:
   workflow_dispatch:
 
 env:
