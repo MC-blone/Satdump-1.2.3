@@ -19,6 +19,9 @@
 #include "common/image/processing.h"
 #include "common/calibration.h"
 
+// Return filesize
+uint64_t getFilesize(std::string filepath);
+
 namespace metop
 {
     namespace instruments
@@ -30,7 +33,34 @@ namespace metop
             ignore_integrated_tle = parameters.contains("ignore_integrated_tle") ? parameters["ignore_integrated_tle"].get<bool>() : false;
         }
 
+        MetOpInstrumentsDecoderModule::~MetOpInstrumentsDecoderModule()
+        {
+        }
+
+        std::vector<ModuleDataType> MetOpInstrumentsDecoderModule::getInputTypes()
+        {
+            // ★ 修改：同时支持文件和流
+            return {DATA_FILE, DATA_STREAM};
+        }
+
+        std::vector<ModuleDataType> MetOpInstrumentsDecoderModule::getOutputTypes()
+        {
+            return {DATA_FILE};
+        }
+
+        // ★ 新增：process 只做分派
         void MetOpInstrumentsDecoderModule::process()
+        {
+            if (input_data_type == DATA_STREAM)
+                processStream();
+            else
+                processFile();
+        }
+
+        // ============================================================
+        // 原版 process() 内容整段搬到这里，一字不改
+        // ============================================================
+        void MetOpInstrumentsDecoderModule::processFile()
         {
             filesize = getFilesize(d_input_file);
             std::ifstream data_in(d_input_file, std::ios::binary);
@@ -525,9 +555,90 @@ namespace metop
             dataset.save(d_output_file_hint.substr(0, d_output_file_hint.rfind('/')));
         }
 
+        // ============================================================
+        // ★ 新增：流模式 —— 保存 CADU + 只计数 AVHRR/IASI-IMG
+        // ============================================================
+        void MetOpInstrumentsDecoderModule::processStream()
+        {
+            logger->info("Streaming mode : counting AVHRR/IASI-IMG + saving raw CADU");
+            filesize = 0;
+
+            // 输出目录
+            std::string out_dir = d_output_file_hint;
+            size_t slash = out_dir.rfind('/');
+            if (slash != std::string::npos)
+                out_dir = out_dir.substr(0, slash);
+            else
+                out_dir = ".";
+
+            std::string cadu_path = out_dir + "/metop_ahrpt_raw.cadu";
+            data_out = std::ofstream(cadu_path, std::ios::binary);
+            d_output_files.push_back(cadu_path);
+            logger->info("Saving raw CADU to " + cadu_path);
+
+            time_t lastTime = 0;
+            uint8_t cadu[1024];
+
+            // 只建 AVHRR (VCID 9) 和 IASI (VCID 10) 的 demuxer
+            ccsds::ccsds_aos::Demuxer demuxer_vcid9(882, true);
+            ccsds::ccsds_aos::Demuxer demuxer_vcid10(882, true);
+
+            while (input_active.load())
+            {
+                // 从 FIFO 读一个 CADU（阶段二推过来的）
+                if (!input_fifo)
+                    break;
+                if (input_fifo->read((uint8_t *)&cadu, 1024) < 0)
+                    break;
+
+                // 保存原始 CADU
+                data_out.write((char *)&cadu, 1024);
+
+                ccsds::ccsds_aos::VCDU vcdu = ccsds::ccsds_aos::parseVCDU(cadu);
+
+                if (vcdu.vcid == 9) // AVHRR/3
+                {
+                    std::vector<ccsds::CCSDSPacket> ccsdsFrames = demuxer_vcid9.work(cadu);
+                    for (ccsds::CCSDSPacket &pkt : ccsdsFrames)
+                        if (pkt.header.apid == 103 || pkt.header.apid == 104)
+                            avhrr_reader.work_metop(pkt);
+                }
+                else if (vcdu.vcid == 10) // IASI
+                {
+                    std::vector<ccsds::CCSDSPacket> ccsdsFrames = demuxer_vcid10.work(cadu);
+                    for (ccsds::CCSDSPacket &pkt : ccsdsFrames)
+                        if (pkt.header.apid == 150) // IASI-IMG
+                            iasi_reader_img.work(pkt);
+                }
+
+                // Update module stats（仅计数）
+                module_stats["avhrr_lines"]    = avhrr_reader.lines;
+                module_stats["iasi_img_lines"] = iasi_reader_img.lines * 64;
+
+                if (time(NULL) % 10 == 0 && lastTime != time(NULL))
+                {
+                    lastTime = time(NULL);
+                    logger->info("AVHRR : " + std::to_string(avhrr_reader.lines) + " lines, "
+                                 "IASI-IMG : " + std::to_string(iasi_reader_img.lines * 64) + " lines");
+                }
+            }
+
+            data_out.close();
+
+            logger->info("Stream counting finished");
+            logger->info("AVHRR lines    : " + std::to_string(avhrr_reader.lines));
+            logger->info("IASI-IMG lines : " + std::to_string(iasi_reader_img.lines * 64));
+        }
+
         void MetOpInstrumentsDecoderModule::drawUI(bool window)
         {
             ImGui::Begin("MetOp Instruments Decoder", NULL, window ? 0 : NOWINDOW_FLAGS);
+
+            // ★ 新增：模式提示
+            if (streamingInput)
+                ImGui::TextColored(style::theme.orange, "Mode : STREAM (counting only)");
+            else
+                ImGui::TextColored(style::theme.green, "Mode : FILE (full decode)");
 
             if (ImGui::BeginTable("##metopinstrumentstable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
             {
@@ -601,7 +712,7 @@ namespace metop
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextColored(style::theme.green, "%d", ascat_reader.lines[0]);
                 ImGui::TableSetColumnIndex(2);
-                drawStatus(gome_status);
+                drawStatus(ascat_status);
 
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
@@ -622,7 +733,8 @@ namespace metop
                 ImGui::EndTable();
             }
 
-            ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
+            if (!streamingInput)
+                ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
 
             ImGui::End();
         }
@@ -641,5 +753,5 @@ namespace metop
         {
             return std::make_shared<MetOpInstrumentsDecoderModule>(input_file, output_file_hint, parameters);
         }
-    } // namespace amsu
+    } // namespace instruments
 } // namespace metop

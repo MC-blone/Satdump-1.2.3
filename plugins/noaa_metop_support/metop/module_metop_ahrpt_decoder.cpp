@@ -28,7 +28,8 @@ namespace metop
 
     std::vector<ModuleDataType> MetOpAHRPTDecoderModule::getOutputTypes()
     {
-        return {DATA_FILE};
+        // ★ 修改：同时支持文件输出和流输出
+        return {DATA_FILE, DATA_STREAM};
     }
 
     MetOpAHRPTDecoderModule::~MetOpAHRPTDecoderModule()
@@ -45,11 +46,19 @@ namespace metop
             filesize = 0;
         if (input_data_type == DATA_FILE)
             data_in = std::ifstream(d_input_file, std::ios::binary);
-        data_out = std::ofstream(d_output_file_hint + ".cadu", std::ios::binary);
-        d_output_files.push_back(d_output_file_hint + ".cadu");
+
+        // ★ 修改：只有文件输出模式才打开文件
+        if (output_data_type == DATA_FILE)
+        {
+            data_out = std::ofstream(d_output_file_hint + ".cadu", std::ios::binary);
+            d_output_files.push_back(d_output_file_hint + ".cadu");
+        }
 
         logger->info("Using input symbols " + d_input_file);
-        logger->info("Decoding to " + d_output_file_hint + ".cadu");
+        if (output_data_type == DATA_FILE)
+            logger->info("Decoding to " + d_output_file_hint + ".cadu");
+        else
+            logger->info("Decoding to stream (FIFO)");
 
         time_t lastTime = 0;
 
@@ -103,8 +112,16 @@ namespace metop
                     // RS Correction
                     rs.decode_interlaved(&cadu[4], true, 4, errors);
 
-                    // Write it out
-                    data_out.write((char *)cadu, 1024);
+                    // ★ 修改：按输出类型分别写入文件或 FIFO
+                    if (output_data_type == DATA_FILE)
+                    {
+                        data_out.write((char *)cadu, 1024);
+                    }
+                    else if (output_data_type == DATA_STREAM)
+                    {
+                        if (output_fifo)
+                            output_fifo->write(cadu, 1024);
+                    }
                 }
             }
 
@@ -126,8 +143,10 @@ namespace metop
             }
         }
 
-        data_out.close();
+        // ★ 修改：只有文件输出模式才关闭文件
         if (output_data_type == DATA_FILE)
+            data_out.close();
+        if (input_data_type == DATA_FILE)
             data_in.close();
     }
 
