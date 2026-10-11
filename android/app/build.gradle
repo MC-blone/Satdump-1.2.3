@@ -11,8 +11,8 @@ android {
     }
 
     defaultConfig {
-        applicationId "org.satdump.SatDump"
-        namespace "org.satdump.SatDump"
+        applicationId "org.satdump.mc"
+        namespace "org.satdump.mc"
         minSdkVersion 26
         targetSdkVersion 27
         versionCode 9
