@@ -1013,6 +1013,24 @@
                             }
                         }
                     },
+                    "AVHRR 221 False Color(Fix)": {
+                        "equation": "ch2*0.4+min(ch1,ch2)*0.6, ch2, ch1",
+                        "description": "descriptions/221_fix.md",
+                        "geo_correct": true,
+                        "project": {
+                            "draw_map_overlay": true,
+                            "individual_equalize": true,
+                            "config": {
+                                "type": "equirec",
+                                "offset_x": -180,
+                                "offset_y": 90,
+                                "scalar_x": 0.087890625,
+                                "scalar_y": -0.087890625,
+                                "width": 4096,
+                                "height": 2048
+                            }
+                        }
+                    },
                     "AVHRR 3a21 False Color": {
                         "equation": "cch3a, cch2, cch1",
                         "description": "descriptions/321.md",
@@ -1830,13 +1848,19 @@
                 "handler": "image_handler",
                 "name": "MSU-MR",
                 "rgb_composites": {
-                    "AVHRR 221 False Color": {
+                    "MSU_MR 221 False Color": {
                         "equation": "ch2, ch2, ch1",
                         "geo_correct": true,
                         "white_balance": true,
                         "description": "descriptions/221.md"
                     },
-                    "AVHRR 3a21 False Color": {
+                    "MSU_MR 221 False Color(Fix)": {
+                        "equation": "ch2*0.4+min(ch1,ch2)*0.6, ch2, ch1",
+                        "geo_correct": true,
+                        "white_balance": true,
+                        "description": "descriptions/221_fix.md"
+                    },
+                    "MSU_MR 321 False Color": {
                         "equation": "ch3, ch2, ch1",
                         "description": "descriptions/321.md",
                         "geo_correct": true,
@@ -1873,7 +1897,7 @@
                         "geo_correct": true,
                         "autogen": false
                     },
-                    "AVHRR 124 False Color": {
+                    "MSU_MR 124 False Color": {
                         "equation": "ch1, ch2, 1-ch5",
                         "description": "descriptions/124.md",
                         "geo_correct": true,
@@ -2400,9 +2424,13 @@
                 "handler": "image_handler",
                 "name": "MSU-GS",
                 "rgb_composites": {
-                    "AVHRR 221 False Color": {
+                    "MSU_GS 221 False Color": {
                         "equation": "ch3,ch3,ch1",
                         "description": "descriptions/221.md"
+                    },
+                    "MSU_GS 221 False Color(Fix)": {
+                        "equation": "ch3*0.4+min(ch1,ch3),ch3,ch1",
+                        "description": "descriptions/221_fix.md"
                     },
                     "MSU-GS 321 False Color": {
                         "equation": "ch3,ch2,ch1",

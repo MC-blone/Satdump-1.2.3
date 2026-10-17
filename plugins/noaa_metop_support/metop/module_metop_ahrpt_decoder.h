@@ -7,9 +7,8 @@
 
 // ★ 引入计数需要的内容
 #include "common/ccsds/ccsds_aos/demuxer.h"
-#include "instruments/avhrr/avhrr_metop_reader.h"
+#include "../instruments/avhrr/avhrr_reader.h"      // AVHRR 在 plugin 根目录
 #include "instruments/iasi/iasi_imaging_reader.h"
-
 namespace metop
 {
     class MetOpAHRPTDecoderModule : public ProcessingModule
