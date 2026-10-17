@@ -2,40 +2,67 @@
 
 #include "core/module.h"
 #include <complex>
-#include <thread>
+#include "common/codings/viterbi/viterbi27.h"
 #include <fstream>
-#include "deframer.h"
-#include "common/widgets/constellation.h"
+#include "common/codings/viterbi/viterbi_1_2.h"
+#include "common/codings/deframing/bpsk_ccsds_deframer.h"
+
+// ★ 新增引入
+#include "common/simple_deframer.h"
+#include "instruments/msumr/msumr_reader.h"
+#include "instruments/mtvza/mtvza_reader.h"
+#include "instruments/bism/bism_reader.h"
 
 namespace meteor
 {
-    class MeteorQPSKKmssDecoderModule : public ProcessingModule
+    class METEORLRPTDecoderModule : public ProcessingModule
     {
     protected:
-        int8_t *soft_buffer;
-        uint8_t *bit_buffer;
-        uint8_t *bit_buffer_2;
+        bool diff_decode;
 
-        uint8_t *diff_buffer_1;
-        uint8_t *diff_buffer_2;
-
-        uint8_t *rfrm_buffer_1, *rfrm_buffer_2;
-        uint8_t *rpkt_buffer_1, *rpkt_buffer_2;
+        int8_t *_buffer, *_buffer2;
+        int8_t *buffer, *buffer2;
 
         std::ifstream data_in;
         std::ofstream data_out;
-
         std::atomic<uint64_t> filesize;
         std::atomic<uint64_t> progress;
 
-        int frame_count = 0;
+        bool m2x_mode;
+
+        int viterbi_lock;
+        float viterbi_ber;
+
+        bool locked = false;
+        int errors[4];
+        int cor;
+
+        std::shared_ptr<viterbi::Viterbi27> viterbi;
+
+        std::shared_ptr<viterbi::Viterbi1_2> viterbin, viterbin2;
+        std::shared_ptr<deframing::BPSK_CCSDS_Deframer> deframer;
+
+        // ★ 新增：用于计数的 Reader 和 Deframer
+        msumr::MSUMRReader msumr_reader;
+        mtvza::MTVZAReader mtvza_reader, mtvza_reader2;
+        bism::BISMReader bism_reader;
+
+        def::SimpleDeframer msumr_deframer;
+        def::SimpleDeframer mtvza_deframer;
+        def::SimpleDeframer mtvza_deframer2;
+        def::SimpleDeframer bism_deframer;
+
+        // ★ 新增：BIS-M 数据提取文件流
+        std::ofstream bism_raw_out;
+        std::ofstream bism_bin_out;
 
         // UI Stuff
-        widgets::ConstellationViewer constellation;
+        float ber_history[200];
+        float cor_history[200];
 
     public:
-        MeteorQPSKKmssDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-        ~MeteorQPSKKmssDecoderModule();
+        METEORLRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+        ~METEORLRPTDecoderModule();
         void process();
         void drawUI(bool window);
         std::vector<ModuleDataType> getInputTypes();
