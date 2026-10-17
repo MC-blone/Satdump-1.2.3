@@ -1,5 +1,7 @@
 #include "backend.h"
 #include "core/exception.h"
+#include <thread>
+#include <chrono>
 
 extern struct android_app *g_App;
 extern EGLDisplay g_EglDisplay;
@@ -71,6 +73,28 @@ void funcEndFrame()
 
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     eglSwapBuffers(g_EglDisplay, g_EglSurface);
+
+    // ★ 修复：在安卓端强制限制 UI 刷新率，防止空转吃满 CPU
+    static auto last_frame_time = std::chrono::steady_clock::now();
+    auto current_time = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_time).count();
+
+    // 检查应用是否在后台/不可见状态 (比如息屏或切出APP)
+    bool is_in_background = (g_App->window == NULL) || (g_App->activity->window_flags == 0);
+
+    if (is_in_background) {
+        // 切到后台时，每秒只刷新 10 帧（100毫秒）节约电量
+        if (elapsed < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100 - elapsed));
+        }
+    } else {
+        // 正常前台显示，限制在 60 帧（每帧约 16 毫秒）
+        if (elapsed < 16) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(16 - elapsed));
+        }
+    }
+
+    last_frame_time = std::chrono::steady_clock::now();
 }
 
 void funcSetIcon(uint8_t*, int, int)

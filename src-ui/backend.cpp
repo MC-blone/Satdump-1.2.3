@@ -1,6 +1,8 @@
 #include <GLFW/glfw3.h>
 #include "core/style.h"
 #include "backend.h"
+#include <thread>
+#include <chrono>
 
 extern GLFWwindow* window;
 extern bool fallback_gl;
@@ -74,6 +76,28 @@ void funcEndFrame()
 
     glfwSwapBuffers(window);
     glfwPollEvents();
+
+    // ★ 核心修复：强制限制 UI 刷新率，防止死循环空转占用 CPU
+    static auto last_frame_time = std::chrono::steady_clock::now();
+    auto current_time = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_time).count();
+
+    // 检测窗口是否最小化（或者失去焦点）
+    bool is_minimized = glfwGetWindowAttrib(window, GLFW_ICONIFIED);
+
+    if (is_minimized) {
+        // 如果最小化，大幅降低刷新率（每秒只刷新 10 帧），节省后台 CPU
+        if (elapsed < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100 - elapsed));
+        }
+    } else {
+        // 正常前台运行，限制在 60 帧（每帧约 16 毫秒）
+        if (elapsed < 16) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(16 - elapsed));
+        }
+    }
+    
+    last_frame_time = std::chrono::steady_clock::now();
 }
 
 void funcSetIcon(uint8_t *image, int w, int h)

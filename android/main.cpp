@@ -76,7 +76,6 @@ void init(struct android_app *app)
         ImGuiIO &io = ImGui::GetIO();
 
         // Disable loading/saving of .ini file from disk.
-        // FIXME: Consider using LoadIniSettingsFromMemory() / SaveIniSettingsToMemory() to save in appropriate location for Android.
         io.IniFilename = NULL;
     }
 
@@ -86,11 +85,6 @@ void init(struct android_app *app)
 
     if (!was_init)
     {
-
-        // Setup Dear ImGui style
-        // ImGui::StyleColorsDark();
-        // ImGui::StyleColorsClassic();
-
         initLogger();
         style::setFonts(backend::device_scale);
         HideSoftKeyboardInput();
@@ -102,11 +96,11 @@ void init(struct android_app *app)
         satdump::initSatdump();
         satdump::initMainUI();
 
-        //Shut down loading screen
+        // Shut down loading screen
         logger->del_sink(loading_screen_sink);
         loading_screen_sink.reset();
 
-        //Set font again to adjust for DPI
+        // Set font again to adjust for DPI
         eglSwapInterval(g_EglDisplay, 1);
 
         // TLE
@@ -126,9 +120,11 @@ void tick()
     if (g_EglDisplay == EGL_NO_DISPLAY)
         return;
 
-    // Poll Unicode characters via JNI
-    // FIXME: do not call this every frame because of JNI overhead
-    PollUnicodeChars();
+    // ★ 核心修复 1：只在需要输入文字时才调用 JNI，彻底消除每帧的 JNI 开销
+    if (io.WantTextInput)
+    {
+        PollUnicodeChars();
+    }
 
     // Open on-screen (soft) input if requested by Dear ImGui
     static bool WantTextInputLast = false;
@@ -283,8 +279,11 @@ void android_main(struct android_app *app)
         int out_events;
         struct android_poll_source *out_data;
 
-        // Poll all events. If the app is not visible, this loop blocks until g_Initialized == true.
-        while (ALooper_pollAll(g_Initialized ? 0 : -1, NULL, &out_events, (void **)&out_data) >= 0)
+        // ★ 核心修复 2：把超时时间从 0 改成 10 毫秒，防止主循环死循环空转吃满 CPU
+        // 如果应用未初始化（比如切到后台），保持 -1 阻塞等待唤醒
+        int timeout = g_Initialized ? 10 : -1;
+        
+        while (ALooper_pollAll(timeout, NULL, &out_events, (void **)&out_data) >= 0)
         {
             // Process one event
             if (out_data != NULL)
@@ -293,17 +292,21 @@ void android_main(struct android_app *app)
             // Exit the app by returning from within the infinite loop
             if (app->destroyRequested != 0)
             {
-                // shutdown() should have been called already while processing the
-                // app command APP_CMD_TERM_WINDOW. But we play save here
                 if (!g_Initialized)
                     shutdown();
 
                 return;
             }
+            
+            // 如果有事件堆积，将 timeout 设为 0，快速清空事件队列
+            timeout = 0; 
         }
 
-        // Initiate a new frame
-        tick();
+        // ★ 核心修复 3：只有在窗口初始化后，才进行渲染更新
+        if (g_Initialized)
+        {
+            tick();
+        }
     }
 }
 
