@@ -31,8 +31,8 @@ namespace metop
 
         int errors[4];
 
-        // ★ 修复：加上命名空间前缀 avhrr:: 和 iasi::
-        avhrr::AVHRRMetOpReader avhrr_reader;
+        // ★ 终极修复：正确的命名空间和类名
+        noaa_metop::avhrr::AVHRRReader avhrr_reader;
         iasi::IASIIMGReader iasi_reader_img;
         
         ccsds::ccsds_aos::Demuxer demuxer_vcid9;
