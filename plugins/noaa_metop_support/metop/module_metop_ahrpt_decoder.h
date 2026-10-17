@@ -5,6 +5,11 @@
 #include "common/codings/viterbi/viterbi_3_4.h"
 #include <fstream>
 
+// ★ 引入计数需要的内容
+#include "common/ccsds/ccsds_aos/demuxer.h"
+#include "instruments/avhrr/avhrr_metop_reader.h"
+#include "instruments/iasi/iasi_imaging_reader.h"
+
 namespace metop
 {
     class MetOpAHRPTDecoderModule : public ProcessingModule
@@ -25,6 +30,12 @@ namespace metop
         deframing::BPSK_CCSDS_Deframer deframer;
 
         int errors[4];
+
+        // ★ 新增：用于内部计数的 reader 和 demuxer
+        AVHRRMetOpReader avhrr_reader;
+        IASIIMGReader iasi_reader_img;
+        ccsds::ccsds_aos::Demuxer demuxer_vcid9;
+        ccsds::ccsds_aos::Demuxer demuxer_vcid10;
 
         // UI Stuff
         float ber_history[200];

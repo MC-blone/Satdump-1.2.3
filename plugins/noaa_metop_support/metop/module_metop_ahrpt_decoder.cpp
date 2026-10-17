@@ -4,6 +4,12 @@
 #include "common/widgets/themed_widgets.h"
 #include "common/codings/randomization.h"
 
+// 需要引入解析和计数的头文件
+#include "common/ccsds/ccsds_aos/vcdu.h"
+#include "common/ccsds/ccsds_aos/demuxer.h"
+#include "instruments/avhrr/avhrr_metop_reader.h"
+#include "instruments/iasi/iasi_imaging_reader.h"
+
 #define BUFFER_SIZE 8192 * 2
 
 // Return filesize
@@ -11,10 +17,14 @@ uint64_t getFilesize(std::string filepath);
 
 namespace metop
 {
-    MetOpAHRPTDecoderModule::MetOpAHRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters) : ProcessingModule(input_file, output_file_hint, parameters),
-                                                                                                                                        d_viterbi_outsync_after(parameters["viterbi_outsync_after"].get<int>()),
-                                                                                                                                        d_viterbi_ber_thresold(parameters["viterbi_ber_thresold"].get<float>()),
-                                                                                                                                        viterbi(d_viterbi_ber_thresold, d_viterbi_outsync_after, BUFFER_SIZE)
+    MetOpAHRPTDecoderModule::MetOpAHRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters) 
+        : ProcessingModule(input_file, output_file_hint, parameters),
+          d_viterbi_outsync_after(parameters["viterbi_outsync_after"].get<int>()),
+          d_viterbi_ber_thresold(parameters["viterbi_ber_thresold"].get<float>()),
+          viterbi(d_viterbi_ber_thresold, d_viterbi_outsync_after, BUFFER_SIZE),
+          avhrr_reader(false, -1),      // 初始化 AVHRR reader
+          demuxer_vcid9(882, true),     // 初始化 Demuxer
+          demuxer_vcid10(882, true)     // 初始化 Demuxer
     {
         viterbi_out = new uint8_t[BUFFER_SIZE * 2];
         soft_buffer = new int8_t[BUFFER_SIZE];
@@ -28,8 +38,7 @@ namespace metop
 
     std::vector<ModuleDataType> MetOpAHRPTDecoderModule::getOutputTypes()
     {
-        // ★ 修改：同时支持文件输出和流输出
-        return {DATA_FILE, DATA_STREAM};
+        return {DATA_FILE}; // 不再需要 STREAM，因为我们自己做完了
     }
 
     MetOpAHRPTDecoderModule::~MetOpAHRPTDecoderModule()
@@ -44,21 +53,24 @@ namespace metop
             filesize = getFilesize(d_input_file);
         else
             filesize = 0;
+            
         if (input_data_type == DATA_FILE)
             data_in = std::ifstream(d_input_file, std::ios::binary);
 
-        // ★ 修改：只有文件输出模式才打开文件
-        if (output_data_type == DATA_FILE)
-        {
-            data_out = std::ofstream(d_output_file_hint + ".cadu", std::ios::binary);
-            d_output_files.push_back(d_output_file_hint + ".cadu");
-        }
+        // ★ 修改：用固定名保存 CADU，防止与上游冲突
+        std::string out_dir = d_output_file_hint;
+        size_t slash = out_dir.rfind('/');
+        if (slash != std::string::npos)
+            out_dir = out_dir.substr(0, slash);
+        else
+            out_dir = ".";
+
+        std::string cadu_path = out_dir + "/metop_ahrpt_raw.cadu";
+        data_out = std::ofstream(cadu_path, std::ios::binary);
+        d_output_files.push_back(cadu_path);
 
         logger->info("Using input symbols " + d_input_file);
-        if (output_data_type == DATA_FILE)
-            logger->info("Decoding to " + d_output_file_hint + ".cadu");
-        else
-            logger->info("Decoding to stream (FIFO)");
+        logger->info("Decoding to " + cadu_path);
 
         time_t lastTime = 0;
 
@@ -112,15 +124,25 @@ namespace metop
                     // RS Correction
                     rs.decode_interlaved(&cadu[4], true, 4, errors);
 
-                    // ★ 修改：按输出类型分别写入文件或 FIFO
-                    if (output_data_type == DATA_FILE)
+                    // Write it out
+                    data_out.write((char *)cadu, 1024);
+
+                    // ★ 新增：解析 VCDU，只对 AVHRR/IASI-IMG 计数
+                    ccsds::ccsds_aos::VCDU vcdu = ccsds::ccsds_aos::parseVCDU(cadu);
+
+                    if (vcdu.vcid == 9) // AVHRR/3
                     {
-                        data_out.write((char *)cadu, 1024);
+                        std::vector<ccsds::CCSDSPacket> ccsdsFrames = demuxer_vcid9.work(cadu);
+                        for (ccsds::CCSDSPacket &pkt : ccsdsFrames)
+                            if (pkt.header.apid == 103 || pkt.header.apid == 104)
+                                avhrr_reader.work_metop(pkt);
                     }
-                    else if (output_data_type == DATA_STREAM)
+                    else if (vcdu.vcid == 10) // IASI
                     {
-                        if (output_fifo)
-                            output_fifo->write(cadu, 1024);
+                        std::vector<ccsds::CCSDSPacket> ccsdsFrames = demuxer_vcid10.work(cadu);
+                        for (ccsds::CCSDSPacket &pkt : ccsdsFrames)
+                            if (pkt.header.apid == 150) // IASI-IMG
+                                iasi_reader_img.work(pkt);
                     }
                 }
             }
@@ -133,21 +155,28 @@ namespace metop
             module_stats["viterbi_ber"] = viterbi.ber();
             module_stats["viterbi_lock"] = viterbi.getState();
             module_stats["rs_avg"] = (errors[0] + errors[1] + errors[2] + errors[3]) / 4;
+            
+            // ★ 新增：更新计数统计
+            module_stats["avhrr_lines"]    = avhrr_reader.lines;
+            module_stats["iasi_img_lines"] = iasi_reader_img.lines * 64;
 
             if (time(NULL) % 10 == 0 && lastTime != time(NULL))
             {
                 lastTime = time(NULL);
                 std::string viterbi_state = viterbi.getState() == 0 ? "NOSYNC" : "SYNCED";
                 std::string deframer_state = deframer.getState() == deframer.STATE_NOSYNC ? "NOSYNC" : (deframer.getState() == deframer.STATE_SYNCING ? "SYNCING" : "SYNCED");
-                logger->info("Progress " + std::to_string(round(((double)progress / (double)filesize) * 1000.0) / 10.0) + "%%, Viterbi : " + viterbi_state + " BER : " + std::to_string(viterbi.ber()) + ", Deframer : " + deframer_state);
+                logger->info("Progress " + std::to_string(round(((double)progress / (double)filesize) * 1000.0) / 10.0) + "%%, Viterbi : " + viterbi_state + " BER : " + std::to_string(viterbi.ber()) + ", Deframer : " + deframer_state + 
+                             ", AVHRR : " + std::to_string(avhrr_reader.lines) + " lines" + 
+                             ", IASI-IMG : " + std::to_string(iasi_reader_img.lines * 64) + " lines");
             }
         }
 
-        // ★ 修改：只有文件输出模式才关闭文件
-        if (output_data_type == DATA_FILE)
-            data_out.close();
+        data_out.close();
         if (input_data_type == DATA_FILE)
             data_in.close();
+            
+        logger->info("AVHRR lines    : " + std::to_string(avhrr_reader.lines));
+        logger->info("IASI-IMG lines : " + std::to_string(iasi_reader_img.lines * 64));
     }
 
     void MetOpAHRPTDecoderModule::drawUI(bool window)
@@ -252,6 +281,20 @@ namespace metop
                             ImGui::TextColored(style::theme.green, "%i ", i);
                     }
                 }
+            }
+
+            ImGui::Spacing();
+
+            // ★ 新增：Counters UI 显示
+            ImGui::Button("Counters", {200 * ui_scale, 20 * ui_scale});
+            {
+                ImGui::Text("AVHRR    : ");
+                ImGui::SameLine();
+                ImGui::TextColored(style::theme.green, "%d", avhrr_reader.lines);
+                
+                ImGui::Text("IASI-IMG : ");
+                ImGui::SameLine();
+                ImGui::TextColored(style::theme.green, "%d", iasi_reader_img.lines * 64);
             }
         }
         ImGui::EndGroup();
