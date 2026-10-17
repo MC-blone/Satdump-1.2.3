@@ -74,13 +74,13 @@ void funcEndFrame()
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     eglSwapBuffers(g_EglDisplay, g_EglSurface);
 
-    // ★ 修复：在安卓端强制限制 UI 刷新率，防止空转吃满 CPU
+    // ★ 核心修复：强制限制 UI 刷新率，防止空转吃满 CPU
     static auto last_frame_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_time).count();
 
-    // 检查应用是否在后台/不可见状态 (比如息屏或切出APP)
-    bool is_in_background = (g_App->window == NULL) || (g_App->activity->window_flags == 0);
+    // Android 里判断后台最安全的方式就是看 window 是否存活
+    bool is_in_background = (g_App->window == NULL);
 
     if (is_in_background) {
         // 切到后台时，每秒只刷新 10 帧（100毫秒）节约电量
