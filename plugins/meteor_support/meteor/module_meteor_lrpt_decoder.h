@@ -7,6 +7,12 @@
 #include "common/codings/viterbi/viterbi_1_2.h"
 #include "common/codings/deframing/bpsk_ccsds_deframer.h"
 
+// ★ 引入统计所需的头文件
+#include "common/simple_deframer.h"
+#include "instruments/msumr/msumr_reader.h"
+#include "instruments/mtvza/mtvza_reader.h"
+#include "instruments/bism/bism_reader.h"
+
 namespace meteor
 {
     class METEORLRPTDecoderModule : public ProcessingModule
@@ -35,6 +41,20 @@ namespace meteor
 
         std::shared_ptr<viterbi::Viterbi1_2> viterbin, viterbin2;
         std::shared_ptr<deframing::BPSK_CCSDS_Deframer> deframer;
+
+        // ★ 新增：用于计数的 Reader 和 Deframer
+        msumr::MSUMRReader msumr_reader;
+        mtvza::MTVZAReader mtvza_reader, mtvza_reader2;
+        bism::BISMReader bism_reader;
+
+        def::SimpleDeframer msumr_deframer;
+        def::SimpleDeframer mtvza_deframer;
+        def::SimpleDeframer mtvza_deframer2;
+        def::SimpleDeframer bism_deframer;
+
+        // ★ 新增：BIS-M 数据提取文件流
+        std::ofstream bism_raw_out;
+        std::ofstream bism_bin_out;
 
         // UI Stuff
         float ber_history[200];
