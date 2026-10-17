@@ -771,21 +771,26 @@ namespace satdump
                         float y_pos = ImGui::GetCursorPosY() + 35 * ui_scale;
                         float live_width = recorder_size.x + 16 * ui_scale;
                         float live_height = 250 * ui_scale;
-                        float winwidth = live_pipeline->modules.size() > 0 ? live_width / live_pipeline->modules.size() : live_width;
-                        float currentPos = 0;
-                        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImGui::GetStyleColorVec4(ImGuiCol_TitleBg));
-                        for (std::shared_ptr<ProcessingModule> &module : live_pipeline->modules)
+                        
+                        // ★ 安全检查 1
+                        if (live_pipeline != nullptr && live_pipeline->modules.size() > 0)
                         {
-                            ImGui::SetNextWindowPos({currentPos, y_pos});
-                            ImGui::SetNextWindowSize({(float)winwidth, (float)live_height});
-                            module->drawUI(false);
-                            currentPos += winwidth;
-
-                            // if (ImGui::GetCurrentContext()->last_window != NULL)
-                            //     currentPos += ImGui::GetCurrentContext()->last_window->Size.x;
-                            //  logger->info(ImGui::GetCurrentContext()->last_window->Name);
+                            float winwidth = live_width / live_pipeline->modules.size();
+                            float currentPos = 0;
+                            ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImGui::GetStyleColorVec4(ImGuiCol_TitleBg));
+                            
+                            for (std::shared_ptr<ProcessingModule> &module : live_pipeline->modules)
+                            {
+                                // ★ 安全检查 2
+                                if (!module) continue;
+                                
+                                ImGui::SetNextWindowPos({currentPos, y_pos});
+                                ImGui::SetNextWindowSize({(float)winwidth, (float)live_height});
+                                module->drawUI(false);
+                                currentPos += winwidth;
+                            }
+                            ImGui::PopStyleColor();
                         }
-                        ImGui::PopStyleColor();
                         ImGui::EndTabItem();
                     }
                 }
@@ -800,21 +805,25 @@ namespace satdump
                             float y_pos = ImGui::GetCursorPosY() + 35 * ui_scale;
                             float live_width = recorder_size.x + 16 * ui_scale;
                             float live_height = 250 * ui_scale;
-                            float winwidth = vfo.live_pipeline->modules.size() > 0 ? live_width / vfo.live_pipeline->modules.size() : live_width;
-                            float currentPos = 0;
-                            ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImGui::GetStyleColorVec4(ImGuiCol_TitleBg));
-                            for (std::shared_ptr<ProcessingModule> &module : vfo.live_pipeline->modules)
+                            
+                            // ★ 安全检查 3
+                            if (vfo.live_pipeline != nullptr && vfo.live_pipeline->modules.size() > 0)
                             {
-                                ImGui::SetNextWindowPos({currentPos, y_pos});
-                                ImGui::SetNextWindowSize({(float)winwidth, (float)live_height});
-                                module->drawUI(false);
-                                currentPos += winwidth;
-
-                                // if (ImGui::GetCurrentContext()->last_window != NULL)
-                                //     currentPos += ImGui::GetCurrentContext()->last_window->Size.x;
-                                //  logger->info(ImGui::GetCurrentContext()->last_window->Name);
+                                float winwidth = live_width / vfo.live_pipeline->modules.size();
+                                float currentPos = 0;
+                                ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImGui::GetStyleColorVec4(ImGuiCol_TitleBg));
+                                for (std::shared_ptr<ProcessingModule> &module : vfo.live_pipeline->modules)
+                                {
+                                    // ★ 安全检查 4
+                                    if (!module) continue;
+                                    
+                                    ImGui::SetNextWindowPos({currentPos, y_pos});
+                                    ImGui::SetNextWindowSize({(float)winwidth, (float)live_height});
+                                    module->drawUI(false);
+                                    currentPos += winwidth;
+                                }
+                                ImGui::PopStyleColor();
                             }
-                            ImGui::PopStyleColor();
                         }
                         ImGui::EndTabItem();
                     }
@@ -826,31 +835,40 @@ namespace satdump
         }
         else if (is_processing)
         {
+            // ★ 安全检查 5
+            if (live_pipeline == nullptr)
+                return; 
+
             if (processing_modules_floating_windows)
             {
                 for (std::shared_ptr<ProcessingModule> &module : live_pipeline->modules)
-                    module->drawUI(true);
+                {
+                    if (module) 
+                        module->drawUI(true);
+                }
             }
             else
             {
                 float y_pos = ImGui::GetCursorPosY() + 35 * ui_scale;
                 float live_width = recorder_size.x + 16 * ui_scale;
                 float live_height = 250 * ui_scale;
-                float winwidth = live_pipeline->modules.size() > 0 ? live_width / live_pipeline->modules.size() : live_width;
-                float currentPos = 0;
-                ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImGui::GetStyleColorVec4(ImGuiCol_TitleBg));
-                for (std::shared_ptr<ProcessingModule> &module : live_pipeline->modules)
+                
+                if (live_pipeline->modules.size() > 0)
                 {
-                    ImGui::SetNextWindowPos({currentPos, y_pos});
-                    ImGui::SetNextWindowSize({(float)winwidth, (float)live_height});
-                    module->drawUI(false);
-                    currentPos += winwidth;
-
-                    // if (ImGui::GetCurrentContext()->last_window != NULL)
-                    //     currentPos += ImGui::GetCurrentContext()->last_window->Size.x;
-                    //  logger->info(ImGui::GetCurrentContext()->last_window->Name);
+                    float winwidth = live_width / live_pipeline->modules.size();
+                    float currentPos = 0;
+                    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImGui::GetStyleColorVec4(ImGuiCol_TitleBg));
+                    for (std::shared_ptr<ProcessingModule> &module : live_pipeline->modules)
+                    {
+                        if (!module) continue; 
+                        
+                        ImGui::SetNextWindowPos({currentPos, y_pos});
+                        ImGui::SetNextWindowSize({(float)winwidth, (float)live_height});
+                        module->drawUI(false);
+                        currentPos += winwidth;
+                    }
+                    ImGui::PopStyleColor();
                 }
-                ImGui::PopStyleColor();
             }
         }
 
