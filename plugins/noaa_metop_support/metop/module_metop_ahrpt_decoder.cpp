@@ -7,9 +7,8 @@
 // 需要引入解析和计数的头文件
 #include "common/ccsds/ccsds_aos/vcdu.h"
 #include "common/ccsds/ccsds_aos/demuxer.h"
-#include "instruments/avhrr/avhrr_metop_reader.h"
-#include "instruments/iasi/iasi_imaging_reader.h"
-
+#include "../instruments/avhrr/avhrr_reader.h"      // AVHRR 在 plugin 根目录
+#include "instruments/iasi/iasi_imaging_reader.h"   // IASI 在当前 metop 目录下
 #define BUFFER_SIZE 8192 * 2
 
 // Return filesize
