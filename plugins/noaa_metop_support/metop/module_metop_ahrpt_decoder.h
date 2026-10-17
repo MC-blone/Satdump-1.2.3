@@ -5,10 +5,11 @@
 #include "common/codings/viterbi/viterbi_3_4.h"
 #include <fstream>
 
-// ★ 引入计数需要的内容
+// ★ 引入需要的头文件
 #include "common/ccsds/ccsds_aos/demuxer.h"
 #include "../instruments/avhrr/avhrr_reader.h"      // AVHRR 在 plugin 根目录
-#include "instruments/iasi/iasi_imaging_reader.h"
+#include "instruments/iasi/iasi_imaging_reader.h"   // IASI 在当前 metop 目录下
+
 namespace metop
 {
     class MetOpAHRPTDecoderModule : public ProcessingModule
@@ -30,9 +31,10 @@ namespace metop
 
         int errors[4];
 
-        // ★ 新增：用于内部计数的 reader 和 demuxer
-        AVHRRMetOpReader avhrr_reader;
-        IASIIMGReader iasi_reader_img;
+        // ★ 修复：加上命名空间前缀 avhrr:: 和 iasi::
+        avhrr::AVHRRMetOpReader avhrr_reader;
+        iasi::IASIIMGReader iasi_reader_img;
+        
         ccsds::ccsds_aos::Demuxer demuxer_vcid9;
         ccsds::ccsds_aos::Demuxer demuxer_vcid10;
 
