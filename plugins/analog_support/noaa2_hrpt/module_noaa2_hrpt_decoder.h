@@ -4,6 +4,8 @@
 #include "imgui/imgui_image.h"
 #include "common/image/image.h"
 #include <vector>
+#include <mutex>
+#include <string>
 
 namespace noaa2_hrpt
 {
@@ -16,22 +18,21 @@ namespace noaa2_hrpt
         int samples_per_line = 13107;
         int line_cnt = 0;
 
-        // 原始全分辨率数据缓冲 (用于保存)
         std::vector<uint8_t> full_imagebuf;
         std::vector<uint8_t> current_line;
-
-        // UI Stuff
+        
+        // UI 缓存
         instrument_status_t decode_status = DECODING;
         bool has_to_update = false;
         unsigned int textureID = 0;
         uint32_t *textureBuffer = nullptr;
+        
+        int texture_width = 0;
+        int texture_height = 0;
 
-        // 预览 UI 状态
         float zoom = 1.0f;
-        ImVec2 pan_offset = ImVec2(0, 0);
         float aspect_ratio = 1.0f;
 
-        // 生成降采样预览
         void update_preview();
 
     public:
