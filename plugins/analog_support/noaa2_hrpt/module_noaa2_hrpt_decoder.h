@@ -4,7 +4,6 @@
 #include "imgui/imgui_image.h"
 #include "common/image/image.h"
 #include <vector>
-#include <mutex>
 #include <string>
 
 namespace noaa2_hrpt
@@ -28,15 +27,15 @@ namespace noaa2_hrpt
         
         int texture_width = 0;
         int texture_height = 0;
-
         float zoom = 1.0f;
         float aspect_ratio = 1.0f;
 
         void update_preview();
+        void apply_stretch_and_save(const std::vector<uint8_t>& raw_data, int w, int h, float p_low, float p_high, const std::string& filename);
 
     public:
         NOAA2HRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-        virtual ~NOAA2HRPTDecoderModule(); // ★ 修复警告：加上 virtual
+        virtual ~NOAA2HRPTDecoderModule();
         void process();
         void drawUI(bool window);
         std::vector<ModuleDataType> getInputTypes() { return {DATA_FILE, DATA_STREAM}; }
