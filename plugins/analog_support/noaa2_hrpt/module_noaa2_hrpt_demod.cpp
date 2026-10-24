@@ -24,22 +24,50 @@ namespace noaa2_hrpt
         constellation.d_vscale = 0.5;
         MIN_SPS = 1;
         MAX_SPS = 1000.0;
+
+        // 防止基类除 0
+        if (d_symbolrate <= 0) 
+            d_symbolrate = 60000;
     }
 
     void NOAA2HRPTDemodModule::init()
     {
         BaseDemodModule::initb();
 
-        // 使用 d_samplerate 保证重采样正确
+        // ★ 强制读取当前真实采样率
         double src_samplerate = d_samplerate;
         if (src_samplerate <= 0) src_samplerate = 2880000;
 
+        // 最终音频采样率固定为 60kHz (原始视频带宽)
+        audio_samplerate = 60000.0;
+
+        // ================= 打印计算日志 =================
+        logger->info("===== NOAA-2 DSP Configuration =====");
+        logger->info("Input Samplerate  : %.2f Hz", src_samplerate);
+        logger->info("Stage 1 Resample  : %.2f -> 1000000 Hz", src_samplerate);
+        logger->info("Stage 2 Resample  : 1000000 -> %.2f Hz", audio_samplerate);
+        logger->info("Expected SPL      : 13107 samples/line");
+        logger->info("Expected Lines/s  : %.2f lines/s", audio_samplerate / 13107.0);
+        logger->info("====================================");
+        // ===============================================
+
+        // 1. 阶段 1：真实采样率(2.88M) 降采样至 1 MHz
         res1 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, src_samplerate, 1000000);
+        
+        // 2. 第一次 FM 解调
         qua1 = std::make_shared<dsp::QuadratureDemodBlock>(res1->output_stream, dsp::hz_to_rad(1000000 / 2, 1000000));
+        
+        // 3. 实信号转复数
         rtc = std::make_shared<dsp::RealToComplexBlock>(qua1->output_stream);
+        
+        // 4. 频率偏移 -99 kHz
         fshift = std::make_shared<dsp::FreqShiftBlock>(rtc->output_stream, 1000000, -99000.0);
-        res2 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(fshift->output_stream, 6, 100);
-        qua2 = std::make_shared<dsp::QuadratureDemodBlock>(res2->output_stream, dsp::hz_to_rad(60000 / 2, 60000));
+        
+        // ★ 5. 阶段 2：核心修复！这里必须是 1000000 降采样到 audio_samplerate，不能写 6, 100
+        res2 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(fshift->output_stream, 1000000, audio_samplerate);
+        
+        // 6. 第二次 FM 解调
+        qua2 = std::make_shared<dsp::QuadratureDemodBlock>(res2->output_stream, dsp::hz_to_rad(audio_samplerate / 2, audio_samplerate));
     }
 
     NOAA2HRPTDemodModule::~NOAA2HRPTDemodModule() {}
@@ -76,14 +104,13 @@ namespace noaa2_hrpt
         uint64_t final_data_size = 0;
         dsp::WavWriter wave_writer(data_out);
         if (save_wav || output_data_type == DATA_FILE)
-            wave_writer.write_header(60000, 1);
+            wave_writer.write_header(audio_samplerate, 1);
 
-        // 只有实时流才会初始化声卡
         if (input_data_type != DATA_FILE && audio::has_sink())
         {
             enable_audio = true;
             audio_sink = audio::get_default_sink();
-            audio_sink->set_samplerate(60000);
+            audio_sink->set_samplerate(audio_samplerate);
             audio_sink->start();
         }
 
@@ -93,6 +120,8 @@ namespace noaa2_hrpt
             if (dat_size <= 0)
             {
                 qua2->output_stream->flush();
+                if (input_data_type == DATA_FILE && file_source->eof())
+                    break;
                 continue;
             }
 
@@ -193,27 +222,15 @@ namespace noaa2_hrpt
 
             ImGui::Checkbox("Save Audio (u8)", &save_audio);
 
-            // 只有在实时流成功获取声卡时，才显示音频控件
             if (enable_audio)
             {
                 const char *btn_icon, *label;
                 ImVec4 color;
-                if (play_audio) 
-                { 
-                    color = style::theme.green.Value; 
-                    btn_icon = u8"\uF028##audio"; 
-                    label = "Audio Playing"; 
-                }
-                else 
-                { 
-                    color = style::theme.red.Value; 
-                    btn_icon = u8"\uF026##audio"; 
-                    label = "Audio Muted"; 
-                }
+                if (play_audio) { color = style::theme.green.Value; btn_icon = u8"\uF028##audio"; label = "Audio Playing"; }
+                else { color = style::theme.red.Value; btn_icon = u8"\uF026##audio"; label = "Audio Muted"; }
 
                 ImGui::PushStyleColor(ImGuiCol_Text, color);
-                if (ImGui::Button(btn_icon)) 
-                    play_audio = !play_audio;
+                if (ImGui::Button(btn_icon)) play_audio = !play_audio;
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
                 ImGui::TextUnformatted(label);
