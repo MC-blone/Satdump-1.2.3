@@ -1,45 +1,51 @@
 #pragma once
 
-#include "core/module.h"
-#include "imgui/imgui_image.h"
-#include "common/image/image.h"
-#include <vector>
-#include <string>
+#include "modules/demod/module_demod_base.h"
+#include "common/dsp/demod/quadrature_demod.h"
+#include "common/dsp/utils/real_to_complex.h"
+#include "common/dsp/utils/freq_shift.h"
+#include "common/dsp/filter/fir.h"
+#include "common/dsp/io/wav_writer.h"
+#include "common/audio/audio_sink.h"
+#include <fstream>
 
 namespace noaa2_hrpt
 {
-    class NOAA2HRPTDecoderModule : public ProcessingModule
+    class NOAA2HRPTDemodModule : public demod::BaseDemodModule
     {
     protected:
-        std::atomic<uint64_t> filesize;
-        std::atomic<uint64_t> progress;
+        // ★ 不再使用 rsp，只保留到 fm2
+        std::shared_ptr<dsp::FIRBlock<complex_t>> filt1;       
+        std::shared_ptr<dsp::QuadratureDemodBlock> fm1;        
+        std::shared_ptr<dsp::RealToComplexBlock> rtc;          
+        std::shared_ptr<dsp::FreqShiftBlock> fsh;              
+        std::shared_ptr<dsp::FIRBlock<complex_t>> filt_lp;     
+        std::shared_ptr<dsp::QuadratureDemodBlock> fm2;        
 
-        int samples_per_line = 13107;
-        int line_cnt = 0;
-
-        std::vector<uint8_t> full_imagebuf;
-        std::vector<uint8_t> current_line;
+        bool save_wav = false;
+        bool save_audio = false;
+        std::ofstream audio_out;
         
-        instrument_status_t decode_status = DECODING;
-        bool has_to_update = false;
-        unsigned int textureID = 0;
-        uint32_t *textureBuffer = nullptr;
+        bool enable_audio = false;
+        bool play_audio = false;
+        float audio_volume = 1.0f;
+        std::shared_ptr<audio::AudioSink> audio_sink;
         
-        int texture_width = 0;
-        int texture_height = 0;
-        float zoom = 1.0f;
-        float aspect_ratio = 1.0f;
+        double audio_samplerate = 120000.0; 
 
-        void update_preview();
-        void apply_stretch_and_save(const std::vector<uint8_t>& raw_data, int w, int h, float p_low, float p_high, const std::string& filename);
+        // ★ 自定义流式重采样状态变量
+        double resample_step = 1.0;
+        double resample_phase = 0.0;
+        float last_sample = 0.0f;
+        bool has_last = false;
 
     public:
-        NOAA2HRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-        virtual ~NOAA2HRPTDecoderModule();
+        NOAA2HRPTDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+        virtual ~NOAA2HRPTDemodModule();
+        void init();
+        void stop();
         void process();
         void drawUI(bool window);
-        std::vector<ModuleDataType> getInputTypes() { return {DATA_FILE, DATA_STREAM}; }
-        std::vector<ModuleDataType> getOutputTypes() { return {DATA_FILE}; }
 
     public:
         static std::string getID();
