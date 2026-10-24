@@ -123,7 +123,10 @@ namespace noaa2_hrpt
     void NOAA2HRPTDecoderModule::process()
     {
         filesize = input_data_type == DATA_FILE ? getFilesize(d_input_file) : 0;
-        progress = 0;
+        
+        // ★ 修复报错：atomic 不能用拷贝赋值
+        progress = filesize.load(); 
+        
         line_cnt = 0;
         full_imagebuf.clear();
         current_line.clear();
@@ -210,8 +213,8 @@ namespace noaa2_hrpt
                     }
 
                     in.clear();
-                    in.seekg(chunk_data + (std::streamoff)chunk_size +
-                             (chunk_size & 1));
+                    // ★ 修复报错：增加 (std::streamoff) 强制转换消除二义性
+                    in.seekg(chunk_data + (std::streamoff)chunk_size + (std::streamoff)(chunk_size & 1));
                 }
 
                 if (!got_fmt || !got_data ||
@@ -219,8 +222,7 @@ namespace noaa2_hrpt
                     wav_channels != 1 ||
                     (wav_bits != 8 && wav_bits != 16))
                 {
-                    logger->error(
-                        "Unsupported WAV. Required: PCM, mono, 8-bit or 16-bit");
+                    logger->error("Unsupported WAV. Required: PCM, mono, 8-bit or 16-bit");
                     decode_status = DONE;
                     return;
                 }
@@ -233,8 +235,7 @@ namespace noaa2_hrpt
             else
             {
                 logger->info("Input format: %s",
-                             is_u8 ? "raw unsigned 8-bit PCM" :
-                                     "raw signed 16-bit PCM");
+                             is_u8 ? "raw unsigned 8-bit PCM" : "raw signed 16-bit PCM");
             }
         }
         else
@@ -264,8 +265,7 @@ namespace noaa2_hrpt
                     if (wav_read >= data_length)
                         break;
 
-                    want = (size_t)std::min<uint64_t>(
-                        want, data_length - wav_read);
+                    want = (size_t)std::min<uint64_t>(want, data_length - wav_read);
                 }
 
                 in.read((char *)raw.data(), (std::streamsize)want);
@@ -280,8 +280,8 @@ namespace noaa2_hrpt
                 if (is_wav)
                     progress = data_start + wav_read;
 
-                if (filesize > 0 && progress > filesize)
-                    progress = filesize;
+                if (filesize.load() > 0 && progress.load() > filesize.load())
+                    progress = filesize.load();
             }
             else
             {
@@ -342,12 +342,11 @@ namespace noaa2_hrpt
             if (now != last_log && now % 5 == 0)
             {
                 last_log = now;
-                double pct = filesize > 0
-                    ? std::min(100.0, (double)progress * 100.0 / (double)filesize)
+                double pct = filesize.load() > 0
+                    ? std::min(100.0, (double)progress.load() * 100.0 / (double)filesize.load())
                     : 0.0;
 
-                logger->info("Progress %.1f%% | Lines: %d",
-                             pct, line_cnt);
+                logger->info("Progress %.1f%% | Lines: %d", pct, line_cnt);
             }
 
             if (input_data_type != DATA_FILE && !input_active.load())
@@ -395,15 +394,12 @@ namespace noaa2_hrpt
                << std::setw(2) << tm_now.tm_min << "-"
                << std::setw(2) << tm_now.tm_sec;
 
-            std::string filename =
-                main_dir + "/" + ss.str() + "_noaa_2_hrpt_fm.png";
+            std::string filename = main_dir + "/" + ss.str() + "_noaa_2_hrpt_fm.png";
 
             logger->info("Saving %d lines (%d x %d): %s",
-                         line_cnt, samples_per_line, line_cnt,
-                         filename.c_str());
+                         line_cnt, samples_per_line, line_cnt, filename.c_str());
 
-            image::Image img(full_imagebuf.data(), 8,
-                             samples_per_line, line_cnt, 1);
+            image::Image img(full_imagebuf.data(), 8, samples_per_line, line_cnt, 1);
             image::save_img(img, filename);
 
             std::vector<uint8_t>().swap(full_imagebuf);
@@ -419,19 +415,15 @@ namespace noaa2_hrpt
 
     void NOAA2HRPTDecoderModule::drawUI(bool window)
     {
-        ImGui::Begin("NOAA-2 HRPT Decoder", nullptr,
-                     window ? 0 : NOWINDOW_FLAGS);
+        ImGui::Begin("NOAA-2 HRPT Decoder", nullptr, window ? 0 : NOWINDOW_FLAGS);
 
         if (textureID == 0)
             textureID = makeImageTexture();
 
-        float avail_width = std::max(100.0f,
-            ImGui::GetContentRegionAvail().x - 100 * ui_scale);
+        float avail_width = std::max(100.0f, ImGui::GetContentRegionAvail().x - 100 * ui_scale);
         float avail_height = 300 * ui_scale;
 
-        ImGui::BeginChild("ImageScroll",
-                          ImVec2(avail_width, avail_height),
-                          true, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::BeginChild("ImageScroll", ImVec2(avail_width, avail_height), true, ImGuiWindowFlags_HorizontalScrollbar);
 
         float ratio = aspect_ratio > 0 ? aspect_ratio : 1.0f;
         float display_height = avail_height * zoom;
@@ -445,11 +437,9 @@ namespace noaa2_hrpt
 
         if (textureID != 0 && textureBuffer != nullptr)
         {
-            ImGui::Image((void *)(intptr_t)textureID,
-                         ImVec2(display_width, display_height));
+            ImGui::Image((void *)(intptr_t)textureID, ImVec2(display_width, display_height));
 
-            if (ImGui::IsItemHovered() &&
-                ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
             {
                 ImVec2 delta = ImGui::GetIO().MouseDelta;
                 ImGui::SetScrollX(ImGui::GetScrollX() - delta.x);
@@ -487,32 +477,20 @@ namespace noaa2_hrpt
 
         if (input_data_type == DATA_FILE)
         {
-            float pct = filesize > 0
-                ? std::min(1.0f, (float)progress / (float)filesize)
+            float pct = filesize.load() > 0
+                ? std::min(1.0f, (float)progress.load() / (float)filesize.load())
                 : 0.0f;
-            ImGui::ProgressBar(pct,
-                ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
+            ImGui::ProgressBar(pct, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
         }
 
         ImGui::End();
     }
 
-    std::string NOAA2HRPTDecoderModule::getID()
-    {
-        return "noaa2_hrpt_decoder";
-    }
-
-    std::vector<std::string> NOAA2HRPTDecoderModule::getParameters()
-    {
-        return {"samples_per_line"};
-    }
-
+    std::string NOAA2HRPTDecoderModule::getID() { return "noaa2_hrpt_decoder"; }
+    std::vector<std::string> NOAA2HRPTDecoderModule::getParameters() { return {"samples_per_line"}; }
     std::shared_ptr<ProcessingModule> NOAA2HRPTDecoderModule::getInstance(
-        std::string input_file,
-        std::string output_file_hint,
-        nlohmann::json parameters)
+        std::string input_file, std::string output_file_hint, nlohmann::json parameters)
     {
-        return std::make_shared<NOAA2HRPTDecoderModule>(
-            input_file, output_file_hint, parameters);
+        return std::make_shared<NOAA2HRPTDecoderModule>(input_file, output_file_hint, parameters);
     }
 }

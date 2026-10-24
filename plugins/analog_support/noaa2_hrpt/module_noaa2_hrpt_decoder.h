@@ -36,7 +36,7 @@ namespace noaa2_hrpt
 
     public:
         NOAA2HRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-        ~NOAA2HRPTDecoderModule();
+        virtual ~NOAA2HRPTDecoderModule(); // ★ 修复警告：加上 virtual
         void process();
         void drawUI(bool window);
         std::vector<ModuleDataType> getInputTypes() { return {DATA_FILE, DATA_STREAM}; }
