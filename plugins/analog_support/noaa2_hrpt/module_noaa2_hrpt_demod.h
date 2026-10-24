@@ -30,7 +30,7 @@ namespace noaa2_hrpt
         float audio_volume = 1.0f;
         std::shared_ptr<audio::AudioSink> audio_sink;
         
-        double audio_samplerate = 60000.0; // ★ 新增：记录最终音频采样率
+        double audio_samplerate = 60000.0;
 
     public:
         NOAA2HRPTDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);

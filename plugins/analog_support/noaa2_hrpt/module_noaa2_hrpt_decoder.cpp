@@ -285,8 +285,9 @@ namespace noaa2_hrpt
             }
             else
             {
-                input_fifo->read(raw.data(), raw.size());
-                bytes_read = raw.size();
+                int read_ret = input_fifo->read(reinterpret_cast<uint8_t *>(raw.data()), raw.size());
+                if (read_ret < 0) break;
+                bytes_read = (size_t)read_ret;
             }
 
             if (is_u8)

@@ -4,6 +4,10 @@
 #include "logger.h"
 #include "imgui/imgui.h"
 #include <volk/volk.h>
+#include <vector>
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
 
 namespace noaa2_hrpt
 {
@@ -25,7 +29,6 @@ namespace noaa2_hrpt
         MIN_SPS = 1;
         MAX_SPS = 1000.0;
 
-        // 防止基类除 0
         if (d_symbolrate <= 0) 
             d_symbolrate = 60000;
     }
@@ -34,40 +37,28 @@ namespace noaa2_hrpt
     {
         BaseDemodModule::initb();
 
-        // ★ 强制读取当前真实采样率
         double src_samplerate = d_samplerate;
         if (src_samplerate <= 0) src_samplerate = 2880000;
 
-        // 最终音频采样率固定为 60kHz (原始视频带宽)
         audio_samplerate = 60000.0;
 
-        // ================= 打印计算日志 =================
-        logger->info("===== NOAA-2 DSP Configuration =====");
-        logger->info("Input Samplerate  : %.2f Hz", src_samplerate);
-        logger->info("Stage 1 Resample  : %.2f -> 1000000 Hz", src_samplerate);
-        logger->info("Stage 2 Resample  : 1000000 -> %.2f Hz", audio_samplerate);
-        logger->info("Expected SPL      : 13107 samples/line");
-        logger->info("Expected Lines/s  : %.2f lines/s", audio_samplerate / 13107.0);
-        logger->info("====================================");
-        // ===============================================
-
-        // 1. 阶段 1：真实采样率(2.88M) 降采样至 1 MHz
+        // 1. 降采样：源采样率 -> 1 MHz
         res1 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, src_samplerate, 1000000);
         
-        // 2. 第一次 FM 解调
-        qua1 = std::make_shared<dsp::QuadratureDemodBlock>(res1->output_stream, dsp::hz_to_rad(1000000 / 2, 1000000));
+        // 2. 第一次鉴频：注意增益改为 2.0 / PI，因为内部会取倒数
+        qua1 = std::make_shared<dsp::QuadratureDemodBlock>(res1->output_stream, 2.0f / float(M_PI));
         
-        // 3. 实信号转复数
+        // 3. 实转复
         rtc = std::make_shared<dsp::RealToComplexBlock>(qua1->output_stream);
         
-        // 4. 频率偏移 -99 kHz
+        // 4. 频移 -99 kHz
         fshift = std::make_shared<dsp::FreqShiftBlock>(rtc->output_stream, 1000000, -99000.0);
         
-        // ★ 5. 阶段 2：核心修复！这里必须是 1000000 降采样到 audio_samplerate，不能写 6, 100
-        res2 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(fshift->output_stream, 1000000, audio_samplerate);
+        // 5. 阶段 2：1 MHz 降采样至 60 kHz（采用严格整数比 3/50，防止行数暴涨）
+        res2 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(fshift->output_stream, 3, 50);
         
-        // 6. 第二次 FM 解调
-        qua2 = std::make_shared<dsp::QuadratureDemodBlock>(res2->output_stream, dsp::hz_to_rad(audio_samplerate / 2, audio_samplerate));
+        // 6. 第二次鉴频：增益同步改为 2.0 / PI
+        qua2 = std::make_shared<dsp::QuadratureDemodBlock>(res2->output_stream, 2.0f / float(M_PI));
     }
 
     NOAA2HRPTDemodModule::~NOAA2HRPTDemodModule() {}
@@ -79,7 +70,9 @@ namespace noaa2_hrpt
         else
             filesize = 0;
 
-        if (save_wav || output_data_type == DATA_FILE)
+        const bool write_wav = save_wav || output_data_type == DATA_FILE;
+
+        if (write_wav)
         {
             data_out = std::ofstream(d_output_file_hint + ".wav", std::ios::binary);
             d_output_files.push_back(d_output_file_hint + ".wav");
@@ -99,11 +92,14 @@ namespace noaa2_hrpt
         
         res1->start(); qua1->start(); rtc->start(); fshift->start(); res2->start(); qua2->start();
 
-        int16_t *output_wav_buffer = new int16_t[d_buffer_size * 100];
-        uint8_t *output_u8_buffer = new uint8_t[d_buffer_size * 100]; 
+        // 改用 vector 自动管理内存
+        std::vector<int16_t> output_wav_buffer(std::max<size_t>(static_cast<size_t>(d_buffer_size) * 100, 65536));
+        std::vector<uint8_t> output_u8_buffer(output_wav_buffer.size());
+
         uint64_t final_data_size = 0;
         dsp::WavWriter wave_writer(data_out);
-        if (save_wav || output_data_type == DATA_FILE)
+        
+        if (write_wav && data_out.is_open())
             wave_writer.write_header(audio_samplerate, 1);
 
         if (input_data_type != DATA_FILE && audio::has_sink())
@@ -125,6 +121,13 @@ namespace noaa2_hrpt
                 continue;
             }
 
+            // 越界保护
+            if (dat_size > static_cast<int>(output_wav_buffer.size()))
+            {
+                logger->error("NOAA-2 output block exceeds buffer capacity");
+                break;
+            }
+
             constellation.pushFloatAndGaussian(qua2->output_stream->readBuf, dat_size);
 
             for (int i = 0; i < dat_size; i++)
@@ -133,7 +136,7 @@ namespace noaa2_hrpt
                 if (qua2->output_stream->readBuf[i] < -1.0f) qua2->output_stream->readBuf[i] = -1.0f;
             }
 
-            volk_32f_s32f_convert_16i(output_wav_buffer, (float *)qua2->output_stream->readBuf, 32767, dat_size);
+            volk_32f_s32f_convert_16i(output_wav_buffer.data(), (float *)qua2->output_stream->readBuf, 32767, dat_size);
 
             if (save_audio && audio_out.is_open())
             {
@@ -144,7 +147,7 @@ namespace noaa2_hrpt
                     if (val > 255) val = 255;
                     output_u8_buffer[i] = (uint8_t)val;
                 }
-                audio_out.write((char *)output_u8_buffer, dat_size);
+                audio_out.write(reinterpret_cast<const char *>(output_u8_buffer.data()), static_cast<std::streamsize>(dat_size));
             }
 
             if (audio_volume != 1.0f && audio_volume != 0.0f)
@@ -159,39 +162,40 @@ namespace noaa2_hrpt
             }
 
             if (enable_audio && play_audio && audio_volume > 0.0f)
-                audio_sink->push_samples(output_wav_buffer, dat_size);
+                audio_sink->push_samples(output_wav_buffer.data(), dat_size);
 
-            if (save_wav || output_data_type == DATA_FILE)
+            if (write_wav && data_out.is_open())
             {
-                data_out.write((char *)output_wav_buffer, dat_size * sizeof(int16_t));
+                data_out.write(reinterpret_cast<const char *>(output_wav_buffer.data()), static_cast<std::streamsize>(dat_size * sizeof(int16_t)));
                 final_data_size += dat_size * sizeof(int16_t);
             }
-            if (output_data_type != DATA_FILE)
-                output_fifo->write((uint8_t *)output_wav_buffer, dat_size * sizeof(int16_t));
+            if (output_data_type != DATA_FILE && output_fifo)
+                output_fifo->write(reinterpret_cast<uint8_t *>(output_wav_buffer.data()), dat_size * sizeof(int16_t));
 
             qua2->output_stream->flush();
 
-            if (input_data_type == DATA_FILE)
-                progress = file_source->getPosition();
+            if (input_data_type == DATA_FILE && filesize > 0)
+            {
+                auto pos = file_source->getPosition();
+                progress = std::min<uint64_t>(pos, filesize);
+            }
 
             if (time(NULL) % 10 == 0 && lastTime != time(NULL))
             {
                 lastTime = time(NULL);
-                logger->info("Progress " + std::to_string(round(((double)progress / (double)filesize) * 1000.0) / 10.0) + "%%");
+                if (filesize > 0)
+                    logger->info("Progress %.1f%%", 100.0 * std::min<double>(1.0, double(progress) / double(filesize)));
             }
         }
 
-        if (enable_audio) audio_sink->stop();
+        if (enable_audio && audio_sink) audio_sink->stop();
 
-        if (save_wav || output_data_type == DATA_FILE)
+        if (write_wav && data_out.is_open())
         {
             wave_writer.finish_header(final_data_size);
             data_out.close();
         }
         if (audio_out.is_open()) audio_out.close();
-
-        delete[] output_wav_buffer;
-        delete[] output_u8_buffer;
         
         BaseDemodModule::stop();
         res1->stop(); qua1->stop(); rtc->stop(); fshift->stop(); res2->stop(); qua2->stop();
