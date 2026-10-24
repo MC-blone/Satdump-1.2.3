@@ -7,7 +7,7 @@
 #include "deframer.h"
 #include "common/widgets/constellation.h"
 
-// ★ 新增引入
+// ★ 引入计数所需的头文件
 #include "common/simple_deframer.h"
 #include "instruments/msumr/msumr_reader.h"
 #include "instruments/mtvza/mtvza_reader.h"
@@ -28,7 +28,16 @@ namespace meteor
         std::atomic<uint64_t> filesize;
         std::atomic<uint64_t> progress;
 
-        // ★ 新增：用于计数的 Reader 和 Deframer
+        // UI Stuff
+        widgets::ConstellationViewer constellation;
+
+        // ★ 新增：Fix 状态管理
+        bool use_fix = false;
+        int consecutive_syncs = 0;
+        time_t last_sync_time = 0;
+        bool fix_status_idle = true;
+
+        // ★ 计数与 BIS-M 提取相关的成员变量
         msumr::MSUMRReader msumr_reader;
         mtvza::MTVZAReader mtvza_reader, mtvza_reader2;
         bism::BISMReader bism_reader;
@@ -38,12 +47,8 @@ namespace meteor
         def::SimpleDeframer mtvza_deframer2;
         def::SimpleDeframer bism_deframer;
 
-        // ★ 新增：BIS-M 数据提取文件流
         std::ofstream bism_raw_out;
         std::ofstream bism_bin_out;
-
-        // UI Stuff
-        widgets::ConstellationViewer constellation;
 
     public:
         METEORHRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);

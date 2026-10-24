@@ -13,8 +13,8 @@ namespace meteor
     METEORHRPTDecoderModule::METEORHRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters) 
         : ProcessingModule(input_file, output_file_hint, parameters),
           constellation(1.0, 0.15, demod_constellation_size),
-          // ★ 初始化 Deframer 和 Reader
           bism_reader(-1),
+          // ★ 初始化 Deframer 和 Reader
           msumr_deframer(0x0218a7a392dd9abf, 64, 11850 * 8, 10, false),
           mtvza_deframer(0xFB386A45, 32, 248 * 8, 0, false),
           mtvza_deframer2(0x38fb456a, 32, 248 * 8, 0, false),
@@ -23,6 +23,9 @@ namespace meteor
         mtvza_reader2.endian_mode = true; // MTVZA2 必须设置大端模式
         def = std::make_shared<CADUDeframer>();
         soft_buffer = new int8_t[BUFFER_SIZE];
+
+        // ★ 读取 Fix 参数
+        use_fix = d_parameters.contains("Use Fix") ? d_parameters["Use Fix"].get<bool>() : false;
     }
 
     std::vector<ModuleDataType> METEORHRPTDecoderModule::getInputTypes()
@@ -52,7 +55,7 @@ namespace meteor
         data_out = std::ofstream(d_output_file_hint + ".cadu", std::ios::binary);
         d_output_files.push_back(d_output_file_hint + ".cadu");
 
-        // ★ 新增：打开 BIS-M 的存储文件
+        // 打开 BIS-M 的存储文件
         std::string out_dir = d_output_file_hint;
         size_t slash = out_dir.rfind('/');
         if (slash != std::string::npos)
@@ -69,7 +72,7 @@ namespace meteor
         time_t lastTime = 0;
         int frame_count = 0;
 
-        // ★ 提取仪器数据的通用 Lambda
+        // ★ 提取仪器数据（保留 MSU-MR、MTVZA 和 BIS-M）
         auto process_instrument_data = [this](uint8_t *cadu) {
             std::vector<std::vector<uint8_t>> msumr_frames, mtvza_frames, mtvza_frames2, bism_frames;
 
@@ -121,15 +124,54 @@ namespace meteor
 
             std::vector<std::array<uint8_t, CADU_SIZE>> frames = def->work(soft_buffer, BUFFER_SIZE);
 
+            // ★ Fix 逻辑核心
+            int current_state = def->getState();
+            if (current_state == 12) { // THRESOLD_STATE_3 (完美 SYNC)
+                consecutive_syncs++;
+                last_sync_time = time(NULL);
+                fix_status_idle = true;
+            }
+
+            // 超时检查：120秒内没搜到同步就停止修复
+            if (time(NULL) - last_sync_time >= 120) {
+                fix_status_idle = true;
+                consecutive_syncs = 0; // 重置
+            }
+
+            bool can_fix = use_fix && (consecutive_syncs >= 2) && (time(NULL) - last_sync_time < 120);
+
+            if (can_fix && current_state == 0 && frames.empty())
+            {
+                // 强行切一帧 (BUFFER_SIZE 正好是 8192 bit = 1024 bytes)
+                std::array<uint8_t, CADU_SIZE> fixed_frame;
+                fixed_frame[0] = 0x1A;
+                fixed_frame[1] = 0xCF;
+                fixed_frame[2] = 0xFC;
+                fixed_frame[3] = 0x1D;
+
+                // 将 8192 个软符号打包成 1020 字节数据
+                for (int i = 0; i < 1020 * 8; i++)
+                {
+                    int byte_idx = 4 + (i / 8);
+                    int bit_idx = 7 - (i % 8);
+                    if (soft_buffer[i] > 0)
+                        fixed_frame[byte_idx] |= (1 << bit_idx);
+                    else
+                        fixed_frame[byte_idx] &= ~(1 << bit_idx);
+                }
+                frames.push_back(fixed_frame);
+                fix_status_idle = false; // 显示 Use Fix
+            }
+
             // Count frames
             frame_count += frames.size();
 
-            // Write to file
+            // Write to file & process instruments
             if (frames.size() > 0)
             {
                 for (std::array<uint8_t, CADU_SIZE> frm : frames)
                 {
-                    // ★ 新增：统计仪器行数
+                    // ★ 恢复了这里的统计逻辑
                     process_instrument_data(frm.data());
 
                     data_out.write((char *)&frm[0], CADU_SIZE);
@@ -140,6 +182,8 @@ namespace meteor
                 progress = data_in.tellg();
 
             module_stats["deframer_lock"] = def->getState() == 12;
+            module_stats["avhrr_lines"]    = msumr_reader.lines;
+            module_stats["iasi_img_lines"] = mtvza_reader2.lines;
 
             if (time(NULL) % 10 == 0 && lastTime != time(NULL))
             {
@@ -152,7 +196,6 @@ namespace meteor
         logger->info("Decoding finished");
 
         data_out.close();
-        // ★ 关闭 BIS-M 文件
         if (bism_raw_out.is_open()) bism_raw_out.close();
         if (bism_bin_out.is_open()) bism_bin_out.close();
 
@@ -174,6 +217,19 @@ namespace meteor
 
         ImGui::BeginGroup();
         {
+            // ★ 新增 Fix UI 状态框
+            ImGui::Button("FIX", {200 * ui_scale, 20 * ui_scale});
+            {
+                ImGui::Text("Status : ");
+                ImGui::SameLine();
+                if (!fix_status_idle && use_fix)
+                    ImGui::TextColored(style::theme.green, "Use Fix");
+                else
+                    ImGui::TextColored(style::theme.red, "IDLE");
+            }
+
+            ImGui::Spacing();
+
             ImGui::Button("Deframer", {200 * ui_scale, 20 * ui_scale});
             {
                 ImGui::Text("State : ");
@@ -193,7 +249,7 @@ namespace meteor
         if (!streamingInput)
             ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
 
-        // ★ 新增：底部实时预览行数
+        // ★ 恢复底部的计数栏
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::TextColored(style::theme.green, "MSU-MR: %d", msumr_reader.lines);
@@ -212,7 +268,7 @@ namespace meteor
 
     std::vector<std::string> METEORHRPTDecoderModule::getParameters()
     {
-        return {"samplerate", "buffer_size", "baseband_format"};
+        return {"samplerate", "buffer_size", "baseband_format", "Use Fix"};
     }
 
     std::shared_ptr<ProcessingModule> METEORHRPTDecoderModule::getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters)

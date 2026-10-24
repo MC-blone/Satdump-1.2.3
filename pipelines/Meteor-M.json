@@ -27,6 +27,12 @@
                 "value": -1,
                 "name": "Year Override",
                 "description": "Override of the year used for timestamps.\nRequired when you are processing your file\nin a different year than the data was created."
+            },
+            "Use Fix": {
+                "type": "bool",
+                "value": false,
+                "name": "Use Fix(Testing in progress)",
+                "description": "Force insert sync headers and cut data to 1024-byte frames\nwhen deframer loses sync (requires 2 syncs prior, timeouts after 2m)."
             }
         },
         "work": {
@@ -40,7 +46,9 @@
                 }
             },
             "cadu": {
-                "meteor_hrpt_decoder": {}
+                "meteor_hrpt_decoder": {
+                    "Use Fix": false
+                }
             },
             "products": {
                 "meteor_instruments": {}
