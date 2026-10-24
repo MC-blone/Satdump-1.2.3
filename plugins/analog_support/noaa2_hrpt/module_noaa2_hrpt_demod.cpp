@@ -13,7 +13,7 @@ namespace noaa2_hrpt
         if (parameters.count("save_wav") > 0)
             save_wav = parameters["save_wav"].get<bool>();
 
-        // ★ 读取 save audio 配置
+        // 读取 save audio 配置
         if (parameters.count("save audio") > 0)
             save_audio = parameters["save audio"].get<bool>();
 
@@ -55,7 +55,7 @@ namespace noaa2_hrpt
             d_output_files.push_back(d_output_file_hint + ".wav");
         }
 
-        // ★ 打开原始音频文件
+        // 打开原始音频文件
         if (save_audio)
         {
             audio_out = std::ofstream(d_output_file_hint + "_audio.u8", std::ios::binary);
@@ -76,7 +76,7 @@ namespace noaa2_hrpt
         qua2->start();
 
         int16_t *output_wav_buffer = new int16_t[d_buffer_size * 100];
-        uint8_t *output_u8_buffer = new uint8_t[d_buffer_size * 100]; // ★ 用于 u8 保存
+        uint8_t *output_u8_buffer = new uint8_t[d_buffer_size * 100]; 
         uint64_t final_data_size = 0;
         dsp::WavWriter wave_writer(data_out);
         if (save_wav || output_data_type == DATA_FILE)
@@ -109,12 +109,10 @@ namespace noaa2_hrpt
 
             volk_32f_s32f_convert_16i(output_wav_buffer, (float *)qua2->output_stream->readBuf, 32767, dat_size);
 
-            // ★ 保存原始 u8 音频（在应用音量之前）
             if (save_audio && audio_out.is_open())
             {
                 for (int i = 0; i < dat_size; i++)
                 {
-                    // 将 int16 (-32768~32767) 映射到 uint8 (0~255)
                     int32_t val = (output_wav_buffer[i] >> 8) + 128;
                     if (val < 0) val = 0;
                     if (val > 255) val = 255;
@@ -123,7 +121,6 @@ namespace noaa2_hrpt
                 audio_out.write((char *)output_u8_buffer, dat_size);
             }
 
-            // 软件音量处理
             if (audio_volume != 1.0f && audio_volume != 0.0f)
             {
                 for (int i = 0; i < dat_size; i++)
@@ -171,13 +168,26 @@ namespace noaa2_hrpt
             data_out.close();
         }
         
-        // ★ 关闭音频文件
         if (audio_out.is_open())
             audio_out.close();
 
         delete[] output_wav_buffer;
         delete[] output_u8_buffer;
         
+        BaseDemodModule::stop();
+        res1->stop();
+        qua1->stop();
+        rtc->stop();
+        fshift->stop();
+        res2->stop();
+        qua2->stop();
+        qua2->output_stream->stopReader();
+    }
+
+    // ★ 修复：补充缺失的 stop() 实现
+    void NOAA2HRPTDemodModule::stop()
+    {
+        // 停止所有 DSP 模块
         BaseDemodModule::stop();
         res1->stop();
         qua1->stop();
@@ -204,7 +214,6 @@ namespace noaa2_hrpt
                 if (ImGui::Checkbox("Show FFT", &show_fft))
                     fft_splitter->set_enabled("fft", show_fft);
 
-            // ★ 添加保存音频复选框
             ImGui::Checkbox("Save Audio (u8)", &save_audio);
 
             if (enable_audio)
