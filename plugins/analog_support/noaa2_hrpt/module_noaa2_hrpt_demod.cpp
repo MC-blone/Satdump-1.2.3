@@ -30,21 +30,15 @@ namespace noaa2_hrpt
     {
         BaseDemodModule::initb();
 
-        // ★ 修复：使用真实的采样率而不是 symbolrate
-        double src_samplerate = get_samplerate();
+        // 使用 d_samplerate 保证重采样正确
+        double src_samplerate = d_samplerate;
         if (src_samplerate <= 0) src_samplerate = 2880000;
 
-        // 1. 阶段 1：降采样至 1 MHz
         res1 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, src_samplerate, 1000000);
-        // 2. 第一次 FM 解调
         qua1 = std::make_shared<dsp::QuadratureDemodBlock>(res1->output_stream, dsp::hz_to_rad(1000000 / 2, 1000000));
-        // 3. 实信号转复数
         rtc = std::make_shared<dsp::RealToComplexBlock>(qua1->output_stream);
-        // 4. 频率偏移 -99 kHz
         fshift = std::make_shared<dsp::FreqShiftBlock>(rtc->output_stream, 1000000, -99000.0);
-        // 5. 阶段 2：降采样至 60 kHz
         res2 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(fshift->output_stream, 6, 100);
-        // 6. 第二次 FM 解调
         qua2 = std::make_shared<dsp::QuadratureDemodBlock>(res2->output_stream, dsp::hz_to_rad(60000 / 2, 60000));
     }
 
@@ -84,6 +78,7 @@ namespace noaa2_hrpt
         if (save_wav || output_data_type == DATA_FILE)
             wave_writer.write_header(60000, 1);
 
+        // 只有实时流才会初始化声卡
         if (input_data_type != DATA_FILE && audio::has_sink())
         {
             enable_audio = true;
@@ -198,15 +193,27 @@ namespace noaa2_hrpt
 
             ImGui::Checkbox("Save Audio (u8)", &save_audio);
 
+            // 只有在实时流成功获取声卡时，才显示音频控件
             if (enable_audio)
             {
                 const char *btn_icon, *label;
                 ImVec4 color;
-                if (play_audio) { color = style::theme.green.Value; btn_icon = u8"\uF028##audio"; label = "Audio Playing"; }
-                else { color = style::theme.red.Value; btn_icon = u8"\uF026##audio"; label = "Audio Muted"; }
+                if (play_audio) 
+                { 
+                    color = style::theme.green.Value; 
+                    btn_icon = u8"\uF028##audio"; 
+                    label = "Audio Playing"; 
+                }
+                else 
+                { 
+                    color = style::theme.red.Value; 
+                    btn_icon = u8"\uF026##audio"; 
+                    label = "Audio Muted"; 
+                }
 
                 ImGui::PushStyleColor(ImGuiCol_Text, color);
-                if (ImGui::Button(btn_icon)) play_audio = !play_audio;
+                if (ImGui::Button(btn_icon)) 
+                    play_audio = !play_audio;
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
                 ImGui::TextUnformatted(label);
