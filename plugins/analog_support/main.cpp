@@ -8,13 +8,14 @@
 
 #include "generic/module_generic_analog_demod.h"
 
+// ★ 引入 NOAA-2 模块
+#include "noaa2_hrpt/module_noaa2_hrpt_demod.h"
+#include "noaa2_hrpt/module_noaa2_hrpt_decoder.h"
+
 class AnalogSupport : public satdump::Plugin
 {
 public:
-    std::string getID()
-    {
-        return "analog_support";
-    }
+    std::string getID() { return "analog_support"; }
 
     void init()
     {
@@ -26,8 +27,11 @@ public:
     {
         REGISTER_MODULE_EXTERNAL(evt.modules_registry, noaa_apt::NOAAAPTDemodModule);
         REGISTER_MODULE_EXTERNAL(evt.modules_registry, noaa_apt::NOAAAPTDecoderModule);
-
         REGISTER_MODULE_EXTERNAL(evt.modules_registry, generic_analog::GenericAnalogDemodModule);
+        
+        // ★ 注册 NOAA-2 模块
+        REGISTER_MODULE_EXTERNAL(evt.modules_registry, noaa2_hrpt::NOAA2HRPTDemodModule);
+        REGISTER_MODULE_EXTERNAL(evt.modules_registry, noaa2_hrpt::NOAA2HRPTDecoderModule);
     }
 
     static void provideSatProjHandler(const satdump::RequestSatProjEvent &evt)

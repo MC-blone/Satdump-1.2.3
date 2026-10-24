@@ -1,0 +1,41 @@
+{
+    "noaa_2_hrpt": {
+        "name": "NOAA-2 (ITOS-D) HRPT",
+        "live": true,
+        "live_cfg": [
+            [
+                1,
+                0
+            ],
+            [
+                2,
+                0
+            ]
+        ],
+        "frequencies": [
+            [
+                "Main",
+                1697.5e6
+            ]
+        ],
+        "parameters": {
+            "samplerate": {
+                "value": 3e6
+            }
+        },
+        "work": {
+            "baseband": {},
+            "soft": {
+                "noaa2_hrpt_demod": {
+                    "save_wav": false,
+                    "save audio": false
+                }
+            },
+            "cadu": {
+                "noaa2_hrpt_decoder": {
+                    "samples_per_line": 13107
+                }
+            }
+        }
+    }
+}
