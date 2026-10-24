@@ -8,7 +8,6 @@
 
 namespace noaa2_hrpt
 {
-    // ★ 修复：类名必须叫 NOAA2HRPTDecoderModule
     class NOAA2HRPTDecoderModule : public ProcessingModule
     {
     protected:

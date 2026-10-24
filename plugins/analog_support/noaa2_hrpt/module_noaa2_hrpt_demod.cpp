@@ -3,7 +3,7 @@
 #include "core/config.h"
 #include "logger.h"
 #include "imgui/imgui.h"
-#include "common/wav.h" // ★ 用于自动识别 WAV 采样率
+#include "common/wav.h"
 #include <volk/volk.h>
 #include <vector>
 #include <cmath>
@@ -24,7 +24,6 @@ namespace noaa2_hrpt
         constellation.d_hscale = 1.0;
         constellation.d_vscale = 0.5;
 
-        // ★ 确保基类不会因为 symbolrate=0 而除零崩溃
         if (d_symbolrate <= 0) d_symbolrate = 60000;
     }
 
@@ -32,7 +31,6 @@ namespace noaa2_hrpt
 
     void NOAA2HRPTDemodModule::init()
     {
-        // ★ 核心修改：如果是文件模式，自动读取 WAV 文件头的真实采样率
         if (input_data_type == DATA_FILE)
         {
             wav::WavHeader hdr = wav::parseHeaderFromFileWav(d_input_file);
@@ -58,7 +56,6 @@ namespace noaa2_hrpt
         filt_lp = std::make_shared<dsp::FIRBlock<complex_t>>(fsh->output_stream, dsp::firdes::low_pass(1, fs, 40000, 10000));
         fm2 = std::make_shared<dsp::QuadratureDemodBlock>(filt_lp->output_stream, 2.0f / float(M_PI));
 
-        // ★ 初始化自定义重采样参数
         resample_step = fs / audio_samplerate;
         resample_phase = 0.0;
         has_last = false;
@@ -78,7 +75,6 @@ namespace noaa2_hrpt
         BaseDemodModule::start();
         filt1->start(); fm1->start(); rtc->start(); fsh->start(); filt_lp->start(); fm2->start();
 
-        // 用于预分配输出缓冲的容器
         std::vector<int16_t> output_wav_buffer;
         uint64_t final_data_size = 0;
         dsp::WavWriter wave_writer(data_out);
@@ -107,7 +103,6 @@ namespace noaa2_hrpt
                 if (fm2->output_stream->readBuf[i] < -1.0f) fm2->output_stream->readBuf[i] = -1.0f;
             }
 
-            // ★ 自定义流式重采样：区间累积插值法
             int max_out = (int)(dat_size / resample_step) + 2;
             output_wav_buffer.resize(max_out);
             int n_out = 0;
@@ -120,7 +115,6 @@ namespace noaa2_hrpt
                     continue;
                 }
 
-                // 在 [last_sample, current] 之间按 step 插值输出
                 while (resample_phase < 1.0) {
                     float val = last_sample * (1.0f - resample_phase) + current * resample_phase;
                     output_wav_buffer[n_out++] = (int16_t)(val * 32767);
@@ -130,7 +124,6 @@ namespace noaa2_hrpt
                 last_sample = current;
             }
 
-            // ★ 音频音量处理
             if (enable_audio && play_audio && audio_volume != 1.0f && audio_volume > 0.0f)
             {
                 for (int i = 0; i < n_out; ++i)
@@ -142,17 +135,13 @@ namespace noaa2_hrpt
                 }
             }
 
-            // 推入声卡
             if (enable_audio && play_audio && audio_volume > 0.0f && n_out > 0)
                 audio_sink->push_samples(output_wav_buffer.data(), n_out);
 
-            // 写入 WAV
             if (write_wav && data_out.is_open() && n_out > 0) {
                 data_out.write(reinterpret_cast<const char *>(output_wav_buffer.data()), n_out * sizeof(int16_t));
                 final_data_size += n_out * sizeof(int16_t);
             }
-            
-            // 推送到 FIFO 给下游解码器
             if (output_data_type != DATA_FILE && output_fifo && n_out > 0)
                 output_fifo->write(reinterpret_cast<uint8_t *>(output_wav_buffer.data()), n_out * sizeof(int16_t));
 
@@ -180,56 +169,31 @@ namespace noaa2_hrpt
     void NOAA2HRPTDemodModule::drawUI(bool window)
     {
         ImGui::Begin(name.c_str(), NULL, window ? 0 : NOWINDOW_FLAGS);
-        ImGui::BeginGroup(); 
-        constellation.draw(); 
-        ImGui::EndGroup();
-        
+        ImGui::BeginGroup(); constellation.draw(); ImGui::EndGroup();
         ImGui::SameLine();
-        
         ImGui::BeginGroup();
         {
             ImGui::Button("Signal", { 200 * ui_scale, 20 * ui_scale });
             if (!streamingInput)
-                if (ImGui::Checkbox("Show FFT", &show_fft)) 
-                    fft_splitter->set_enabled("fft", show_fft);
-            
+                if (ImGui::Checkbox("Show FFT", &show_fft)) fft_splitter->set_enabled("fft", show_fft);
             ImGui::Checkbox("Save Audio (u8)", &save_audio);
-
-            // ★ 恢复音频播放和音量控制面板
             if (enable_audio)
             {
                 const char *btn_icon, *label;
                 ImVec4 color;
-                if (play_audio) 
-                { 
-                    color = style::theme.green.Value; 
-                    btn_icon = u8"\uF028##audio"; 
-                    label = "Audio Playing"; 
-                }
-                else 
-                { 
-                    color = style::theme.red.Value; 
-                    btn_icon = u8"\uF026##audio"; 
-                    label = "Audio Muted"; 
-                }
-
+                if (play_audio) { color = style::theme.green.Value; btn_icon = u8"\uF028##audio"; label = "Audio Playing"; }
+                else { color = style::theme.red.Value; btn_icon = u8"\uF026##audio"; label = "Audio Muted"; }
                 ImGui::PushStyleColor(ImGuiCol_Text, color);
-                if (ImGui::Button(btn_icon)) 
-                    play_audio = !play_audio;
+                if (ImGui::Button(btn_icon)) play_audio = !play_audio;
                 ImGui::PopStyleColor();
-                
                 ImGui::SameLine();
                 ImGui::TextUnformatted(label);
-
                 ImGui::SetNextItemWidth(200 * ui_scale);
                 ImGui::SliderFloat("Volume##audiovol", &audio_volume, 0.0f, 2.0f, "%.2fx");
             }
         }
         ImGui::EndGroup();
-
-        if (!streamingInput) 
-            ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
-        
+        if (!streamingInput) ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
         drawStopButton();
         ImGui::End();
         drawFFT();

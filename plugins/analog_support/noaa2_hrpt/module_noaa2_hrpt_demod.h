@@ -32,7 +32,7 @@ namespace noaa2_hrpt
         
         double audio_samplerate = 120000.0; 
 
-        // ★ 补上缺失的流式重采样变量声明
+        // 流式重采样变量
         double resample_step = 1.0;
         double resample_phase = 0.0;
         float last_sample = 0.0f;
