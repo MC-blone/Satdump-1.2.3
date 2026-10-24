@@ -7,7 +7,6 @@
 #include "common/dsp/resamp/rational_resampler.h"
 #include "common/dsp/io/wav_writer.h"
 #include "common/audio/audio_sink.h"
-#include <fstream>
 
 namespace noaa2_hrpt
 {
@@ -22,8 +21,6 @@ namespace noaa2_hrpt
         std::shared_ptr<dsp::QuadratureDemodBlock> qua2;
 
         bool save_wav = false;
-        
-        // ★ 音频保存与播放
         bool save_audio = false;
         std::ofstream audio_out;
         

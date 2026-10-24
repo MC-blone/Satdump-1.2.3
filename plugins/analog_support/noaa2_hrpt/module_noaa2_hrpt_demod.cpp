@@ -12,8 +12,6 @@ namespace noaa2_hrpt
     {
         if (parameters.count("save_wav") > 0)
             save_wav = parameters["save_wav"].get<bool>();
-
-        // 读取 save audio 配置
         if (parameters.count("save audio") > 0)
             save_audio = parameters["save audio"].get<bool>();
 
@@ -32,11 +30,21 @@ namespace noaa2_hrpt
     {
         BaseDemodModule::initb();
 
-        res1 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, d_symbolrate, 1000000);
+        // ★ 修复：使用真实的采样率而不是 symbolrate
+        double src_samplerate = get_samplerate();
+        if (src_samplerate <= 0) src_samplerate = 2880000;
+
+        // 1. 阶段 1：降采样至 1 MHz
+        res1 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, src_samplerate, 1000000);
+        // 2. 第一次 FM 解调
         qua1 = std::make_shared<dsp::QuadratureDemodBlock>(res1->output_stream, dsp::hz_to_rad(1000000 / 2, 1000000));
+        // 3. 实信号转复数
         rtc = std::make_shared<dsp::RealToComplexBlock>(qua1->output_stream);
+        // 4. 频率偏移 -99 kHz
         fshift = std::make_shared<dsp::FreqShiftBlock>(rtc->output_stream, 1000000, -99000.0);
+        // 5. 阶段 2：降采样至 60 kHz
         res2 = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(fshift->output_stream, 6, 100);
+        // 6. 第二次 FM 解调
         qua2 = std::make_shared<dsp::QuadratureDemodBlock>(res2->output_stream, dsp::hz_to_rad(60000 / 2, 60000));
     }
 
@@ -55,7 +63,6 @@ namespace noaa2_hrpt
             d_output_files.push_back(d_output_file_hint + ".wav");
         }
 
-        // 打开原始音频文件
         if (save_audio)
         {
             audio_out = std::ofstream(d_output_file_hint + "_audio.u8", std::ios::binary);
@@ -68,12 +75,7 @@ namespace noaa2_hrpt
         time_t lastTime = 0;
         BaseDemodModule::start();
         
-        res1->start();
-        qua1->start();
-        rtc->start();
-        fshift->start();
-        res2->start();
-        qua2->start();
+        res1->start(); qua1->start(); rtc->start(); fshift->start(); res2->start(); qua2->start();
 
         int16_t *output_wav_buffer = new int16_t[d_buffer_size * 100];
         uint8_t *output_u8_buffer = new uint8_t[d_buffer_size * 100]; 
@@ -133,9 +135,7 @@ namespace noaa2_hrpt
             }
 
             if (enable_audio && play_audio && audio_volume > 0.0f)
-            {
                 audio_sink->push_samples(output_wav_buffer, dat_size);
-            }
 
             if (save_wav || output_data_type == DATA_FILE)
             {
@@ -143,9 +143,7 @@ namespace noaa2_hrpt
                 final_data_size += dat_size * sizeof(int16_t);
             }
             if (output_data_type != DATA_FILE)
-            {
                 output_fifo->write((uint8_t *)output_wav_buffer, dat_size * sizeof(int16_t));
-            }
 
             qua2->output_stream->flush();
 
@@ -159,49 +157,33 @@ namespace noaa2_hrpt
             }
         }
 
-        if (enable_audio)
-            audio_sink->stop();
+        if (enable_audio) audio_sink->stop();
 
         if (save_wav || output_data_type == DATA_FILE)
         {
             wave_writer.finish_header(final_data_size);
             data_out.close();
         }
-        
-        if (audio_out.is_open())
-            audio_out.close();
+        if (audio_out.is_open()) audio_out.close();
 
         delete[] output_wav_buffer;
         delete[] output_u8_buffer;
         
         BaseDemodModule::stop();
-        res1->stop();
-        qua1->stop();
-        rtc->stop();
-        fshift->stop();
-        res2->stop();
-        qua2->stop();
+        res1->stop(); qua1->stop(); rtc->stop(); fshift->stop(); res2->stop(); qua2->stop();
         qua2->output_stream->stopReader();
     }
 
-    // ★ 修复：补充缺失的 stop() 实现
     void NOAA2HRPTDemodModule::stop()
     {
-        // 停止所有 DSP 模块
         BaseDemodModule::stop();
-        res1->stop();
-        qua1->stop();
-        rtc->stop();
-        fshift->stop();
-        res2->stop();
-        qua2->stop();
+        res1->stop(); qua1->stop(); rtc->stop(); fshift->stop(); res2->stop(); qua2->stop();
         qua2->output_stream->stopReader();
     }
 
     void NOAA2HRPTDemodModule::drawUI(bool window)
     {
         ImGui::Begin(name.c_str(), NULL, window ? 0 : NOWINDOW_FLAGS);
-        
         ImGui::BeginGroup();
         constellation.draw();
         ImGui::EndGroup();
@@ -220,22 +202,11 @@ namespace noaa2_hrpt
             {
                 const char *btn_icon, *label;
                 ImVec4 color;
-                if (play_audio)
-                {
-                    color = style::theme.green.Value;
-                    btn_icon = u8"\uF028##audio";
-                    label = "Audio Playing";
-                }
-                else
-                {
-                    color = style::theme.red.Value;
-                    btn_icon = u8"\uF026##audio";
-                    label = "Audio Muted";
-                }
+                if (play_audio) { color = style::theme.green.Value; btn_icon = u8"\uF028##audio"; label = "Audio Playing"; }
+                else { color = style::theme.red.Value; btn_icon = u8"\uF026##audio"; label = "Audio Muted"; }
 
                 ImGui::PushStyleColor(ImGuiCol_Text, color);
-                if (ImGui::Button(btn_icon))
-                    play_audio = !play_audio;
+                if (ImGui::Button(btn_icon)) play_audio = !play_audio;
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
                 ImGui::TextUnformatted(label);
