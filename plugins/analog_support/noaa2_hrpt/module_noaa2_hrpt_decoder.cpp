@@ -20,7 +20,6 @@ namespace noaa2_hrpt
     {
         if (parameters.contains("samples_per_line")) samples_per_line = parameters["samples_per_line"].get<int>();
         if (samples_per_line < 1) samples_per_line = 13107;
-        
         full_imagebuf.reserve((size_t)samples_per_line * 5000);
         current_line.reserve(samples_per_line * 2);
         filesize = 0;
@@ -32,8 +31,11 @@ namespace noaa2_hrpt
         if (textureID != 0) deleteImageTexture(textureID);
     }
 
+    // 修复全黑预览的关键：在预览时自动计算数据的最暗和最亮像素，实时拉伸
     void NOAA2HRPTDecoderModule::update_preview() {
-        if (line_cnt <= 0 || full_imagebuf.size() < (size_t)samples_per_line * line_cnt) return;
+        std::lock_guard<std::mutex> lock(img_mtx);
+        if (line_cnt <= 0 || full_imagebuf.empty()) return;
+        
         aspect_ratio = (float)samples_per_line / (float)line_cnt;
         const int max_size = 2500;
         int w, h;
@@ -44,6 +46,7 @@ namespace noaa2_hrpt
             h = std::min(line_cnt, max_size);
             w = std::max(1, (int)(h * aspect_ratio));
         }
+
         if (textureBuffer == nullptr || texture_width != w || texture_height != h) {
             delete[] textureBuffer;
             textureBuffer = new uint32_t[(size_t)w * h];
@@ -52,12 +55,23 @@ namespace noaa2_hrpt
             if (textureID != 0) deleteImageTexture(textureID);
             textureID = makeImageTexture();
         }
+
+        // 计算当前所有像素的最大最小值
+        int vmin = 255, vmax = 0;
+        for (uint8_t v : full_imagebuf) {
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+        if (vmax == vmin) vmax = vmin + 1;
+
         for (int y = 0; y < h; ++y) {
             int sy = (int)((int64_t)y * line_cnt / h);
             for (int x = 0; x < w; ++x) {
                 int sx = (int)((int64_t)x * samples_per_line / w);
                 uint8_t v = full_imagebuf[(size_t)sy * samples_per_line + sx];
-                textureBuffer[(size_t)y * w + x] = (255u << 24) | ((uint32_t)v << 16) | ((uint32_t)v << 8) | v;
+                // 实时拉伸到 0~255
+                uint8_t stretched = (uint8_t)(((int)v - vmin) * 255 / (vmax - vmin));
+                textureBuffer[(size_t)y * w + x] = (255u << 24) | ((uint32_t)stretched << 16) | ((uint32_t)stretched << 8) | stretched;
             }
         }
         updateImageTexture(textureID, textureBuffer, w, h);
@@ -69,22 +83,17 @@ namespace noaa2_hrpt
         std::sort(sorted.begin(), sorted.end());
         int pmin_idx = std::clamp((int)(sorted.size() * (p_low / 100.0)), 0, (int)sorted.size() - 1);
         int pmax_idx = std::clamp((int)(sorted.size() * (p_high / 100.0)), 0, (int)sorted.size() - 1);
-        
         int pmin = sorted[pmin_idx];
         int pmax = sorted[pmax_idx];
         if (pmax <= pmin) pmax = pmin + 1;
 
         std::vector<uint8_t> stretched(raw_data.size());
         for (size_t i = 0; i < raw_data.size(); ++i) {
-            int val = raw_data[i];
-            int mapped = std::clamp((val - pmin) * 255 / (pmax - pmin), 0, 255);
-            stretched[i] = (uint8_t)mapped;
+            stretched[i] = (uint8_t)std::clamp((raw_data[i] - pmin) * 255 / (pmax - pmin), 0, 255);
         }
 
         image::Image img(stretched.data(), 8, w, h, 1);
-        if (w != samples_per_line) {
-            img.resize(samples_per_line, h);
-        }
+        if (w != samples_per_line) img.resize(samples_per_line, h);
         image::save_img(img, filename);
     }
 
@@ -103,31 +112,25 @@ namespace noaa2_hrpt
 
         std::ifstream in;
         bool is_u8 = false;
+        int sp_out = samples_per_line * 2; // 120kHz 下的一行像素数
 
         if (input_data_type == DATA_FILE) {
             in.open(d_input_file, std::ios::binary);
-            if (!in) { decode_status = DONE; return; }
-
-            // 暴力 WAV 处理：读取前 44 字节，如果包含 "RIFF" 跳过，否则认为是 raw 流
             char header[44];
             in.read(header, 44);
             if (in.gcount() == 44 && std::memcmp(header, "RIFF", 4) == 0 && std::memcmp(header + 8, "WAVE", 4) == 0) {
-                logger->info("Valid WAV header found, skipping 44 bytes.");
-                is_u8 = false;
+                is_u8 = false; 
             } else {
-                logger->info("Not a standard WAV, assuming raw 8-bit stream.");
                 in.seekg(0, std::ios::beg);
-                is_u8 = true;
+                is_u8 = true; 
             }
         }
-
-        // 解调器输出为 120kHz，所以每行像素为 26214
-        int sp_out = samples_per_line * 2; 
 
         std::vector<uint8_t> raw(65536);
         time_t last_log = 0;
         int last_preview_line = 0;
 
+        // 实时流循环
         while (input_data_type == DATA_FILE ? (bool)in : input_active.load()) {
             size_t bytes_read = 0;
             if (input_data_type == DATA_FILE) {
@@ -138,29 +141,31 @@ namespace noaa2_hrpt
                 if (filesize.load() > 0 && progress.load() > filesize.load()) progress = filesize.load();
             } else {
                 if (!input_active.load()) break;
-                int read_ret = input_fifo->read(reinterpret_cast<uint8_t *>(raw.data()), raw.size());
-                if (read_ret < 0) break;
-                bytes_read = (size_t)read_ret;
+                if (input_fifo->read(raw.data(), raw.size()) < 0) break;
+                bytes_read = raw.size();
             }
 
-            if (is_u8) {
-                for (size_t i = 0; i < bytes_read; ++i) {
-                    current_line.push_back(raw[i]);
-                    if ((int)current_line.size() == sp_out) {
-                        full_imagebuf.insert(full_imagebuf.end(), current_line.begin(), current_line.end());
-                        current_line.clear(); ++line_cnt;
+            {
+                std::lock_guard<std::mutex> lock(img_mtx);
+                if (is_u8) {
+                    for (size_t i = 0; i < bytes_read; ++i) {
+                        current_line.push_back(raw[i]);
+                        if ((int)current_line.size() == sp_out) {
+                            full_imagebuf.insert(full_imagebuf.end(), current_line.begin(), current_line.end());
+                            current_line.clear(); ++line_cnt;
+                        }
                     }
-                }
-            } else {
-                size_t usable = bytes_read & ~(size_t)1;
-                for (size_t i = 0; i < usable; i += 2) {
-                    int16_t sample;
-                    std::memcpy(&sample, raw.data() + i, sizeof(sample));
-                    int value = std::clamp(((int)sample >> 8) + 128, 0, 255);
-                    current_line.push_back((uint8_t)value);
-                    if ((int)current_line.size() == sp_out) {
-                        full_imagebuf.insert(full_imagebuf.end(), current_line.begin(), current_line.end());
-                        current_line.clear(); ++line_cnt;
+                } else {
+                    size_t usable = bytes_read & ~(size_t)1;
+                    for (size_t i = 0; i < usable; i += 2) {
+                        int16_t sample;
+                        std::memcpy(&sample, raw.data() + i, sizeof(sample));
+                        int value = std::clamp(((int)sample >> 8) + 128, 0, 255);
+                        current_line.push_back((uint8_t)value);
+                        if ((int)current_line.size() == sp_out) {
+                            full_imagebuf.insert(full_imagebuf.end(), current_line.begin(), current_line.end());
+                            current_line.clear(); ++line_cnt;
+                        }
                     }
                 }
             }
@@ -182,11 +187,13 @@ namespace noaa2_hrpt
         if (in.is_open()) in.close();
         
         decode_status = PROCESSING;
-        
-        if (!current_line.empty()) {
-            current_line.resize(sp_out, 0);
-            full_imagebuf.insert(full_imagebuf.end(), current_line.begin(), current_line.end());
-            current_line.clear(); ++line_cnt;
+        {
+            std::lock_guard<std::mutex> lock(img_mtx);
+            if (!current_line.empty()) {
+                current_line.resize(sp_out, 0);
+                full_imagebuf.insert(full_imagebuf.end(), current_line.begin(), current_line.end());
+                current_line.clear(); ++line_cnt;
+            }
         }
 
         if (line_cnt > 0) {
@@ -208,10 +215,12 @@ namespace noaa2_hrpt
             std::string base_name = main_dir + "/" + ss.str() + "_noaa_2_hrpt_fm";
             
             logger->info("Applying percentiles stretch and saving...");
-            apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 0.1f, 99.9f, base_name + "_原始动态.png");
-            apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 2.0f, 98.0f, base_name + "_增强对比.png");
-
-            std::vector<uint8_t>().swap(full_imagebuf);
+            {
+                std::lock_guard<std::mutex> lock(img_mtx);
+                apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 0.1f, 99.9f, base_name + "_原始动态.png");
+                apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 2.0f, 98.0f, base_name + "_增强对比.png");
+                std::vector<uint8_t>().swap(full_imagebuf);
+            }
             logger->info("Decode complete and images saved.");
         } else {
             logger->error("No complete image lines decoded");
@@ -222,7 +231,14 @@ namespace noaa2_hrpt
 
     void NOAA2HRPTDecoderModule::drawUI(bool window) {
         ImGui::Begin("NOAA-2 HRPT Decoder", nullptr, window ? 0 : NOWINDOW_FLAGS);
-        if (textureID == 0) textureID = makeImageTexture();
+        
+        if (textureID == 0) {
+            textureID = makeImageTexture();
+            textureBuffer = new uint32_t[1]{0};
+            updateImageTexture(textureID, textureBuffer, 1, 1);
+        }
+        
+        if (has_to_update) update_preview();
 
         float avail_width = std::max(100.0f, ImGui::GetContentRegionAvail().x - 100 * ui_scale);
         float avail_height = 300 * ui_scale;

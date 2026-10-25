@@ -5,6 +5,7 @@
 #include "common/image/image.h"
 #include <vector>
 #include <string>
+#include <mutex>
 
 namespace noaa2_hrpt
 {
@@ -19,7 +20,8 @@ namespace noaa2_hrpt
 
         std::vector<uint8_t> full_imagebuf;
         std::vector<uint8_t> current_line;
-        
+        std::mutex img_mtx;
+
         instrument_status_t decode_status = DECODING;
         bool has_to_update = false;
         unsigned int textureID = 0;
