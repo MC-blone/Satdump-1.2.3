@@ -1,8 +1,13 @@
 #include "module_noaa2_hrpt_demod.h"
 #include "common/dsp/filter/firdes.h"
+#include "common/dsp/source/strict_file_source.h"
+#include "common/dsp/utils/wav_writer.h"
+#include "common/dsp/resamp/rational_resampler.h"
+#include "common/dsp/filter/fir.h"
 #include "core/config.h"
 #include "logger.h"
 #include "imgui/imgui.h"
+#include "utils/file.h"
 #include <volk/volk.h>
 #include <vector>
 #include <numeric>
@@ -15,7 +20,6 @@ namespace noaa2_hrpt
         : ProcessingModule(input_file, output_file_hint, parameters),
           constellation(1.0, 0.15, demod_constellation_size)
     {
-        // 自动从流水线参数中读取
         if (parameters.count("samplerate") > 0) d_samplerate = parameters["samplerate"].get<double>();
         if (parameters.count("baseband_format") > 0) baseband_format = parameters["baseband_format"].get<std::string>();
         if (parameters.count("save_wav") > 0) save_wav = parameters["save_wav"].get<bool>();
@@ -31,9 +35,8 @@ namespace noaa2_hrpt
         double subcarrier = 99000.0;
         double bw = 200000.0;
 
-        // 建立 DSP 链路
         if (input_data_type == DATA_FILE) {
-            filesize = getFilesize(d_input_file);
+            filesize = satdump::getFilesize(d_input_file);
             baseband_io = std::make_shared<dsp::StrictFileSource>();
             if (!baseband_io->open(d_input_file, baseband_format)) {
                 logger->error("Failed to open input file!");
@@ -74,7 +77,6 @@ namespace noaa2_hrpt
         dsp::WavWriter wave_writer(data_out);
         if (write_wav && data_out.is_open()) wave_writer.write_header(audio_samplerate, 1);
 
-        // 实时模式开启音频
         if (input_data_type != DATA_FILE && audio::has_sink()) {
             enable_audio = true;
             audio_sink = audio::get_default_sink();
@@ -82,17 +84,18 @@ namespace noaa2_hrpt
             audio_sink->start();
         }
 
-        // 实时输入读取容器
         std::vector<int8_t> raw_in(65536 * 2);
         complex_t* read_buf = (complex_t*)malloc(65536 * sizeof(complex_t));
 
         while (input_active.load())
         {
+            int avail = 0;
+
             if (input_data_type == DATA_FILE) {
-                int avail = rsp->output_stream->read();
-                if (avail < 0) break; // StrictFileSource 关闭
+                avail = rsp->output_stream->read();
+                if (avail < 0) break;
                 if (avail == 0) { rsp->output_stream->flush(); continue; }
-                
+
                 constellation.pushFloatAndGaussian(rsp->output_stream->readBuf, avail);
                 for (int i = 0; i < avail; i++) {
                     if (rsp->output_stream->readBuf[i] > 1.0f) rsp->output_stream->readBuf[i] = 1.0f;
@@ -100,20 +103,21 @@ namespace noaa2_hrpt
                 }
                 volk_32f_s32f_convert_16i(output_wav_buffer.data(), (float *)rsp->output_stream->readBuf, 32767, avail);
                 rsp->output_stream->flush();
-                
+
                 progress = baseband_io->get_progress();
             } else {
-                // 实时流模式：从 FIFO 读取 int8_t 软符号 (来自 psk_demod)
-                // 如果上一级输出的是 cs16，这里可能需要改，但 psk_demod 通常是 8-bit
-                if (input_fifo->read(reinterpret_cast<uint8_t*>(raw_in.data()), 65536 * 2) < 0) break;
-                
-                for (int i = 0; i < 65536; i++) {
+                int n = input_fifo->read(reinterpret_cast<uint8_t*>(raw_in.data()), 65536 * 2);
+                if (n < 0) break;
+                if (n == 0) continue;
+
+                int ncomplex = n / 2;
+                for (int i = 0; i < ncomplex; i++) {
                     read_buf[i] = complex_t(raw_in[i*2] / 127.0f, raw_in[i*2+1] / 127.0f);
                 }
-                memcpy(input_stream->writeBuf, read_buf, 65536 * sizeof(complex_t));
-                input_stream->swap(65536);
+                memcpy(input_stream->writeBuf, read_buf, ncomplex * sizeof(complex_t));
+                input_stream->swap(ncomplex);
 
-                int avail = rsp->output_stream->read();
+                avail = rsp->output_stream->read();
                 if (avail <= 0) { rsp->output_stream->flush(); continue; }
 
                 constellation.pushFloatAndGaussian(rsp->output_stream->readBuf, avail);
@@ -125,36 +129,35 @@ namespace noaa2_hrpt
                 rsp->output_stream->flush();
             }
 
-            // 统一处理音频输出
-            int avail = (input_data_type == DATA_FILE) ? 65536 : 65536; // 随便给个足够大的，这里只做写入处理
-            if (output_wav_buffer.size() > 0) {
-                // 保存 u8
-                if (save_audio && audio_out.is_open()) {
-                    for (int i = 0; i < avail; i++) {
-                        int32_t val = (output_wav_buffer[i] >> 8) + 128;
-                        output_u8_buffer[i] = (uint8_t)std::clamp(val, 0, 255);
-                    }
-                    audio_out.write(reinterpret_cast<const char*>(output_u8_buffer.data()), avail);
-                }
-                
-                // 实时播放
-                if (enable_audio && play_audio && audio_volume > 0.0f) {
-                    for (int i = 0; i < avail; i++) {
-                        int32_t v = (int32_t)(output_wav_buffer[i] * audio_volume);
-                        output_wav_buffer[i] = (int16_t)std::clamp(v, -32768, 32767);
-                    }
-                    audio_sink->push_samples(output_wav_buffer.data(), avail);
-                }
+            if (avail <= 0) continue;
 
-                // 保存 WAV
-                if (write_wav && data_out.is_open()) {
-                    data_out.write(reinterpret_cast<const char*>(output_wav_buffer.data()), avail * sizeof(int16_t));
-                    final_data_size += avail * sizeof(int16_t);
+            // 保存 u8
+            if (save_audio && audio_out.is_open()) {
+                for (int i = 0; i < avail; i++) {
+                    int32_t val = (output_wav_buffer[i] >> 8) + 128;
+                    output_u8_buffer[i] = (uint8_t)std::clamp(val, 0, 255);
                 }
-                // 推给解码器
-                if (output_data_type != DATA_FILE && output_fifo) {
-                    output_fifo->write(reinterpret_cast<uint8_t*>(output_wav_buffer.data()), avail * sizeof(int16_t));
+                audio_out.write(reinterpret_cast<const char*>(output_u8_buffer.data()), avail);
+            }
+
+            // 实时播放
+            if (enable_audio && play_audio && audio_volume > 0.0f) {
+                for (int i = 0; i < avail; i++) {
+                    int32_t v = (int32_t)(output_wav_buffer[i] * audio_volume);
+                    output_wav_buffer[i] = (int16_t)std::clamp(v, -32768, 32767);
                 }
+                audio_sink->push_samples(output_wav_buffer.data(), avail);
+            }
+
+            // 保存 WAV
+            if (write_wav && data_out.is_open()) {
+                data_out.write(reinterpret_cast<const char*>(output_wav_buffer.data()), avail * sizeof(int16_t));
+                final_data_size += avail * sizeof(int16_t);
+            }
+
+            // 推给解码器
+            if (output_data_type != DATA_FILE && output_fifo) {
+                output_fifo->write(reinterpret_cast<uint8_t*>(output_wav_buffer.data()), avail * sizeof(int16_t));
             }
         }
 
@@ -165,6 +168,8 @@ namespace noaa2_hrpt
         if (enable_audio && audio_sink) audio_sink->stop();
         if (write_wav && data_out.is_open()) { wave_writer.finish_header(final_data_size); data_out.close(); }
         if (audio_out.is_open()) audio_out.close();
+
+        free(read_buf);
     }
 
     void NOAA2HRPTDemodModule::drawUI(bool window)
@@ -172,7 +177,7 @@ namespace noaa2_hrpt
         ImGui::Begin("NOAA-2 HRPT Demodulator", NULL, window ? 0 : NOWINDOW_FLAGS);
 
         ImGui::BeginGroup();
-        constellation.draw(); 
+        constellation.draw();
         ImGui::EndGroup();
 
         ImGui::SameLine();
