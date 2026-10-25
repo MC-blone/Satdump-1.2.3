@@ -1,6 +1,6 @@
 #include "module_noaa2_hrpt_demod.h"
 #include "common/dsp/filter/firdes.h"
-#include "common/dsp/source/strict_file_source.h"
+#include "#include common/dsp/io/file_source.h"
 #include "common/dsp/utils/wav_writer.h"
 #include "common/dsp/resamp/rational_resampler.h"
 #include "common/dsp/filter/fir.h"
