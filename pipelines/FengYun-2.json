@@ -58,7 +58,10 @@
             },
             "products": {
                 "fengyun_svissr_image_decoder": {
-                    "satname": "FY-2x"
+                    "satname": "FY-2x",
+                    "apply_correction": false,
+                    "save_telemetry": true,
+                    "no_save_img":false
                 }
             }
         }
@@ -114,7 +117,9 @@
             },
             "products": {
                 "fengyun_svissr_image_decoder": {
-                    "satname": "FY-2x"
+                    "satname": "FY-2x",
+                    "apply_correction": false,
+                    "save_telemetry": false
                 }
             }
         }

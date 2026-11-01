@@ -18,9 +18,8 @@ namespace fengyun_svissr
     public:
         SVISSRReader();
         ~SVISSRReader();
-        void pushFrame(uint8_t *data);
+        void pushFrame(uint8_t *data, bool decode_vis = true); // 【修改】新增 decode_vis 参数
         void reset();
-        image::Image getImage();
         image::Image getImageIR1();
         image::Image getImageIR2();
         image::Image getImageIR3();

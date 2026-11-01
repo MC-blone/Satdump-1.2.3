@@ -39,7 +39,7 @@ namespace fengyun_svissr
         std::fill(&goodLines[0], &goodLines[MAX_HEIGHT], false);
     }
 
-    void SVISSRReader::pushFrame(uint8_t *data)
+    void SVISSRReader::pushFrame(uint8_t *data, bool decode_vis)
     {
         int counter = (data[67]) << 8 | (data[68]); // Decode line counter
 
@@ -108,6 +108,7 @@ namespace fengyun_svissr
         }
 
         // Decode VIS
+        if (decode_vis) // 【修改】根据参数决定是否解码可见光
         {
             for (int run = 0; run < 4; run++)
             {
@@ -143,7 +144,6 @@ namespace fengyun_svissr
 
     image::Image SVISSRReader::getImageIR1()
     {
-        // Fill missing lines by averaging above and below line
         for (int y = 1; y < MAX_HEIGHT - 1; y++)
         {
             bool &current = goodLines[y];
@@ -157,13 +157,11 @@ namespace fengyun_svissr
                 }
             }
         }
-
         return image::Image(&imageBufferIR1[0], 16, WIDTH_IR, MAX_HEIGHT, 1);
     }
 
     image::Image SVISSRReader::getImageIR2()
     {
-        // Fill missing lines by averaging above and below line
         for (int y = 1; y < MAX_HEIGHT - 1; y++)
         {
             bool &current = goodLines[y];
@@ -177,13 +175,11 @@ namespace fengyun_svissr
                 }
             }
         }
-
         return image::Image(&imageBufferIR2[0], 16, WIDTH_IR, MAX_HEIGHT, 1);
     }
 
     image::Image SVISSRReader::getImageIR3()
     {
-        // Fill missing lines by averaging above and below line
         for (int y = 1; y < MAX_HEIGHT - 1; y++)
         {
             bool &current = goodLines[y];
@@ -197,13 +193,11 @@ namespace fengyun_svissr
                 }
             }
         }
-
         return image::Image(&imageBufferIR3[0], 16, WIDTH_IR, MAX_HEIGHT, 1);
     }
 
     image::Image SVISSRReader::getImageIR4()
     {
-        // Fill missing lines by averaging above and below line
         for (int y = 1; y < MAX_HEIGHT - 1; y++)
         {
             bool &current = goodLines[y];
@@ -217,13 +211,11 @@ namespace fengyun_svissr
                 }
             }
         }
-
         return image::Image(&imageBufferIR4[0], 16, WIDTH_IR, MAX_HEIGHT, 1);
     }
 
     image::Image SVISSRReader::getImageVIS()
     {
-        // Fill missing lines by averaging above and below line
         for (int y = 1; y < MAX_HEIGHT - 1; y++)
         {
             bool &current = goodLines[y];
@@ -240,7 +232,6 @@ namespace fengyun_svissr
                 }
             }
         }
-
         return image::Image(&imageBufferVIS[0], 16, WIDTH_VIS, MAX_HEIGHT * 4, 1);
     }
 }

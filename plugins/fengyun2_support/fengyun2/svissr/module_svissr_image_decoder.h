@@ -5,14 +5,34 @@
 #include <fstream>
 #include "image/svissr_reader.h"
 #include <thread>
+#include <map>
 
 namespace fengyun_svissr
 {
+    enum SVISSRSubCommunicationBlockType
+    {
+        Simplified_mapping,
+        Orbit_and_attitude,
+        MANAM,
+        Calibration_1,
+        Calibration_2,
+        Spare
+    };
+
+    struct SVISSRSubcommunicationBlock
+    {
+        int start_offset;
+        int end_offset;
+    };
+
+    typedef std::vector<uint8_t> Group;
+    typedef std::vector<uint8_t> MinorFrame;
+
     class SVISSRImageDecoderModule : public ProcessingModule
     {
     protected:
         // Settings
-        const std::string sat_name;
+        std::string sat_name;
 
         // Read buffer
         uint8_t *frame;
@@ -26,19 +46,25 @@ namespace fengyun_svissr
         bool writingImage = false;
         int valid_lines;
         float approx_progess;
+        
+        // 新增/保留参数
+        bool apply_correction;
+        bool save_telemetry;
+        bool no_save_img;      // 【新增】是否仅预览不保存
+        int preview_ch;        // 【新增】当前预览通道 (2 或 4)
+        std::ofstream output_svissr; // 【新增】用于内部输出 .svissr 文件
+        int global_counter;
+        bool counter_locked = false;
 
         struct SVISSRBuffer
         {
             int scid;
-
             double timestamp;
-
             image::Image image1;
             image::Image image2;
             image::Image image3;
             image::Image image4;
             image::Image image5;
-
             std::string directory;
         };
 
@@ -68,7 +94,6 @@ namespace fengyun_svissr
                     writeImages(*img);
                     continue;
                 }
-
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }
@@ -78,8 +103,18 @@ namespace fengyun_svissr
 
         // Stats
         std::vector<int> scid_stats;
+        std::vector<std::vector<uint8_t>> detector_telemetry_stats;
+
+        // Subcommunication block handling
+        void save_subcom_frame();
+        std::vector<MinorFrame> subcommunication_frames;
+        MinorFrame current_subcom_frame;
+        std::vector<Group> group_retransmissions;
+        void write_MANAM(time_t unix_timestamp, std::vector<uint8_t> manam_data);
+        void write_telemetry(time_t unix_timestamp, std::string telemetry_jsonc);
 
         // UI Stuff
+        bool sat_is_eclipsed = false;
         unsigned int textureID = 0;
         uint32_t *textureBuffer;
 
@@ -97,4 +132,4 @@ namespace fengyun_svissr
         static std::vector<std::string> getParameters();
         static std::shared_ptr<ProcessingModule> getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
     };
-} // namespace elektro_arktika
+}
