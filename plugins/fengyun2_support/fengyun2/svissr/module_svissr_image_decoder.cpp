@@ -5,14 +5,50 @@
 #include "imgui/imgui_image.h"
 #include <filesystem>
 #include "resources.h"
-#include "common/utils.h"        // 修复：替换了 utils/majority_law.h
+#include "common/utils.h"
 #include "common/image/io.h"
+#include <cstring>
+#include <map>
 
 #define FRAME_SIZE 44356
 #define SUBCOM_START_OFFSET 196
 #define SUBCOM_GROUP_SIZE 2097
 
 uint64_t getFilesize(std::string filepath);
+
+// ====== 补充 2.0 版本的大数定律函数，1.2.3 没有 ======
+void majority_law(uint8_t *in, uint8_t *out, int length, int count)
+{
+    for (int i = 0; i < length; i++)
+    {
+        int ones = 0;
+        for (int c = 0; c < count; c++)
+        {
+            for (int b = 0; b < 8; b++)
+            {
+                if ((in[c * length + i] >> b) & 1)
+                    ones++;
+            }
+        }
+        if (ones > (count * 8) / 2)
+            out[i] = 0xFF;
+        else
+            out[i] = 0x00;
+    }
+}
+
+std::vector<uint8_t> majority_law_vec(const std::vector<std::vector<uint8_t>> &in)
+{
+    if (in.empty()) return {};
+    std::vector<uint8_t> out(in[0].size());
+    uint8_t *in_arr = new uint8_t[in.size() * in[0].size()];
+    for (size_t i = 0; i < in.size(); i++)
+        memcpy(&in_arr[i * in[0].size()], in[i].data(), in[i].size());
+    majority_law(in_arr, out.data(), out.size(), in.size());
+    delete[] in_arr;
+    return out;
+}
+// ==================================================
 
 std::map<fengyun_svissr::SVISSRSubCommunicationBlockType, fengyun_svissr::SVISSRSubcommunicationBlock> subcom_blocks = {
     {fengyun_svissr::Simplified_mapping, {0, 99}}, {fengyun_svissr::Orbit_and_attitude, {100, 227}}, {fengyun_svissr::MANAM, {228, 637}},
@@ -89,7 +125,7 @@ namespace fengyun_svissr
     void SVISSRImageDecoderModule::save_subcom_frame()
     {
         if (!group_retransmissions.empty() && current_subcom_frame.size() / SUBCOM_GROUP_SIZE == 24) {
-            Group last_group = satdump::majority_law_vec(group_retransmissions);
+            Group last_group = majority_law_vec(group_retransmissions); // 修改：去掉了 satdump::
             group_retransmissions.clear();
             current_subcom_frame.insert(current_subcom_frame.end(), last_group.begin(), last_group.end());
             logger->debug("Saved a subcom frame!");
@@ -121,7 +157,7 @@ namespace fengyun_svissr
         bool process_subcom_data = false;
 
         if (!subcommunication_frames.empty()) {
-            final_subcom_frame = satdump::majority_law_vec(subcommunication_frames);
+            final_subcom_frame = majority_law_vec(subcommunication_frames); // 修改：去掉了 satdump::
             int errors = get_spare_errors(final_subcom_frame);
             logger->debug("Final subcom data errors: %d/35800", errors);
             if (errors < 32) process_subcom_data = true;
@@ -134,10 +170,10 @@ namespace fengyun_svissr
             OrbitAndAttitudeData *orbit_attitude_block = reinterpret_cast<OrbitAndAttitudeData *>(orbit_attitude_data_unstructured.data());
 
             AttitudePredictionSubBlock attitude_prediction_data;
-            satdump::majority_law(orbit_attitude_block->ATTITUDE_PREDICTION_SUBBLOCKS, reinterpret_cast<uint8_t *>(&attitude_prediction_data));
+            majority_law((uint8_t*)orbit_attitude_block->ATTITUDE_PREDICTION_SUBBLOCKS, reinterpret_cast<uint8_t *>(&attitude_prediction_data), sizeof(AttitudePredictionSubBlock), 10); // 修改：补充了参数
 
             OrbitPredictionSubBlock orbit_prediction_data;
-            satdump::majority_law(orbit_attitude_block->ORBIT_PREDICTION_SUBBLOCKS, reinterpret_cast<uint8_t *>(&orbit_prediction_data));
+            majority_law((uint8_t*)orbit_attitude_block->ORBIT_PREDICTION_SUBBLOCKS, reinterpret_cast<uint8_t *>(&orbit_prediction_data), sizeof(OrbitPredictionSubBlock), 8); // 修改：补充了参数
 
             unix_timestamp = ((orbit_attitude_block->IMAGE_START_TIME * 1e-8) - 40587) * 86400;
 
@@ -146,7 +182,7 @@ namespace fengyun_svissr
             if (save_telemetry) {
                 std::vector<uint8_t> Calib_2_block = get_subcom_block(final_subcom_frame, Calibration_2);
                 std::string active_sensor = (Calib_2_block[10] & 0b1) == 1 ? "Primary" : "Backup";
-                uint8_t active_detectors = satdump::majority_law_vec(detector_telemetry_stats)[0];
+                uint8_t active_detectors = majority_law_vec(detector_telemetry_stats)[0]; // 修改：去掉了 satdump::
                 std::string telemetry_data = SVISSRTelemetryDumper::dump_telemetry_to_JSON(*orbit_attitude_block, attitude_prediction_data, orbit_prediction_data, active_sensor, active_detectors);
                 write_telemetry(unix_timestamp, telemetry_data);
             }
@@ -244,7 +280,7 @@ namespace fengyun_svissr
                 if ((group_id == 0 && last_group_id == 24) || (current_subcom_frame.size() / SUBCOM_GROUP_SIZE) == 24) save_subcom_frame();
                 else if (group_retransmissions.size() < 9 && (current_subcom_frame.size() / SUBCOM_GROUP_SIZE) == group_id - 1) {
                     if (!group_retransmissions.empty()) {
-                        Group group = satdump::majority_law_vec(group_retransmissions);
+                        Group group = majority_law_vec(group_retransmissions); // 修改：去掉了 satdump::
                         current_subcom_frame.insert(current_subcom_frame.end(), group.begin(), group.end());
                         group_retransmissions.clear();
                         Group current_retransmission(frame + SUBCOM_START_OFFSET, frame + SUBCOM_START_OFFSET + SUBCOM_GROUP_SIZE);
@@ -280,7 +316,7 @@ namespace fengyun_svissr
 
             memmove(last_status, &last_status[1], 19);
             last_status[19] = backwardScan;
-            uint8_t backward_scanning = satdump::most_common(&last_status[0], &last_status[20], 0);
+            uint8_t backward_scanning = most_common(&last_status[0], &last_status[20], 0); // 修改：去掉了 satdump::
 
             if (backward_scanning && valid_lines < 3) counter_locked = false;
 
@@ -302,7 +338,7 @@ namespace fengyun_svissr
                 buffer->image3 = vissrImageReader.getImageIR3();
                 buffer->image4 = vissrImageReader.getImageIR1();
                 buffer->image5 = vissrImageReader.getImageIR2();
-                buffer->scid = satdump::most_common(scid_stats.begin(), scid_stats.end(), 0);
+                buffer->scid = most_common(scid_stats.begin(), scid_stats.end(), 0); // 修改：去掉了 satdump::
                 scid_stats.clear();
                 buffer->directory = directory;
 
@@ -338,7 +374,7 @@ namespace fengyun_svissr
             buffer->image3 = vissrImageReader.getImageIR3();
             buffer->image4 = vissrImageReader.getImageIR1();
             buffer->image5 = vissrImageReader.getImageIR2();
-            buffer->scid = satdump::most_common(scid_stats.begin(), scid_stats.end(), 0);
+            buffer->scid = most_common(scid_stats.begin(), scid_stats.end(), 0); // 修改：去掉了 satdump::
             scid_stats.clear();
             buffer->directory = directory;
 
