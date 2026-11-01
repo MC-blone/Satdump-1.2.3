@@ -47,12 +47,11 @@ namespace fengyun_svissr
         int valid_lines;
         float approx_progess;
         
-        // 新增/保留参数
         bool apply_correction;
         bool save_telemetry;
-        bool no_save_img;      // 【新增】是否仅预览不保存
-        int preview_ch;        // 【新增】当前预览通道 (2 或 4)
-        std::ofstream output_svissr; // 【新增】用于内部输出 .svissr 文件
+        bool no_save_img;      
+        int preview_ch;        
+        std::ofstream output_svissr; 
         int global_counter;
         bool counter_locked = false;
 

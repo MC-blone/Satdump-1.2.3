@@ -5,9 +5,8 @@
 #include "imgui/imgui_image.h"
 #include <filesystem>
 #include "resources.h"
-#include "common/utils.h"
+#include "common/utils.h"        // 修复：替换了 utils/majority_law.h
 #include "common/image/io.h"
-#include "utils/majority_law.h"
 
 #define FRAME_SIZE 44356
 #define SUBCOM_START_OFFSET 196
@@ -140,7 +139,6 @@ namespace fengyun_svissr
             OrbitPredictionSubBlock orbit_prediction_data;
             satdump::majority_law(orbit_attitude_block->ORBIT_PREDICTION_SUBBLOCKS, reinterpret_cast<uint8_t *>(&orbit_prediction_data));
 
-            // 使用真实卫星时间
             unix_timestamp = ((orbit_attitude_block->IMAGE_START_TIME * 1e-8) - 40587) * 86400;
 
             write_MANAM(unix_timestamp, get_subcom_block(final_subcom_frame, MANAM));
@@ -164,14 +162,12 @@ namespace fengyun_svissr
         std::filesystem::create_directory(buffer.directory + "/" + timestamp);
         std::string disk_folder = buffer.directory + "/" + timestamp;
 
-        // 直接输出 5 个通道的原始灰度图 (后期可通过 SatDump UI 自行调整)
-        image::save_img(buffer.image1, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "1")).c_str()); // VIS
-        image::save_img(buffer.image2, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "2")).c_str()); // IR4
-        image::save_img(buffer.image3, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "3")).c_str()); // IR3
-        image::save_img(buffer.image4, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "4")).c_str()); // IR1
-        image::save_img(buffer.image5, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "5")).c_str()); // IR2
+        image::save_img(buffer.image1, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "1")).c_str());
+        image::save_img(buffer.image2, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "2")).c_str());
+        image::save_img(buffer.image3, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "3")).c_str());
+        image::save_img(buffer.image4, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "4")).c_str());
+        image::save_img(buffer.image5, std::string(disk_folder + "/" + getSvissrFilename(&timeReadable, "5")).c_str());
 
-        // 尝试生成伪彩图 (如果有 LUT)
         if (resources::resourceExists("fy2/svissr/lut.png")) {
             image::Image channel1(8, buffer.image1.width(), buffer.image1.height(), 1);
             for (size_t i = 0; i < channel1.width() * channel1.height(); i++) channel1.set(i, buffer.image1.get(i) / 255);
@@ -205,7 +201,7 @@ namespace fengyun_svissr
         if (input_data_type == DATA_FILE) data_in = std::ifstream(d_input_file, std::ios::binary);
 
         std::string directory = d_output_file_hint.substr(0, d_output_file_hint.rfind('/')) + "/IMAGE";
-        if (!std::filesystem::exists(directory)) std::filesystem::create_directory(directory);
+        if (!std::filesystem::exists(directory) && !no_save_img) std::filesystem::create_directory(directory);
 
         time_t lastTime = 0;
         uint8_t last_status[20]; memset(last_status, 0, 20);
@@ -213,7 +209,7 @@ namespace fengyun_svissr
         valid_lines = 0;
 
         bool is_live = input_data_type != DATA_FILE;
-        if (is_live) {
+        if (is_live && !no_save_img) {
             images_thread_should_run = true;
             images_queue_thread = std::thread(&SVISSRImageDecoderModule::image_saving_thread_f, this);
         }
@@ -222,6 +218,10 @@ namespace fengyun_svissr
         {
             if (input_data_type == DATA_FILE) data_in.read((char *)frame, FRAME_SIZE);
             else input_fifo->read((uint8_t *)frame, FRAME_SIZE);
+
+            if (no_save_img && output_svissr.is_open()) {
+                output_svissr.write((char *)frame, FRAME_SIZE);
+            }
 
             int counter = (frame[67] << 8 | frame[68]) & 0x0fff;
 
@@ -287,6 +287,14 @@ namespace fengyun_svissr
             if (backward_scanning && valid_lines > 40) {
                 logger->info("Full disk end detected!");
                 counter_locked = false;
+                
+                if (no_save_img) {
+                    logger->info("No Save Img is enabled. Clearing image buffers.");
+                    vissrImageReader.reset();
+                    valid_lines = 0;
+                    continue;
+                }
+
                 std::shared_ptr<SVISSRBuffer> buffer = std::make_shared<SVISSRBuffer>();
 
                 buffer->image1 = vissrImageReader.getImageVIS();
@@ -307,7 +315,7 @@ namespace fengyun_svissr
 
             if (backwardScan) continue;
 
-            vissrImageReader.pushFrame(frame);
+            vissrImageReader.pushFrame(frame, !no_save_img); 
             valid_lines++;
             approx_progess = round(((float)counter / 2500.0f) * 1000.0f) / 10.0f;
 
@@ -322,7 +330,7 @@ namespace fengyun_svissr
 
         if (input_data_type == DATA_FILE) data_in.close();
 
-        if (valid_lines > 2) {
+        if (valid_lines > 2 && !no_save_img) {
             logger->info("Full disk end detected!");
             std::shared_ptr<SVISSRBuffer> buffer = std::make_shared<SVISSRBuffer>();
             buffer->image1 = vissrImageReader.getImageVIS();
@@ -347,11 +355,26 @@ namespace fengyun_svissr
         counter_locked = false; global_counter = 0;
         apply_correction = parameters.contains("apply_correction") ? parameters["apply_correction"].get<bool>() : false;
         save_telemetry = parameters.contains("save_telemetry") ? parameters["save_telemetry"].get<bool>() : false;
+        
+        no_save_img = parameters.contains("no_save_img") ? parameters["no_save_img"].get<bool>() : false;
+        preview_ch = 2; 
+
         backwardScan = false;
         vissrImageReader.reset();
+
+        if (no_save_img) {
+            output_svissr = std::ofstream(d_output_file_hint + ".svissr", std::ios::binary);
+            d_output_files.push_back(d_output_file_hint + ".svissr");
+            logger->info("No Save Img mode enabled, .svissr data will be saved to " + d_output_file_hint + ".svissr");
+        }
     }
 
-    SVISSRImageDecoderModule::~SVISSRImageDecoderModule() { delete[] frame; if (textureID != 0) delete[] textureBuffer; if (images_queue_thread.joinable()) images_queue_thread.join(); }
+    SVISSRImageDecoderModule::~SVISSRImageDecoderModule() { 
+        delete[] frame; 
+        if (textureID != 0) delete[] textureBuffer; 
+        if (images_queue_thread.joinable()) images_queue_thread.join(); 
+        if (output_svissr.is_open()) output_svissr.close();
+    }
 
     std::vector<ModuleDataType> SVISSRImageDecoderModule::getInputTypes() { return {DATA_FILE, DATA_STREAM}; }
     std::vector<ModuleDataType> SVISSRImageDecoderModule::getOutputTypes() { return {DATA_FILE}; }
@@ -359,34 +382,48 @@ namespace fengyun_svissr
     void SVISSRImageDecoderModule::drawUI(bool window) {
         if (textureID == 0) { textureID = makeImageTexture(); textureBuffer = new uint32_t[2501 * 2291]; memset(textureBuffer, 0, sizeof(uint32_t) * 2501 * 2291); }
         ImGui::Begin("S-VISSR Image Decoder", NULL, window ? 0 : NOWINDOW_FLAGS);
+        
         ImGui::BeginGroup();
-        ushort_to_rgba(vissrImageReader.imageBufferIR1, textureBuffer, 2501 * 2291);
+        if (preview_ch == 2) {
+            ushort_to_rgba(vissrImageReader.imageBufferIR4, textureBuffer, 2501 * 2291);
+            ImGui::Text("Preview: IR Ch2 (3.75 um)");
+        } else {
+            ushort_to_rgba(vissrImageReader.imageBufferIR1, textureBuffer, 2501 * 2291);
+            ImGui::Text("Preview: IR Ch4 (10.8 um)");
+        }
+        
         updateImageTexture(textureID, textureBuffer, 2291, 2501);
         ImGui::Image((void *)(intptr_t)textureID, {200 * ui_scale, 200 * ui_scale});
         ImGui::EndGroup();
+        
         ImGui::SameLine();
         ImGui::BeginGroup();
+        
+        if (ImGui::Button("Switch to Ch2", {120 * ui_scale, 20 * ui_scale})) preview_ch = 2;
+        if (ImGui::Button("Switch to Ch4", {120 * ui_scale, 20 * ui_scale})) preview_ch = 4;
+        
         if (apply_correction) {
-            ImGui::Button("Correction", {200 * ui_scale, 20 * ui_scale});
-            ImGui::Text("Counter correction status: "); ImGui::SameLine();
+            ImGui::Button("Correction", {120 * ui_scale, 20 * ui_scale});
+            ImGui::Text("Status: "); ImGui::SameLine();
             if (global_counter == 0) ImGui::TextColored(style::theme.red, "WAITING");
             else if (global_counter != 0 && !counter_locked) ImGui::TextColored(style::theme.orange, "LOCKING");
             else ImGui::TextColored(style::theme.green, "LOCKED");
         }
-        ImGui::Button("Full Disk Progress", {200 * ui_scale, 20 * ui_scale});
-        ImGui::ProgressBar((float)approx_progess / 100.0f, ImVec2(200 * ui_scale, 20 * ui_scale));
+        ImGui::Button("Full Disk Progress", {120 * ui_scale, 20 * ui_scale});
+        ImGui::ProgressBar((float)approx_progess / 100.0f, ImVec2(120 * ui_scale, 20 * ui_scale));
         ImGui::Text("State : "); ImGui::SameLine();
-        if (sat_is_eclipsed) ImGui::TextColored(style::theme.red, "Satellite is eclipsed...");
-        else if (writingImage) ImGui::TextColored(style::theme.green, "Writing images...");
-        else if (backwardScan) ImGui::TextColored(style::theme.red, "Imager rollback...");
+        if (sat_is_eclipsed) ImGui::TextColored(style::theme.red, "Eclipsed...");
+        else if (writingImage) ImGui::TextColored(style::theme.green, "Writing...");
+        else if (backwardScan) ImGui::TextColored(style::theme.red, "Rollback...");
         else ImGui::TextColored(style::theme.orange, "Receiving...");
         ImGui::EndGroup();
+        
         if (!streamingInput) ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
         ImGui::End();
     }
 
     std::string SVISSRImageDecoderModule::getID() { return "fengyun_svissr_image_decoder"; }
-    std::vector<std::string> SVISSRImageDecoderModule::getParameters() { return {"satname", "apply_correction", "save_telemetry"}; }
+    std::vector<std::string> SVISSRImageDecoderModule::getParameters() { return {"satname", "apply_correction", "save_telemetry", "no_save_img"}; }
     std::shared_ptr<ProcessingModule> SVISSRImageDecoderModule::getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters) {
         return std::make_shared<SVISSRImageDecoderModule>(input_file, output_file_hint, parameters);
     }
