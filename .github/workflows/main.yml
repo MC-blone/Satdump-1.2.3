@@ -51,19 +51,25 @@ jobs:
         working-directory: ${{github.workspace}}\windows
         run: .\build_deps.ps1
 
-      - name: Clean vcpkg if exists
+      - name: Sync deps to vcpkg directory
         shell: powershell
         run: |
-          if (Test-Path "${{github.workspace}}\vcpkg") {
-              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
-          }
+          # 欺骗 CMake，把 2.0 的 deps 伪装成 1.2.3 的 vcpkg 目录结构
+          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\include")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\include" | Out-Null }
+          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\lib")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\lib" | Out-Null }
+          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\bin")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\bin" | Out-Null }
+          
+          Copy-Item -Path "${{github.workspace}}\windows\deps\output\include\*" -Destination "${{github.workspace}}\vcpkg\installed\include" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "${{github.workspace}}\windows\deps\output\lib\*" -Destination "${{github.workspace}}\vcpkg\installed\lib" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "${{github.workspace}}\windows\deps\output\bin\*" -Destination "${{github.workspace}}\vcpkg\installed\bin" -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
+        # 强制指定 include 和 lib 路径，双保险
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output;${{github.workspace}}/vcpkg/installed" -DCMAKE_CXX_FLAGS="/I${{github.workspace}}/windows/deps/output/include /I${{github.workspace}}/vcpkg/installed/include" "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
@@ -135,19 +141,23 @@ jobs:
         working-directory: ${{github.workspace}}\windows
         run: .\build_deps.ps1 -is_cross 1 -is_arm 1
 
-      - name: Clean vcpkg if exists
+      - name: Sync deps to vcpkg directory
         shell: powershell
         run: |
-          if (Test-Path "${{github.workspace}}\vcpkg") {
-              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
-          }
+          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\include")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\include" | Out-Null }
+          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\lib")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\lib" | Out-Null }
+          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\bin")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\bin" | Out-Null }
+          
+          Copy-Item -Path "${{github.workspace}}\windows\deps\output\include\*" -Destination "${{github.workspace}}\vcpkg\installed\include" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "${{github.workspace}}\windows\deps\output\lib\*" -Destination "${{github.workspace}}\vcpkg\installed\lib" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "${{github.workspace}}\windows\deps\output\bin\*" -Destination "${{github.workspace}}\vcpkg\installed\bin" -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output;${{github.workspace}}/vcpkg/installed" -DCMAKE_CXX_FLAGS="/I${{github.workspace}}/windows/deps/output/include /I${{github.workspace}}/vcpkg/installed/include" "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
