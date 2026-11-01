@@ -51,12 +51,19 @@ jobs:
         working-directory: ${{github.workspace}}\windows
         run: .\build_deps.ps1
 
+      - name: Clean vcpkg if exists
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\vcpkg") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
+          }
+
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH=${{github.workspace}}/windows/deps/output -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/windows/deps/output -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
@@ -128,12 +135,19 @@ jobs:
         working-directory: ${{github.workspace}}\windows
         run: .\build_deps.ps1 -is_cross 1 -is_arm 1
 
+      - name: Clean vcpkg if exists
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\vcpkg") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
+          }
+
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH=${{github.workspace}}/windows/deps/output -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/windows/deps/output -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
