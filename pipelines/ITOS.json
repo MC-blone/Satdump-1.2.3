@@ -17,8 +17,6 @@
             "baseband": {},
             "soft": {
                 "noaa2_hrpt_demod": {
-                    "samplerate": 2880000,
-                    "baseband_format": "cs16",
                     "save_wav": false,
                     "save_audio": false
                 }

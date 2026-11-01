@@ -31,62 +31,86 @@ namespace noaa2_hrpt
         if (textureID != 0) deleteImageTexture(textureID);
     }
 
-    // 修复全黑预览的关键：在预览时自动计算数据的最暗和最亮像素，实时拉伸
+    // 关键改动：
+    // 1) 纹理固定 MAX_PREVIEW_W × MAX_PREVIEW_H，一次分配，永不重分配
+    // 2) min/max 用采样估算（行抽样 + 列抽样），避免每次扫全图
+    // 3) 只更新有效区域 [0, preview_h) × [0, preview_w)
     void NOAA2HRPTDecoderModule::update_preview() {
         std::lock_guard<std::mutex> lock(img_mtx);
         if (line_cnt <= 0 || full_imagebuf.empty()) return;
-        
-        aspect_ratio = (float)samples_per_line / (float)line_cnt;
-        const int max_size = 2500;
-        int w, h;
-        if (samples_per_line >= line_cnt) {
-            w = std::min(samples_per_line, max_size);
-            h = std::max(1, (int)(w / aspect_ratio));
-        } else {
-            h = std::min(line_cnt, max_size);
-            w = std::max(1, (int)(h * aspect_ratio));
-        }
 
-        if (textureBuffer == nullptr || texture_width != w || texture_height != h) {
-            delete[] textureBuffer;
-            textureBuffer = new uint32_t[(size_t)w * h];
-            texture_width = w;
-            texture_height = h;
-            if (textureID != 0) deleteImageTexture(textureID);
+        preview_w = std::min(samples_per_line, MAX_PREVIEW_W);
+        preview_h = std::min(line_cnt, MAX_PREVIEW_H);
+        if (preview_w <= 0 || preview_h <= 0) return;
+
+        aspect_ratio = (float)samples_per_line / (float)line_cnt;
+
+        // 一次性分配固定尺寸纹理
+        if (textureBuffer == nullptr) {
+            textureBuffer = new uint32_t[(size_t)MAX_PREVIEW_W * MAX_PREVIEW_H];
+            for (size_t i = 0; i < (size_t)MAX_PREVIEW_W * MAX_PREVIEW_H; ++i)
+                textureBuffer[i] = 0xFF000000u;
             textureID = makeImageTexture();
         }
 
-        // 计算当前所有像素的最大最小值
+        // 采样估算 min/max（避免扫 2.6 亿像素）
         int vmin = 255, vmax = 0;
-        for (uint8_t v : full_imagebuf) {
-            if (v < vmin) vmin = v;
-            if (v > vmax) vmax = v;
+        int row_step = std::max(1, line_cnt / 512);
+        int col_step = std::max(1, samples_per_line / 32);
+        for (int y = 0; y < line_cnt; y += row_step) {
+            const uint8_t *row = &full_imagebuf[(size_t)y * samples_per_line];
+            for (int x = 0; x < samples_per_line; x += col_step) {
+                uint8_t v = row[x];
+                if (v < vmin) vmin = v;
+                if (v > vmax) vmax = v;
+            }
         }
         if (vmax == vmin) vmax = vmin + 1;
 
-        for (int y = 0; y < h; ++y) {
-            int sy = (int)((int64_t)y * line_cnt / h);
-            for (int x = 0; x < w; ++x) {
-                int sx = (int)((int64_t)x * samples_per_line / w);
-                uint8_t v = full_imagebuf[(size_t)sy * samples_per_line + sx];
-                // 实时拉伸到 0~255
-                uint8_t stretched = (uint8_t)(((int)v - vmin) * 255 / (vmax - vmin));
-                textureBuffer[(size_t)y * w + x] = (255u << 24) | ((uint32_t)stretched << 16) | ((uint32_t)stretched << 8) | stretched;
+        // 采样填充预览（从 full_imagebuf 按比例取点）
+        const uint32_t alpha = 255u << 24;
+        for (int py = 0; py < preview_h; ++py) {
+            int sy = (int)((int64_t)py * line_cnt / preview_h);
+            const uint8_t *row = &full_imagebuf[(size_t)sy * samples_per_line];
+            uint32_t *dst = &textureBuffer[(size_t)py * MAX_PREVIEW_W];
+            for (int px = 0; px < preview_w; ++px) {
+                int sx = (int)((int64_t)px * samples_per_line / preview_w);
+                uint8_t stretched = (uint8_t)(((int)row[sx] - vmin) * 255 / (vmax - vmin));
+                dst[px] = alpha | ((uint32_t)stretched << 16) | ((uint32_t)stretched << 8) | stretched;
             }
         }
-        updateImageTexture(textureID, textureBuffer, w, h);
+
+        updateImageTexture(textureID, textureBuffer, MAX_PREVIEW_W, MAX_PREVIEW_H);
         has_to_update = false;
     }
 
     void NOAA2HRPTDecoderModule::apply_stretch_and_save(const std::vector<uint8_t>& raw_data, int w, int h, float p_low, float p_high, const std::string& filename) {
-        std::vector<uint8_t> sorted = raw_data;
-        std::sort(sorted.begin(), sorted.end());
-        int pmin_idx = std::clamp((int)(sorted.size() * (p_low / 100.0)), 0, (int)sorted.size() - 1);
-        int pmax_idx = std::clamp((int)(sorted.size() * (p_high / 100.0)), 0, (int)sorted.size() - 1);
-        int pmin = sorted[pmin_idx];
-        int pmax = sorted[pmax_idx];
-        if (pmax <= pmin) pmax = pmin + 1;
+        // 性能优化：用采样估算百分位，避免对 2.6 亿像素做全排序（原实现 30s~3min）
+        // 目标 ~100 万采样点，排序 < 1s，百分位精度足够（像素值仅 256 种）
+        const size_t TARGET_SAMPLES = 1000000;
+        size_t step = std::max<size_t>(1, raw_data.size() / TARGET_SAMPLES);
 
+        std::vector<uint8_t> sample;
+        sample.reserve(raw_data.size() / step + 1);
+        for (size_t i = 0; i < raw_data.size(); i += step)
+            sample.push_back(raw_data[i]);
+        std::sort(sample.begin(), sample.end());
+
+        int pmin = 0, pmax = 255;
+        if (!sample.empty()) {
+            size_t lo_idx = (size_t)(sample.size() * (p_low / 100.0));
+            size_t hi_idx = (size_t)(sample.size() * (p_high / 100.0));
+            if (lo_idx >= sample.size()) lo_idx = sample.size() - 1;
+            if (hi_idx >= sample.size()) hi_idx = sample.size() - 1;
+            pmin = sample[lo_idx];
+            pmax = sample[hi_idx];
+            if (pmax <= pmin) pmax = pmin + 1;
+        }
+
+        logger->debug("Stretch [%s]: raw=%zu, sample=%zu, step=%zu, pmin=%d, pmax=%d",
+                      filename.c_str(), raw_data.size(), sample.size(), step, pmin, pmax);
+
+        // 全量 stretch（O(N) 线性，非瓶颈）
         std::vector<uint8_t> stretched(raw_data.size());
         for (size_t i = 0; i < raw_data.size(); ++i) {
             stretched[i] = (uint8_t)std::clamp((raw_data[i] - pmin) * 255 / (pmax - pmin), 0, 255);
@@ -119,10 +143,10 @@ namespace noaa2_hrpt
             char header[44];
             in.read(header, 44);
             if (in.gcount() == 44 && std::memcmp(header, "RIFF", 4) == 0 && std::memcmp(header + 8, "WAVE", 4) == 0) {
-                is_u8 = false; 
+                is_u8 = false;
             } else {
                 in.seekg(0, std::ios::beg);
-                is_u8 = true; 
+                is_u8 = true;
             }
         }
 
@@ -130,7 +154,6 @@ namespace noaa2_hrpt
         time_t last_log = 0;
         int last_preview_line = 0;
 
-        // 实时流循环
         while (input_data_type == DATA_FILE ? (bool)in : input_active.load()) {
             size_t bytes_read = 0;
             if (input_data_type == DATA_FILE) {
@@ -185,7 +208,7 @@ namespace noaa2_hrpt
         }
 
         if (in.is_open()) in.close();
-        
+
         decode_status = PROCESSING;
         {
             std::lock_guard<std::mutex> lock(img_mtx);
@@ -213,7 +236,7 @@ namespace noaa2_hrpt
             ss << std::setfill('0') << std::setw(4) << tm_now.tm_year + 1900 << "-" << std::setw(2) << tm_now.tm_mon + 1 << "-" << std::setw(2) << tm_now.tm_mday << "_" << std::setw(2) << tm_now.tm_hour << "-" << std::setw(2) << tm_now.tm_min << "-" << std::setw(2) << tm_now.tm_sec;
 
             std::string base_name = main_dir + "/" + ss.str() + "_noaa_2_hrpt_fm";
-            
+
             logger->info("Applying percentiles stretch and saving...");
             {
                 std::lock_guard<std::mutex> lock(img_mtx);
@@ -231,13 +254,15 @@ namespace noaa2_hrpt
 
     void NOAA2HRPTDecoderModule::drawUI(bool window) {
         ImGui::Begin("NOAA-2 HRPT Decoder", nullptr, window ? 0 : NOWINDOW_FLAGS);
-        
+
         if (textureID == 0) {
             textureID = makeImageTexture();
-            textureBuffer = new uint32_t[1]{0};
-            updateImageTexture(textureID, textureBuffer, 1, 1);
+            textureBuffer = new uint32_t[(size_t)MAX_PREVIEW_W * MAX_PREVIEW_H];
+            for (size_t i = 0; i < (size_t)MAX_PREVIEW_W * MAX_PREVIEW_H; ++i)
+                textureBuffer[i] = 0xFF000000u;
+            updateImageTexture(textureID, textureBuffer, MAX_PREVIEW_W, MAX_PREVIEW_H);
         }
-        
+
         if (has_to_update) update_preview();
 
         float avail_width = std::max(100.0f, ImGui::GetContentRegionAvail().x - 100 * ui_scale);
@@ -247,10 +272,17 @@ namespace noaa2_hrpt
         float ratio = aspect_ratio > 0 ? aspect_ratio : 1.0f;
         float display_height = avail_height * zoom;
         float display_width = display_height * ratio;
-        if (display_width > avail_width * zoom) { display_width = avail_width * zoom; display_height = display_width / ratio; }
+        if (display_width > avail_width * zoom) {
+            display_width = avail_width * zoom;
+            display_height = display_width / ratio;
+        }
 
-        if (textureID != 0 && textureBuffer != nullptr) {
-            ImGui::Image((void *)(intptr_t)textureID, ImVec2(display_width, display_height));
+        if (textureID != 0 && textureBuffer != nullptr && preview_w > 0 && preview_h > 0) {
+            // 只用纹理有效区域（UV 裁剪到 preview_w × preview_h）
+            ImVec2 uv0(0.0f, 0.0f);
+            ImVec2 uv1((float)preview_w / (float)MAX_PREVIEW_W,
+                       (float)preview_h / (float)MAX_PREVIEW_H);
+            ImGui::Image((void *)(intptr_t)textureID, ImVec2(display_width, display_height), uv0, uv1);
             if (ImGui::IsItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 ImVec2 delta = ImGui::GetIO().MouseDelta;
                 ImGui::SetScrollX(ImGui::GetScrollX() - delta.x);
@@ -270,6 +302,7 @@ namespace noaa2_hrpt
         drawStatus(decode_status);
         ImGui::Spacing();
         ImGui::Text("Lines : %d", line_cnt);
+        ImGui::Text("Preview: %d x %d", preview_w, preview_h);
         ImGui::Text("Ratio : %.2f", aspect_ratio);
         ImGui::Text("Zoom  : %.1fx", zoom);
         ImGui::EndGroup();
