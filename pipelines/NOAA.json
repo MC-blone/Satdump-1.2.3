@@ -14,19 +14,51 @@
         ],
         "frequencies": [
             [
-                "NOAA-18",
-                1707e6
-            ],
-            [
-                "NOAA-19",
+                "NOAA-12 HRPT",
                 1698e6
             ],
             [
-                "NOAA-15",
+                "NOAA-14 HRPT Primary",
+                1698e6
+            ],
+            [
+                "NOAA-14 HRPT Backup",
+                1707e6
+            ],
+            [
+                "NOAA-15 HRPT Primary",
+                1698e6
+            ],
+            [
+                "NOAA-15 HRPT Backup",
                 1702.5e6
             ],
             [
-                "NOAA POES S-Band",
+                "NOAA-16 HRPT",
+                1698e6
+            ],
+            [
+                "NOAA-16 HRPT Backup",
+                1707e6
+            ],
+            [
+                "NOAA-17 HRPT Primary",
+                1698e6
+            ],
+            [
+                "NOAA-17 HRPT Backup",
+                1707e6
+            ],
+            [
+                "NOAA-18 HRPT",
+                1707e6
+            ],
+            [
+                "NOAA-19 HRPT",
+                1698e6
+            ],
+            [
+                "NOAA POES S-Band High Speed",
                 2247.5e6
             ]
         ],
@@ -76,15 +108,51 @@
         ],
         "frequencies": [
             [
-                "NOAA-19",
+                "NOAA-12 GAC/HRPT",
+                1698e6
+            ],
+            [
+                "NOAA-14 GAC/HRPT Primary",
+                1698e6
+            ],
+            [
+                "NOAA-14 GAC/HRPT Backup",
+                1707e6
+            ],
+            [
+                "NOAA-15 GAC/HRPT Primary",
+                1698e6
+            ],
+            [
+                "NOAA-15 GAC/HRPT Backup",
                 1702.5e6
             ],
             [
-                "NOAA-18",
-                1698.0e6
+                "NOAA-16 GAC/HRPT",
+                1698e6
             ],
             [
-                "NOAA-15",
+                "NOAA-16 GAC/HRPT Backup",
+                1707e6
+            ],
+            [
+                "NOAA-17 GAC/HRPT Primary",
+                1698e6
+            ],
+            [
+                "NOAA-17 GAC/HRPT Backup",
+                1707e6
+            ],
+            [
+                "NOAA-18 GAC/HRPT",
+                1707e6
+            ],
+            [
+                "NOAA-19 GAC/HRPT",
+                1698e6
+            ],
+            [
+                "NOAA POES S-Band High Speed",
                 2247.5e6
             ]
         ],
@@ -143,11 +211,31 @@
         ],
         "frequencies": [
             [
-                "NOAA-18/15",
+                "NOAA-12 DSB",
                 137.35e6
             ],
             [
-                "NOAA-19",
+                "NOAA-14 DSB",
+                137.35e6
+            ],
+            [
+                "NOAA-15 DSB",
+                137.35e6
+            ],
+            [
+                "NOAA-16 DSB",
+                137.35e6
+            ],
+            [
+                "NOAA-17 DSB",
+                137.35e6
+            ],
+            [
+                "NOAA-18 DSB",
+                137.35e6
+            ],
+            [
+                "NOAA-19 DSB",
                 137.77e6
             ]
         ],
@@ -201,16 +289,36 @@
         ],
         "frequencies": [
             [
-                "NOAA-18",
+                "NOAA-12 APT",
+                137.5e6
+            ],
+            [
+                "NOAA-14 APT",
+                137.62e6
+            ],
+            [
+                "NOAA-15 APT Raw",
+                137.5e6
+            ],
+            [
+                "NOAA-15 APT Backup",
+                137.62e6
+            ],
+            [
+                "NOAA-16 APT Inactive",
+                137.5e6
+            ],
+            [
+                "NOAA-17 APT",
+                137.5e6
+            ],
+            [
+                "NOAA-18 APT",
                 137.9125e6
             ],
             [
-                "NOAA-19",
+                "NOAA-19 APT",
                 137.1e6
-            ],
-            [
-                "NOAA-15",
-                137.62e6
             ]
         ],
         "parameters": {

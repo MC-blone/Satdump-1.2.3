@@ -1,0 +1,266 @@
+{
+    "goes_hrit": {
+        "name": "GOES-R HRIT",
+        "live": true,
+        "live_cfg": {
+            "pkt_size": 10240,
+            "default": [
+                [1, 0],
+                [2, 0],
+                [3, 0]
+            ],
+            "server": [
+                [1, 0],
+                [2, 0]
+            ],
+            "client": [
+                [3, 0]
+            ]
+        },
+        "frequencies": [
+            ["HRIT", 1694.1e6]
+        ],
+        "parameters": {
+            "samplerate": {
+                "value": 6e6
+            },
+            "fill_missing": {
+                "type": "bool",
+                "value": false,
+                "name": "Fill Missing Data",
+                "description": "Corrects black lines caused by\ninterference or signal drop-outs"
+            },
+            "parse_dcs": {
+                "type": "bool",
+                "value": false,
+                "name": "Parse DCS",
+                "description": "Process DCS data and save it as json"
+            },
+            "write_lrit": {
+                "type": "bool",
+                "value": false,
+                "name": "Save All LRIT",
+                "description": "Save all unprocessed LRIT files"
+            },
+            "tracked_addresses": {
+                "type": "string",
+                "value": "",
+                "name": "Tracked DCS Addresses",
+                "description": "Only process DCS messages from the specified addresses (comma separated).\n\nExample: DE4CB498, DE4704BE"
+            }
+        },
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "bpsk",
+                    "symbolrate": 927e3,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.02,
+                    "max_sps": 3
+                }
+            },
+            "cadu": {
+                "ccsds_conv_concat_decoder": {
+                    "constellation": "bpsk",
+                    "cadu_size": 8192,
+                    "viterbi_ber_thresold": 0.300,
+                    "viterbi_outsync_after": 20,
+                    "derandomize": true,
+                    "nrzm": true,
+                    "rs_i": 4,
+                    "rs_type": "rs223",
+                    "rs_usecheck": true
+                }
+            },
+            "products": {
+                "goes_lrit_data_decoder": {
+                    "max_fill_lines": 50,
+                    "write_images": true,
+                    "write_emwin": true,
+                    "write_messages": true,
+                    "write_dcs": false,
+                    "write_unknown": false
+                }
+            }
+        }
+    },
+    "goes_hrit_tcp": {
+        "name": "GOES-R HRIT to goestools",
+        "live": true,
+        "live_cfg": [
+            [1, 0],
+            [2, 0],
+            [3, 0]
+        ],
+        "frequencies": [
+            ["HRIT", 1694.1e6]
+        ],
+        "samplerate": 6e6,
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "bpsk",
+                    "symbolrate": 927e3,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.02,
+                    "max_sps": 3
+                }
+            },
+            "cadu": {
+                "ccsds_conv_concat_decoder": {
+                    "constellation": "bpsk",
+                    "cadu_size": 8192,
+                    "viterbi_ber_thresold": 0.300,
+                    "viterbi_outsync_after": 20,
+                    "derandomize": true,
+                    "nrzm": true,
+                    "rs_i": 4,
+                    "rs_type": "rs223",
+                    "rs_usecheck": true
+                }
+            },
+            "tcp": {
+                "xrit_goesrecv_publisher": {
+                    "address": "0.0.0.0",
+                    "nanomsg_port": 5004
+                }
+            }
+        }
+    },
+    "goes_grb": {
+        "name": "GOES-R GRB",
+        "live": true,
+        "live_cfg": {
+            "pkt_size": 204800,
+            "default": [
+                [1, 0],
+                [2, 0]
+            ],
+            "server": [
+                [1, 0],
+                [2, 0]
+            ],
+            "client": [
+                [3, 0]
+            ]
+        },
+        "frequencies": [],
+        "samplerate": 6e6,
+        "work": {
+            "baseband": {},
+            "bbframe": {
+                "dvbs2_demod": {
+                    "symbolrate": 8665938,
+                    "rrc_alpha": 0.25,
+                    "pll_bw": 0.005,
+                    "clock_alpha": 2.5e-3,
+                    "modcod": 11,
+                    "mt_bch": true
+                }
+            },
+            "cadu": {
+                "goes_grb_cadu_extractor": {}
+            },
+            "products": {
+                "goes_grb_data_decoder": {}
+            }
+        }
+    },
+    "goesr_cda": {
+        "name": "GOES-R CDA (40k)",
+        "live": true,
+        "live_cfg": [
+            [1, 0],
+            [2, 0]
+        ],
+        "frequencies": [
+            ["CDA", 1693e6]
+        ],
+        "samplerate": 1e6,
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "bpsk",
+                    "symbolrate": 40e3,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.02,
+                    "max_sps": 3
+                }
+            },
+            "cadu": {
+                "ccsds_simple_psk_decoder": {
+                    "constellation": "bpsk",
+                    "cadu_size": 2048,
+                    "nrzm": true,
+                    "rs_i": 1,
+                    "rs_type": "rs223"
+                }
+            },
+            "products": {}
+        }
+    },
+    "goesr_cda_4k": {
+        "name": "GOES-R CDA (4k)",
+        "live": true,
+        "live_cfg": [
+            [1, 0],
+            [2, 0]
+        ],
+        "frequencies": [
+            ["CDA", 1693e6]
+        ],
+        "samplerate": 1e6,
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "bpsk",
+                    "symbolrate": 4e3,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.02,
+                    "max_sps": 3
+                }
+            },
+            "cadu": {
+                "ccsds_simple_psk_decoder": {
+                    "constellation": "bpsk",
+                    "cadu_size": 2048,
+                    "nrzm": true,
+                    "rs_i": 1,
+                    "rs_type": "rs223"
+                }
+            },
+            "products": {}
+        }
+    },
+    "goesr_raw": {
+        "name": "GOES-R Raw Data",
+        "samplerate": 20e6,
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "oqpsk",
+                    "symbolrate": 60e6,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.001
+                }
+            },
+            "cadu": {
+                "ccsds_ldpc_decoder": {
+                    "constellation": "oqpsk",
+                    "ldpc_rate": "7/8",
+                    "ldpc_iterations": 10,
+                    "internal_stream": false,
+                    "internal_cadu_size": 0
+                }
+            },
+            "products": {
+                "goesr_instruments": {}
+            }
+        }
+    }
+}
