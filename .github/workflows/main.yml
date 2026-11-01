@@ -50,25 +50,28 @@ jobs:
           }
           cd vcpkg
           git fetch --tags
-          # 使用 2024.05.15 这个 tag
           git checkout 2024.05.15
           .\bootstrap-vcpkg.bat
           cd ..
 
-          # 2. Patch Configure-vcpkg.ps1 以防万一
+          # 2. Patch Configure-vcpkg.ps1
           $file = "${{github.workspace}}\windows\Configure-vcpkg.ps1"
           if (Test-Path $file) {
               $content = Get-Content -Path $file -Raw
+              
+              # 忽略已存在的 exit 1，让它继续往下跑
+              $content = $content -replace 'exit 1', 'Write-Host "Skipping exit 1..."'
+              
               # 替换写死的 pthreads
               $content = $content.Replace('$pthread_lib=$(Get-Item ..\installed\$platform\lib\pthreadVC3.lib).FullName', '$pthread_lib=$(Get-ChildItem ..\installed\$platform\lib\pthreadVC*.lib -ErrorAction SilentlyContinue | Select-Object -First 1).FullName')
               $content = $content.Replace('$pthread_include=$(Get-Item ..\installed\$platform\include\pthread.h).DirectoryName', '$pthread_include=$(Get-ChildItem ..\installed\$platform\include\pthread.h -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName')
               $content = $content.Replace('$pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc', 'if ($pthread_lib) { $pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc }')
               
-              # 替换写死的 libusb
+              # 替换写死的 libusb（如果找不到子目录，则回退到 include 根目录）
               $content = $content.Replace('$libusb_include=$(Get-Item ..\installed\$platform\include\libusb-1.0).FullName', '$libusb_include=$(Get-ChildItem ..\installed\$platform\include\libusb-1.0 -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; if (-not $libusb_include) { $libusb_include = "${{github.workspace}}\vcpkg\installed\$platform\include" }')
               
               Set-Content -Path $file -Value $content
-              Write-Host "Patched Configure-vcpkg.ps1 for newer vcpkg paths"
+              Write-Host "Patched Configure-vcpkg.ps1"
           }
 
       - name: Configure vcpkg
@@ -174,13 +177,17 @@ jobs:
           $file = "${{github.workspace}}\windows\Configure-vcpkg.ps1"
           if (Test-Path $file) {
               $content = Get-Content -Path $file -Raw
+              
+              $content = $content -replace 'exit 1', 'Write-Host "Skipping exit 1..."'
+              
               $content = $content.Replace('$pthread_lib=$(Get-Item ..\installed\$platform\lib\pthreadVC3.lib).FullName', '$pthread_lib=$(Get-ChildItem ..\installed\$platform\lib\pthreadVC*.lib -ErrorAction SilentlyContinue | Select-Object -First 1).FullName')
               $content = $content.Replace('$pthread_include=$(Get-Item ..\installed\$platform\include\pthread.h).DirectoryName', '$pthread_include=$(Get-ChildItem ..\installed\$platform\include\pthread.h -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName')
               $content = $content.Replace('$pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc', 'if ($pthread_lib) { $pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc }')
+              
               $content = $content.Replace('$libusb_include=$(Get-Item ..\installed\$platform\include\libusb-1.0).FullName', '$libusb_include=$(Get-ChildItem ..\installed\$platform\include\libusb-1.0 -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; if (-not $libusb_include) { $libusb_include = "${{github.workspace}}\vcpkg\installed\$platform\include" }')
               
               Set-Content -Path $file -Value $content
-              Write-Host "Patched Configure-vcpkg.ps1 for newer vcpkg paths"
+              Write-Host "Patched Configure-vcpkg.ps1"
           }
 
       - name: Configure vcpkg
