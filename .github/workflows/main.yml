@@ -23,8 +23,8 @@ jobs:
         uses: actions/cache@v4
         id: win-deps-x64
         with:
-          path: vcpkg
-          key: win-deps-x64-${{ hashFiles('windows/Configure-vcpkg.ps1') }}
+          path: windows/deps
+          key: win-deps-x64-${{ hashFiles('windows/build_deps.ps1') }}
 
       - name: Set up Python 3.13
         if: steps.win-deps-x64.outputs.cache-hit != 'true'
@@ -40,73 +40,28 @@ jobs:
         if: steps.win-deps-x64.outputs.cache-hit != 'true'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Setup stable vcpkg & Patch Configure-vcpkg.ps1
+      - name: Setup VS Dev Env
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build Deps
         if: steps.win-deps-x64.outputs.cache-hit != 'true'
         shell: powershell
-        run: |
-          # 1. 手动 clone 并切换到一个稳定版本的 vcpkg，避免最新版导致的 msys2 404 和路径变化
-          if (-not (Test-Path vcpkg)) {
-              git clone https://github.com/microsoft/vcpkg.git
-          }
-          cd vcpkg
-          git fetch --tags
-          git checkout 2024.05.15
-          .\bootstrap-vcpkg.bat
-          cd ..
-
-          # 2. Patch Configure-vcpkg.ps1
-          $file = "${{github.workspace}}\windows\Configure-vcpkg.ps1"
-          if (Test-Path $file) {
-              $content = Get-Content -Path $file -Raw
-              
-              # 忽略已存在的 exit 1，让它继续往下跑
-              $content = $content -replace 'exit 1', 'Write-Host "Skipping exit 1..."'
-              
-              # 替换写死的 pthreads
-              $content = $content.Replace('$pthread_lib=$(Get-Item ..\installed\$platform\lib\pthreadVC3.lib).FullName', '$pthread_lib=$(Get-ChildItem ..\installed\$platform\lib\pthreadVC*.lib -ErrorAction SilentlyContinue | Select-Object -First 1).FullName')
-              $content = $content.Replace('$pthread_include=$(Get-Item ..\installed\$platform\include\pthread.h).DirectoryName', '$pthread_include=$(Get-ChildItem ..\installed\$platform\include\pthread.h -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName')
-              $content = $content.Replace('$pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc', 'if ($pthread_lib) { $pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc }')
-              
-              # 替换写死的 libusb（如果找不到子目录，则回退到 include 根目录）
-              $content = $content.Replace('$libusb_include=$(Get-Item ..\installed\$platform\include\libusb-1.0).FullName', '$libusb_include=$(Get-ChildItem ..\installed\$platform\include\libusb-1.0 -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; if (-not $libusb_include) { $libusb_include = "${{github.workspace}}\vcpkg\installed\$platform\include" }')
-              
-              Set-Content -Path $file -Value $content
-              Write-Host "Patched Configure-vcpkg.ps1"
-          }
-
-      - name: Configure vcpkg
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
-        shell: powershell
-        run: ${{github.workspace}}\windows\Configure-vcpkg.ps1 -platform x64-windows
-
-      - name: Clean up vcpkg
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
-        run: rm -recurse -force $Env:GITHUB_WORKSPACE/vcpkg/packages, $Env:GITHUB_WORKSPACE/vcpkg/downloads, $Env:GITHUB_WORKSPACE/vcpkg/buildtrees
-
-      - name: Download Aaronia RTSA API
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
-        shell: powershell
-        run: Invoke-WebRequest -Uri "https://www.satdump.org/Aaronia_RTSA_Suite_PRO_2.2.0.12821_Setup_64bit.exe" -OutFile $Env:GITHUB_WORKSPACE/vcpkg/rtsa.exe
-
-      - name: Install Aaronia RTSA API
-        shell: cmd
-        run: start /wait vcpkg\rtsa.exe /q2 /install
-
-      - name: Add support to NSIS for long PATHs
-        shell: powershell
-        run: ${{github.workspace}}\windows\Get-NSIS-LongStrings.ps1
+        working-directory: ${{github.workspace}}\windows
+        run: .\build_deps.ps1
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -DVCPKG_TARGET_TRIPLET="x64-windows" -DPLUGIN_AARONIA_SDR_SUPPORT=ON -DBUILD_MSVC=ON -DCMAKE_TOOLCHAIN_FILE="${{github.workspace}}\vcpkg\scripts\buildsystems\vcpkg.cmake" "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH=${{github.workspace}}/windows/deps/output -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/windows/deps/output -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
         shell: bash
-        run: cmake --build . --config $BUILD_TYPE
+        run: ninja
 
       - name: Build Installer
         working-directory: ${{runner.workspace}}/build
@@ -124,13 +79,14 @@ jobs:
 
       - name: Build Portable
         shell: powershell
-        run: ${{github.workspace}}\windows\Finish-Release.ps1 -platform x64-windows -BuildPath ${{runner.workspace}}\build
+        working-directory: ${{runner.workspace}}/build
+        run: ${{github.workspace}}\windows\make_portable.ps1 -source_path "$Env:GITHUB_WORKSPACE"
 
       - name: Upload Portable
         uses: actions/upload-artifact@v4
         with:
           name: SatDump-Windows_x64_Portable
-          path: ${{runner.workspace}}/build/Release/*
+          path: ${{runner.workspace}}/build/portable/*
 
   build_windows_arm64:
     runs-on: windows-2022
@@ -144,8 +100,8 @@ jobs:
         uses: actions/cache@v4
         id: win-deps-arm64
         with:
-          path: vcpkg
-          key: win-deps-arm64-${{ hashFiles('windows/Configure-vcpkg.ps1') }}
+          path: windows/deps
+          key: win-deps-arm64-${{ hashFiles('windows/build_deps.ps1') }}
 
       - name: Set up Python 3.13
         if: steps.win-deps-arm64.outputs.cache-hit != 'true'
@@ -161,59 +117,28 @@ jobs:
         if: steps.win-deps-arm64.outputs.cache-hit != 'true'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Setup stable vcpkg & Patch Configure-vcpkg.ps1
+      - name: Setup VS Dev Env
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      - name: Build Deps
         if: steps.win-deps-arm64.outputs.cache-hit != 'true'
         shell: powershell
-        run: |
-          if (-not (Test-Path vcpkg)) {
-              git clone https://github.com/microsoft/vcpkg.git
-          }
-          cd vcpkg
-          git fetch --tags
-          git checkout 2024.05.15
-          .\bootstrap-vcpkg.bat
-          cd ..
-
-          $file = "${{github.workspace}}\windows\Configure-vcpkg.ps1"
-          if (Test-Path $file) {
-              $content = Get-Content -Path $file -Raw
-              
-              $content = $content -replace 'exit 1', 'Write-Host "Skipping exit 1..."'
-              
-              $content = $content.Replace('$pthread_lib=$(Get-Item ..\installed\$platform\lib\pthreadVC3.lib).FullName', '$pthread_lib=$(Get-ChildItem ..\installed\$platform\lib\pthreadVC*.lib -ErrorAction SilentlyContinue | Select-Object -First 1).FullName')
-              $content = $content.Replace('$pthread_include=$(Get-Item ..\installed\$platform\include\pthread.h).DirectoryName', '$pthread_include=$(Get-ChildItem ..\installed\$platform\include\pthread.h -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName')
-              $content = $content.Replace('$pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc', 'if ($pthread_lib) { $pthread_content | Set-Content -Encoding ASCII ..\installed\$platform\lib\pkgconfig\pthread.pc }')
-              
-              $content = $content.Replace('$libusb_include=$(Get-Item ..\installed\$platform\include\libusb-1.0).FullName', '$libusb_include=$(Get-ChildItem ..\installed\$platform\include\libusb-1.0 -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; if (-not $libusb_include) { $libusb_include = "${{github.workspace}}\vcpkg\installed\$platform\include" }')
-              
-              Set-Content -Path $file -Value $content
-              Write-Host "Patched Configure-vcpkg.ps1"
-          }
-
-      - name: Configure vcpkg
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        shell: powershell
-        run: ${{github.workspace}}\windows\Configure-vcpkg.ps1 -platform arm64-windows
-
-      - name: Clean up vcpkg
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        run: rm -recurse -force $Env:GITHUB_WORKSPACE/vcpkg/packages, $Env:GITHUB_WORKSPACE/vcpkg/downloads, $Env:GITHUB_WORKSPACE/vcpkg/buildtrees
-
-      - name: Add support to NSIS for long PATHs
-        shell: powershell
-        run: ${{github.workspace}}\windows\Get-NSIS-LongStrings.ps1
+        working-directory: ${{github.workspace}}\windows
+        run: .\build_deps.ps1 -is_cross 1 -is_arm 1
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -A ARM64 -DVCPKG_TARGET_TRIPLET="arm64-windows" -DVCPKG_HOST_TRIPLET="x64-windows" -DVCPKG_USE_HOST_TOOLS=ON -DCMAKE_SYSTEM_VERSION="10.0.22621.0" -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_CROSSCOMPILING=ON -DPLUGIN_LIMESDR_SDR_SUPPORT=OFF -DBUILD_MSVC=ON -DCMAKE_TOOLCHAIN_FILE="${{github.workspace}}\vcpkg\scripts\buildsystems\vcpkg.cmake" "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH=${{github.workspace}}/windows/deps/output -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/windows/deps/output -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
         shell: bash
-        run: cmake --build . --config $BUILD_TYPE
+        run: ninja
 
       - name: Build Installer
         working-directory: ${{runner.workspace}}/build
@@ -231,13 +156,14 @@ jobs:
 
       - name: Build Portable
         shell: powershell
-        run: ${{github.workspace}}\windows\Finish-Release.ps1 -platform arm64-windows -BuildPath ${{runner.workspace}}\build
+        working-directory: ${{runner.workspace}}/build
+        run: ${{github.workspace}}\windows\make_portable.ps1 -source_path "$Env:GITHUB_WORKSPACE"
 
       - name: Upload Portable
         uses: actions/upload-artifact@v4
         with:
           name: SatDump-Windows_arm64_Portable
-          path: ${{runner.workspace}}/build/Release/*
+          path: ${{runner.workspace}}/build/portable/*
 
   build_android:
     runs-on: ubuntu-latest
@@ -377,17 +303,13 @@ jobs:
         run: |
           cp *.deb /tmp/satdump.deb && cp $GITHUB_WORKSPACE/SatDump.yml .
           
-          # Run pkg2appimage but don't fail the step yet
           ./pkg2appimage SatDump.yml || true
           
-          # Apply the fix suggested by the appimagetool error
           if [ -d "SatDump/SatDump.AppDir" ]; then
             rm -f SatDump/SatDump.AppDir/.DirIcon
-            # Download appimagetool to package it manually
             wget -c https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
             chmod +x appimagetool
             mkdir -p out
-            # Run appimagetool manually
             ./appimagetool SatDump/SatDump.AppDir out/SatDump-x86_64.AppImage
           else
             echo "AppDir not found, pkg2appimage failed earlier"
