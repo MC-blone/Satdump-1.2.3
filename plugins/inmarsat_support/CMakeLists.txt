@@ -1,3 +1,4 @@
+
 cmake_minimum_required(VERSION 3.12)
 project(inmarsat_support)
 
@@ -7,7 +8,18 @@ target_link_libraries(inmarsat_support PUBLIC satdump_core)
 target_include_directories(inmarsat_support PUBLIC src .)
 
 if(MSVC)
-    target_link_libraries(inmarsat_support PUBLIC ws2_32 zlib.dll)
+    target_link_libraries(inmarsat_support PUBLIC ws2_32)
+    find_package(ZLIB QUIET)
+    if(ZLIB_FOUND)
+        target_link_libraries(inmarsat_support PUBLIC ZLIB::ZLIB)
+    else()
+        find_library(INMARSAT_ZLIB_LIBRARY NAMES zlib zlibd zlib1)
+        if(INMARSAT_ZLIB_LIBRARY)
+            target_link_libraries(inmarsat_support PUBLIC ${INMARSAT_ZLIB_LIBRARY})
+        else()
+            target_link_libraries(inmarsat_support PUBLIC zlib.dll)
+        endif()
+    endif()
 endif()
 
 install(TARGETS inmarsat_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
