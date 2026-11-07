@@ -136,7 +136,7 @@ jobs:
           name: SatDump-Windows_x64_Portable
           path: ${{runner.workspace}}/build/portable/*
 
-  build_windows_arm64:
+  build_windows_:
     runs-on: windows-2022
 
     steps:
@@ -226,7 +226,12 @@ jobs:
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
-
+      - name: Check Zstd
+        shell: powershell
+        run: |
+          Write-Host "Checking Zstd headers..."
+          Get-ChildItem "$env:GITHUB_WORKSPACE\vcpkg\installed" -Filter zstd.h -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Get-ChildItem "$env:GITHUB_WORKSPACE\windows\deps\output" -Filter zstd.h -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
         run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
