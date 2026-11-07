@@ -5,7 +5,6 @@
 #include "common/dsp/resamp/rational_resampler.h"
 #include <fstream>
 #include <vector>
-#include <complex>
 
 namespace fengyun4
 {
@@ -19,7 +18,6 @@ namespace fengyun4
             int bw_hz = 812500;
             int fft_size = 512;
             int last_syms = 0;
-            std::ofstream data_out;
 
             void drawUI(bool window) override;
             void process() override;
@@ -28,8 +26,10 @@ namespace fengyun4
             LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
             ~LoRaDemodModule();
 
+            void init() override;
+
             static std::string getID();
-            virtual std::string getIDM() { return getID(); }
+            std::string getIDM() override { return getID(); }
             static std::vector<std::string> getParameters();
             static std::shared_ptr<ProcessingModule> getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
         };
