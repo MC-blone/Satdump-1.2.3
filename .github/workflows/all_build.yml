@@ -126,8 +126,13 @@ jobs:
         shell: powershell
         working-directory: ${{github.workspace}}\build
         run: |
-          & "$env:GITHUB_WORKSPACE\windows\make_portable.ps1" -source_path "$env:GITHUB_WORKSPACE"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:GITHUB_WORKSPACE\windows\make_portable.ps1" `
+            -source_path "$env:GITHUB_WORKSPACE" `
+            -triplet "${{ matrix.platform }}"
+
+          if (-not (Test-Path "portable\satdump.exe")) {
+            throw "Portable package was not generated correctly"
+          }
 
       - name: Upload Portable
         uses: actions/upload-artifact@v4

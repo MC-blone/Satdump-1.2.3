@@ -1,46 +1,70 @@
+```powershell
 param(
-    [string]$source_path="$(Split-Path -Parent $MyInvocation.MyCommand.Path)\.."
+    [string]$source_path="$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..",
+    [string]$triplet="x64-windows"
 )
 
-# Output folder
-if (Test-Path -path portable) {
-    rm -r -fo portable
+$source_path = (Resolve-Path $source_path).Path
+$build_path = (Get-Location).Path
+$binary_path = Join-Path $build_path "Release"
+
+if (!(Test-Path "$binary_path\satdump.exe")) {
+    $binary_path = $build_path
 }
-mkdir portable
 
-# Core
-cp satdump.exe portable
-cp satdump-ui.exe portable
-cp *.dll portable
+$plugin_path = Join-Path $binary_path "plugins"
+$vcpkg_bin = Join-Path $source_path "vcpkg\installed\$triplet\bin"
 
-# Plugins
-mkdir portable/plugins
-cp plugins/*.dll portable/plugins
+if (!(Test-Path "$binary_path\satdump.exe")) {
+    throw "Cannot find satdump.exe"
+}
+if (!(Test-Path "$binary_path\satdump-ui.exe")) {
+    throw "Cannot find satdump-ui.exe"
+}
+if (!(Test-Path $plugin_path)) {
+    throw "Cannot find plugins directory: $plugin_path"
+}
+if (!(Test-Path $vcpkg_bin)) {
+    throw "Cannot find vcpkg DLL directory: $vcpkg_bin"
+}
 
-# Resources
-cp -r $source_path/resources portable
-cp $source_path/satdump_cfg.json portable
+if (Test-Path portable) {
+    Remove-Item portable -Recurse -Force
+}
+New-Item -ItemType Directory portable | Out-Null
 
-# Add DLLs
+Copy-Item "$binary_path\satdump.exe" portable
+Copy-Item "$binary_path\satdump-ui.exe" portable
+Get-ChildItem $binary_path -File -Filter "*.dll" | Copy-Item -Destination portable
+
+New-Item -ItemType Directory "portable\plugins" | Out-Null
+Get-ChildItem $plugin_path -File -Filter "*.dll" | Copy-Item -Destination "portable\plugins"
+
+Copy-Item "$source_path\resources" portable -Recurse
+Copy-Item "$source_path\satdump_cfg.json" portable
+
 function Parse-DumpBin($binary_path)
 {
     $return_val = @()
-    $dumpbin_result = dumpbin /dependents $binary_path
+    $dumpbin_result = & dumpbin /dependents $binary_path 2>$null
     $reading = $false
-    for($i = 0; $i -lt $dumpbin_result.Count; $i++)
+
+    foreach ($line in $dumpbin_result)
     {
-        $this_line = $dumpbin_result[$i].trim()
-        if($this_line -eq "Image has the following dependencies:")
+        $this_line = $line.Trim()
+
+        if ($this_line -eq "Image has the following dependencies:")
         {
-            $i++
             $reading = $true
             continue
         }
-        if($reading -and [string]::IsNullOrWhiteSpace($this_line))
+
+        if ($reading -and [string]::IsNullOrWhiteSpace($this_line))
         {
             break
         }
-        if($reading)
+
+        if ($reading -and $this_line -match '^[A-Za-z0-9_.+-]+\.dll$')
         {
             $return_val += $this_line
         }
@@ -49,55 +73,90 @@ function Parse-DumpBin($binary_path)
     return $return_val
 }
 
-$input_dlls = Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter portable/*.dll
-$input_dlls += Get-ChildItem -ErrorAction SilentlyContinue -Recurse -Filter portable/*.exe
-$input_dlls += Get-ChildItem -ErrorAction SilentlyContinue -Recurse -Filter portable/plugins/*.dll
+$input_dlls = @(
+    Get-ChildItem portable -Recurse -File | Where-Object {
+        $_.Extension -eq ".dll" -or $_.Extension -eq ".exe"
+    }
+)
+
 $dll_array = @()
 
 Write-Output "Input DLLs/EXE..."
 
-# Read dependencies
-foreach($input_dll in $input_dlls)
+foreach ($input_dll in $input_dlls)
 {
-    Write-Output $input_dll.FullName 
-    $dll_array += Parse-Dumpbin $input_dll.FullName
+    Write-Output $input_dll.FullName
+    $dll_array += Parse-DumpBin $input_dll.FullName
 }
 
-$dll_array = $dll_array | select -Unique
+$dll_array = @($dll_array | Select-Object -Unique)
 
 Write-Output "Required DLLs..."
 
-foreach($req_dll in $dll_array)
+foreach ($req_dll in $dll_array)
 {
     Write-Output $req_dll
 }
 
+$available_dlls = @()
+$available_dlls += Get-ChildItem $vcpkg_bin -File -Filter "*.dll"
+$available_dlls += Get-ChildItem $binary_path -File -Filter "*.dll"
+
+$available_dlls = @(
+    $available_dlls | Sort-Object FullName -Unique
+)
+
 Write-Output "Available DLLs..."
 
-$available_dlls = Get-ChildItem $source_path/windows/deps/output/bin -Filter *.dll
-$dlls_to_copy = @()
-foreach($available_dll in $available_dlls)
+$dll_map = @{}
+foreach ($available_dll in $available_dlls)
 {
-    Write-Output $available_dll.FullName 
-    if($dll_array.Contains($available_dll.Name))
+    $dll_map[$available_dll.Name.ToLowerInvariant()] = $available_dll
+    Write-Output $available_dll.FullName
+}
+
+$dlls_to_copy = @{}
+foreach ($req_dll in $dll_array)
+{
+    $key = $req_dll.ToLowerInvariant()
+
+    if ($dll_map.ContainsKey($key))
     {
-        $dlls_to_copy += $available_dll
+        $dlls_to_copy[$key] = $dll_map[$key]
     }
 }
 
-# Recursively get remaining dependencies
-$last_count = 0
-while($last_count -ne $dlls_to_copy.Count)
+Write-Output "Recursively resolving dependencies..."
+
+$processed = @{}
+
+while ($true)
 {
-    $last_count = $dlls_to_copy.Count
-    foreach($dll_to_copy in $dlls_to_copy)
+    $pending = @(
+        $dlls_to_copy.Values | Where-Object {
+            !$processed.ContainsKey($_.FullName.ToLowerInvariant())
+        }
+    )
+
+    if ($pending.Count -eq 0)
     {
+        break
+    }
+
+    foreach ($dll_to_copy in $pending)
+    {
+        $key = $dll_to_copy.FullName.ToLowerInvariant()
+        $processed[$key] = $true
+
         $potential_dlls = Parse-DumpBin $dll_to_copy.FullName
-        foreach($available_dll in $available_dlls)
+
+        foreach ($req_dll in $potential_dlls)
         {
-            if($potential_dlls.Contains($available_dll.Name) -and -not $dlls_to_copy.Name.Contains($available_dll.Name))
+            $dll_key = $req_dll.ToLowerInvariant()
+
+            if (!$dlls_to_copy.ContainsKey($dll_key) -and $dll_map.ContainsKey($dll_key))
             {
-                $dlls_to_copy += $available_dll
+                $dlls_to_copy[$dll_key] = $dll_map[$dll_key]
             }
         }
     }
@@ -105,9 +164,16 @@ while($last_count -ne $dlls_to_copy.Count)
 
 Write-Output "Copying dependencies..."
 
-# Copy determined dependencies
-foreach($dll_to_copy in $dlls_to_copy)
+foreach ($dll_to_copy in $dlls_to_copy.Values)
 {
-    Write-Output $dll_to_copy.FullName 
-    cp $dll_to_copy.FullName ./portable
+    $destination = Join-Path portable $dll_to_copy.Name
+
+    if (!(Test-Path $destination))
+    {
+        Write-Output $dll_to_copy.FullName
+        Copy-Item $dll_to_copy.FullName portable
+    }
 }
+
+Write-Output "Portable package created successfully."
+```
