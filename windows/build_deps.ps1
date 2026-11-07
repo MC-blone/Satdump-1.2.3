@@ -55,6 +55,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "CURL build or installation failed"
 }
 
+Copy-Item "$output_folder\lib\libcurl_imp.lib" "$output_folder\lib\libcurl.lib" -Force
+
+Write-Host "CURL successfully installed"
+cd ../..
+
 $curl_header = "$output_folder\include\curl\curl.h"
 $curl_library = "$output_folder\lib\libcurl_imp.lib"
 
