@@ -24,7 +24,7 @@ jobs:
         id: win-deps-x64
         with:
           path: windows/deps
-          key: win-deps-x64-v4-${{ hashFiles('windows/build_deps.ps1') }}
+          key: win-deps-x64-v5-${{ hashFiles('windows/build_deps.ps1') }}
 
       - name: Set up Python 3.13
         if: steps.win-deps-x64.outputs.cache-hit != 'true'
@@ -149,7 +149,7 @@ jobs:
         id: win-deps-arm64
         with:
           path: windows/deps
-          key: win-deps-arm64-v5-${{ hashFiles('windows/build_deps.ps1') }}
+          key: win-deps-arm64-v6-${{ hashFiles('windows/build_deps.ps1') }}
 
       - name: Set up Python 3.13
         if: steps.win-deps-arm64.outputs.cache-hit != 'true'
@@ -198,7 +198,8 @@ jobs:
           if (Test-Path build) { Remove-Item -Recurse -Force build }
           mkdir build
           cd build
-          cmake $cmake_params .. -DHTTP_ONLY=ON -DBUILD_STATIC_LIBS=OFF -DCURL_USE_SCHANNEL=ON -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DZLIB_ROOT="$output_folder" -DCMAKE_C_FLAGS="-I$output_folder/include"
+          # 添加 -DCURL_DISABLE_MANUAL=ON 和 -DBUILD_LIBCURL_DOCS=OFF 禁用文档生成
+          cmake $cmake_params .. -DHTTP_ONLY=ON -DBUILD_STATIC_LIBS=OFF -DCURL_USE_SCHANNEL=ON -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DZLIB_ROOT="$output_folder" -DCMAKE_C_FLAGS="-I$output_folder/include" -DCURL_DISABLE_MANUAL=ON -DBUILD_LIBCURL_DOCS=OFF
           ninja install
 
       - name: Verify Dependencies
