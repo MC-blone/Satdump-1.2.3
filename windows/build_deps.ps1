@@ -35,18 +35,15 @@ cd ../..
 # Curl
 git clone https://github.com/curl/curl --depth 1 -b curl-8_9_1
 cd curl
-mkdir build
+
+if (Test-Path "build") {
+    Remove-Item "build" -Recurse -Force
+}
+
+New-Item -ItemType Directory -Path "build" | Out-Null
 cd build
 
-cmake $cmake_params .. `
-    -DHTTP_ONLY=ON `
-    -DBUILD_SHARED_LIBS=ON `
-    -DBUILD_STATIC_LIBS=OFF `
-    -DBUILD_CURL_EXE=OFF `
-    -DCURL_USE_SCHANNEL=ON `
-    -DUSE_LIBIDN2=OFF `
-    -DCURL_USE_LIBPSL=OFF `
-    -DIMPORT_LIB_SUFFIX=_imp
+cmake $cmake_params .. -DHTTP_ONLY=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -DBUILD_CURL_EXE=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF -DENABLE_CURL_MANUAL=OFF -DCURL_USE_SCHANNEL=ON -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF -DIMPORT_LIB_SUFFIX=_imp
 
 if ($LASTEXITCODE -ne 0) {
     throw "CURL CMake configuration failed"
