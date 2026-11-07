@@ -1,14 +1,11 @@
 #include "module_emwin_text_decoder.h"
 #include "logger.h"
 #include "imgui/imgui.h"
-#include "core/config.h"
 #include <filesystem>
 #include <cstring>
 #include <ctime>
 #include <cstdio>
 #include <cmath>
-#include <thread>
-#include <chrono>
 
 namespace
 {
@@ -36,23 +33,15 @@ namespace fengyun4
                 sf = parameters["sf"].get<int>();
             if (sf < 7 || sf > 12)
                 sf = 9;
-
-            buffer = new uint8_t[8192];
-            memset(buffer, 0, 8192);
         }
 
         EmwinTextDecoderModule::~EmwinTextDecoderModule()
         {
-            if (buffer)
-            {
-                delete[] buffer;
-                buffer = nullptr;
-            }
         }
 
         std::vector<ModuleDataType> EmwinTextDecoderModule::getInputTypes()
         {
-            return {DATA_FILE, DATA_STREAM};
+            return {DATA_FILE};
         }
 
         std::vector<ModuleDataType> EmwinTextDecoderModule::getOutputTypes()
@@ -121,7 +110,16 @@ namespace fengyun4
         {
             if (input_data_type == DATA_FILE)
             {
-                filesize = getFilesize(d_input_file);
+                std::ifstream tmp(d_input_file, std::ios::binary | std::ios::ate);
+                if (tmp.is_open())
+                {
+                    filesize = (uint64_t)tmp.tellg();
+                    tmp.close();
+                }
+                else
+                {
+                    filesize = 0;
+                }
                 data_in = std::ifstream(d_input_file, std::ios::binary);
             }
             else
@@ -129,59 +127,45 @@ namespace fengyun4
                 filesize = 0;
             }
 
-            logger->info("Using input soft symbols " + d_input_file);
+            logger->info("Using input cadu " + d_input_file);
 
-            const int bits_per_sym = sf;
-            const int syms_per_read = 16;
-            std::vector<int8_t> soft((size_t)bits_per_sym * syms_per_read, 0);
-
-            std::string text_accum;
             double base_time = (double)time(NULL);
+            std::string text_accum;
+            text_accum.reserve(4096);
+
+            const int buf_size = 8192;
+            std::vector<uint8_t> rd((size_t)buf_size, 0);
 
             time_t lastTime = 0;
 
             while (input_data_type == DATA_FILE ? !data_in.eof() : input_active.load())
             {
-                int syms = 0;
+                int n = 0;
 
                 if (input_data_type == DATA_FILE)
                 {
-                    data_in.read((char *)soft.data(), (std::streamsize)soft.size());
+                    data_in.read((char *)rd.data(), (std::streamsize)rd.size());
                     std::streamsize got = data_in.gcount();
                     if (got <= 0)
                         break;
-                    syms = (int)(got / bits_per_sym);
+                    n = (int)got;
                 }
                 else
                 {
                     if (!input_fifo)
-                    {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        continue;
-                    }
-                    input_fifo->read((uint8_t *)soft.data(), (int)soft.size());
-                    syms = syms_per_read;
+                        break;
+                    input_fifo->read((uint8_t *)rd.data(), buf_size);
+                    n = buf_size;
                 }
 
-                for (int s = 0; s < syms; s++)
+                for (int i = 0; i < n; i++)
                 {
-                    int val = 0;
-                    int conf = 0;
-                    for (int b = 0; b < bits_per_sym; b++)
-                    {
-                        int8_t v = soft[(size_t)s * bits_per_sym + b];
-                        val = (val << 1) | (v > 0 ? 1 : 0);
-                        conf += (v > 0 ? v : -v);
-                    }
+                    uint8_t v = rd[(size_t)i];
+                    bool printable = (v >= 0x20 && v <= 0x7E) || v == '\n' || v == '\r' || v == '\t';
 
-                    total_syms++;
-                    if (conf > 50 * bits_per_sym)
-                        valid_syms++;
-
-                    bool printable = (val >= 0x20 && val <= 0x7E) || val == '\n' || val == '\r' || val == '\t';
                     if (printable)
                     {
-                        text_accum.push_back((char)val);
+                        text_accum.push_back((char)v);
                         if (text_accum.size() > 4096)
                         {
                             process_final_text(text_accum, base_time);
@@ -196,14 +180,7 @@ namespace fengyun4
                     }
                 }
 
-                if (!text_accum.empty() && input_data_type == DATA_FILE && data_in.eof())
-                {
-                    if (text_accum.size() > 0)
-                        process_final_text(text_accum, base_time);
-                    text_accum.clear();
-                }
-
-                if (input_data_type == DATA_FILE)
+                if (input_data_type == DATA_FILE && data_in)
                     progress = (uint64_t)(std::streamoff)data_in.tellg();
 
                 if (time(NULL) % 10 == 0 && lastTime != time(NULL))
@@ -239,8 +216,6 @@ namespace fengyun4
             if (main_open)
             {
                 ImGui::Text("SF: %d", sf);
-                ImGui::Text("Total symbols: %d", total_syms);
-                ImGui::Text("Valid symbols: %d", valid_syms);
                 ImGui::Text("Last message count: %d", last_msg_count);
 
                 if (input_data_type == DATA_FILE && filesize > 0)
