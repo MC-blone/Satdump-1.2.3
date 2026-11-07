@@ -4,7 +4,6 @@
 #include <cstring>
 #include <cmath>
 #include <ctime>
-#include <algorithm>
 
 namespace fengyun4
 {
@@ -37,7 +36,16 @@ namespace fengyun4
         {
             if (input_data_type == DATA_FILE)
             {
-                filesize = getFilesize(d_input_file);
+                std::ifstream tmp(d_input_file, std::ios::binary | std::ios::ate);
+                if (tmp.is_open())
+                {
+                    filesize = (uint64_t)tmp.tellg();
+                    tmp.close();
+                }
+                else
+                {
+                    filesize = 0;
+                }
                 data_in = std::ifstream(d_input_file, std::ios::binary);
             }
             else
@@ -175,7 +183,6 @@ namespace fengyun4
             if (input_data_type == DATA_FILE && filesize > 0)
                 ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
 
-            drawStopButton();
             ImGui::End();
         }
 
