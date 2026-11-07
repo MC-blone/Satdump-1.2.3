@@ -22,9 +22,9 @@
                     "bw": 812500
                 }
             },
-            "cadu": {
-                "emwin_cadu_decoder": {
-                    "sf": 9
+            "cadu":{
+                "emwin_cadu_decoder":{
+                    "sf":9
                 }
             },
             "products": {
