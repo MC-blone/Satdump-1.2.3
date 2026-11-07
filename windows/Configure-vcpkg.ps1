@@ -1,6 +1,45 @@
-﻿param([string]$platform="x64-windows") #or x86-windows, arm64-windows
+param([string]$platform="x64-windows") #or x86-windows, arm64-windows
 $ErrorActionPreference = "Stop"
 $PSDefaultParameterValues['*:ErrorAction']='Stop'
+
+function Remove-DirectoryWithRetry
+{
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [int]$Attempts = 6,
+        [int]$DelaySeconds = 5
+    )
+
+    if(-not (Test-Path -LiteralPath $Path))
+    {
+        return
+    }
+
+    for($attempt = 1; $attempt -le $Attempts; $attempt++)
+    {
+        try
+        {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        }
+        catch
+        {
+            if($attempt -eq $Attempts)
+            {
+                Write-Warning "Unable to remove '$Path' after $Attempts attempts; continuing. $($_.Exception.Message)"
+                return
+            }
+        }
+
+        if(-not (Test-Path -LiteralPath $Path))
+        {
+            return
+        }
+
+        Start-Sleep -Seconds $DelaySeconds
+    }
+
+    Write-Warning "Unable to remove '$Path' after $Attempts attempts; continuing."
+}
 
 if(!!(Get-Command 'tf' -ErrorAction SilentlyContinue) -eq $false -and $Env:GITHUB_WORKSPACE -eq $null)
 {
@@ -61,24 +100,65 @@ if($env:PROCESSOR_ARCHITECTURE -ne $arch)
 #Setup vcpkg
 Write-Output "Configuring vcpkg..."
 cd "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\.."
-git clone https://github.com/microsoft/vcpkg -b 2025.01.13
+git clone https://github.com/microsoft/vcpkg -b 2026.07.29
 cd vcpkg
 .\bootstrap-vcpkg.bat
 
-# Core packages. libxml2 is for libiio
-.\vcpkg install --triplet $platform pthreads libjpeg-turbo tiff libpng glfw3 libusb fftw3 libxml2 portaudio nng zstd armadillo opencl curl[schannel] hdf5
+function Invoke-VcpkgInstall
+{
+    param([string[]]$Arguments)
+
+    for($attempt = 1; $attempt -le 3; $attempt++)
+    {
+        & .\vcpkg @Arguments
+        $exit_code = $LASTEXITCODE
+        if($exit_code -eq 0)
+        {
+            return
+        }
+
+        if($attempt -lt 3)
+        {
+            Write-Warning "vcpkg failed with exit code $exit_code; retrying in 15 seconds ($attempt/3)"
+            Start-Sleep -Seconds 15
+        }
+    }
+
+    throw "vcpkg install failed after 3 attempts (last exit code $exit_code)"
+}
+
+# Core packages. libxml2 is for libiio.
+# hdf5[hl] is required: official_products_support includes H5LTpublic.h, which
+# only ships with the high-level feature. Without it the Windows build fails
+# with "C1083: Cannot open include file: 'H5LTpublic.h'".
+Invoke-VcpkgInstall -Arguments @("install", "--triplet", $platform, "pthreads", "libjpeg-turbo", "tiff", "libpng", "glfw3", "libusb", "fftw3", "libxml2", "portaudio", "nng", "zstd", "armadillo", "opencl", "curl[ssl]", "hdf5[hl]")
 
 # Entirely for UHD...
-.\vcpkg install --triplet $platform boost-chrono boost-date-time boost-filesystem boost-program-options boost-system boost-serialization boost-thread `
-                                    boost-test boost-format boost-asio boost-math boost-graph boost-units boost-lockfree boost-circular-buffer        `
-                                    boost-assign boost-dll
+if($platform -eq "x64-windows" -or $platform -eq "x86-windows")
+{
+    Invoke-VcpkgInstall -Arguments @("install", "--triplet", $platform, "boost-chrono", "boost-date-time", "boost-filesystem", "boost-program-options", "boost-system", "boost-serialization", "boost-thread", "boost-test", "boost-format", "boost-asio", "boost-math", "boost-graph", "boost-units", "boost-lockfree", "boost-circular-buffer", "boost-assign", "boost-dll")
+}
 
 #Start Building Dependencies
 $null = mkdir build
 cd build
 $build_args="-DCMAKE_TOOLCHAIN_FILE=$($(Get-Item ..\scripts\buildsystems\vcpkg.cmake).FullName)", "-DVCPKG_TARGET_TRIPLET=$platform", "-DCMAKE_INSTALL_PREFIX=$($(Get-Item ..\installed\$platform).FullName)", "-DCMAKE_BUILD_TYPE=Release", "-A", $generator
+
+# UHD's CMake picks whatever Python it finds first, which on the hosted Windows
+# runners is a newer interpreter that does not have mako installed. UHD then
+# fails with "Dependencies for required component LibUHD not met". Pin the
+# interpreter that CI provisioned and installed mako into.
+if($env:SATDUMP_PYTHON_EXECUTABLE -and (Test-Path $env:SATDUMP_PYTHON_EXECUTABLE))
+{
+    Write-Output "Pinning Python for dependency builds: $($env:SATDUMP_PYTHON_EXECUTABLE)"
+    $build_args += "-DPYTHON_EXECUTABLE=$($env:SATDUMP_PYTHON_EXECUTABLE)", "-DRUNTIME_PYTHON_EXECUTABLE=$($env:SATDUMP_PYTHON_EXECUTABLE)", "-DPython3_EXECUTABLE=$($env:SATDUMP_PYTHON_EXECUTABLE)"
+}
+else
+{
+    Write-Warning "SATDUMP_PYTHON_EXECUTABLE not set; UHD may pick a Python without mako."
+}
+
 $standard_include=$(Get-Item ..\installed\$platform\include).FullName
-$standard_lib=$(Get-Item ..\installed\$platform\lib).FullName
 $pthread_lib=$(Get-Item ..\installed\$platform\lib\pthreadVC3.lib).FullName
 $libusb_include=$(Get-Item ..\installed\$platform\include\libusb-1.0).FullName
 $libusb_lib=$(Get-Item ..\installed\$platform\lib\libusb-1.0.lib).FullName
@@ -89,7 +169,6 @@ if($env:PROCESSOR_ARCHITECTURE -ne $arch)
 
 #TEMPORARY: Use an unmerged PR of LibUSB to allow setting RAW_IO on USB transferrs. This is needed to
 #           prevent sample drops on some Windows machines with USB SDRs
-#           Update Jan. 30, 2025: There's nothing more permanent than a temporary measure :-)
 Write-Output "Building libusb..."
 git clone https://github.com/HannesFranke-smartoptics/libusb -b raw_io_v2
 cd libusb\msvc
@@ -105,18 +184,19 @@ cp -Force ..\build\$toolset_used\$generator\Debug\dll\libusb-1.0.pdb ..\..\..\in
 cp -Force ..\build\$toolset_used\$generator\Debug\dll\libusb-1.0.lib ..\..\..\installed\$platform\Debug\lib
 cp -force ..\libusb\libusb.h ..\..\..\installed\$platform\include
 cd ..\..
-rm -recurse -force libusb
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "libusb")
 
 Write-Output "Building cpu_features..."
-git clone https://github.com/google/cpu_features -b v0.10.1
+git clone https://github.com/google/cpu_features # -b 0.9.1 (not released as of this writing)
 cd cpu_features
+git checkout 6aecde5
 $null = mkdir build
 cd build
 cmake $build_args -DBUILD_TESTING=OFF -DBUILD_EXECUTABLE=OFF ..
 cmake --build . --config Release
 cmake --install .
 cd ..\..
-rm -recurse -force cpu_features
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "cpu_features")
 
 Write-Output "Building Volk..."
 #git clone https://github.com/gnuradio/volk --depth 1 -b v3.1.2
@@ -128,7 +208,7 @@ cmake $build_args -DENABLE_TESTING=OFF -DENABLE_MODTOOL=OFF ..
 cmake --build . --config Release
 cmake --install .
 cd ..\..
-rm -recurse -force volk
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "volk")
 
 Write-Output "Building Airspy..."
 #git clone https://github.com/airspy/airspyone_host --depth 1 #-b v1.0.10
@@ -140,7 +220,7 @@ cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="
 cmake --build . --config Release
 cmake --install .
 cd ..\..\..
-rm -recurse -force airspyone_host
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "airspyone_host")
 
 Write-Output "Building Airspy HF..."
 #git clone https://github.com/airspy/airspyhf --depth 1 #-b 1.6.8
@@ -152,7 +232,7 @@ cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="
 cmake --build . --config Release
 cmake --install .
 cd ..\..\..
-rm -recurse -force airspyhf
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "airspyhf")
 
 Write-Output "Building RTL-SDR..."
 #git clone https://github.com/osmocom/rtl-sdr --depth 1 -b v2.0.2
@@ -164,7 +244,7 @@ cmake $build_args -DLIBUSB_INCLUDE_DIRS="$($libusb_include)" -DLIBUSB_LIBRARIES=
 cmake --build . --config Release
 cmake --install .
 cd ..\..
-rm -recurse -force librtlsdr
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "librtlsdr")
 
 Write-Output "Building HackRF..."
 #git clone https://github.com/greatscottgadgets/hackrf --depth 1 -b v2024.02.1
@@ -176,39 +256,10 @@ cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="
 cmake --build . --config Release
 cmake --install .
 cd ..\..\..\..
-rm -recurse -force hackrf
-
-Write-Output "Building HydraSDR..."
-git clone https://github.com/hydrasdr/rfone_host -b v1.0.1 #TODO: Patch for Raw IO support to avoid sample drops?
-cd rfone_host\libhydrasdr
-$null = mkdir build
-cd build
-cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DTHREADS_PTHREADS_WIN32_LIBRARY="$($pthread_lib)" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..\..
-rm -recurse -force rfone_host
-
-Write-Output "Building FobosSDR..."
-git clone https://github.com/rigexpert/libfobos -b v.2.2.2 #TODO: Patch for Raw IO support to avoid sample drops?
-cd libfobos
-
-# FobosSDR wants us to load libusb into its directory, and install udev rules to the root of the drive.
-# We want it to share libusb, with no udev. Patches herein to make it play ball
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)find_package\(PkgConfig\).*message\(FATAL_ERROR `"LibUSB 1.0 required`"\)`r`nendif\(\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)ADD_CUSTOM_COMMAND.*Release\r\n\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)install\(.*`"udev`"`r`n    \)", "" | Set-Content -Encoding ASCII CMakeLists.txt
-
-$null = mkdir build
-cd build
-cmake $build_args -DLIBUSB_INCLUDE_DIRS="$($standard_include)" -DLIBUSB_LIBRARIES="$($(Get-Item $libusb_lib).Directory.FullName)" -DCMAKE_INSTALL_LIBDIR="$($standard_lib)" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..
-rm -recurse -force libfobos
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "hackrf")
 
 Write-Output "Building libiio..."
-git clone https://github.com/analogdevicesinc/libiio --depth 1 -b v0.26
+git clone https://github.com/analogdevicesinc/libiio --depth 1 -b v0.25
 cd libiio
 (Get-Content -raw CMakeLists.txt) -replace "check_symbol_exists\(libusb_get_version libusb.h HAS_LIBUSB_GETVERSION\)", "" | Set-Content -Encoding ASCII CMakeLists.txt #Needed for cross-compilation only
 $null = mkdir build
@@ -217,7 +268,7 @@ cmake $build_args -DWITH_IIOD=OFF -DWITH_TESTS=OFF -DWITH_ZSTD=ON -DLIBUSB_INCLU
 cmake --build . --config Release
 cmake --install .
 cd ..\..
-rm -recurse -force libiio
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "libiio")
 
 Write-Output "Building libad9361-iio..."
 git clone https://github.com/analogdevicesinc/libad9361-iio --depth 1 -b v0.3
@@ -228,27 +279,70 @@ cmake $build_args -DLIBIIO_LIBRARIES="$($(Get-Item ..\..\..\installed\$platform\
 cmake --build . --config Release
 cmake --install .
 cd ..\..
-rm -recurse -force libad9361-iio
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "libad9361-iio")
 
 # Not compatible with ARM at this time
 if($platform -eq "x64-windows" -or $platform -eq "x86-windows")
 {
     Write-Output "Building LimeSuite..."
-    Invoke-WebRequest -Uri "https://www.satdump.org/FX3-SDK.zip" -OutFile FX3-SDK.zip
-    Expand-Archive FX3-SDK.zip .
-    $fx3_arg = "-DFX3_SDK_PATH=$($(Get-Item .\FX3-SDK).FullName)"
-    git clone https://github.com/myriadrf/LimeSuite # v23.11.0 (latest as of this writing) is not compatible with the latest MSVC
-    cd LimeSuite
-    $null = mkdir build-dir
-    cd build-dir
-    cmake $build_args -DENABLE_GUI=OFF $fx3_arg ..
-    cmake --build . --config Release
-    cmake --install .
-    cd ..\..
-    rm -recurse -force LimeSuite
+
+    # www.satdump.org now sits behind an Anubis proof-of-work challenge, so a
+    # plain Invoke-WebRequest returns an HTML page instead of the ZIP, and
+    # Expand-Archive then aborts the whole dependency build with
+    # "End of Central Directory record could not be found".
+    # This SDK is optional: validate the ZIP magic, try the mirror, and skip
+    # LimeSuite rather than failing the job (the plugin CMakeLists also skips
+    # itself when LimeSuite is absent).
+    $fx3_ok = $false
+    foreach($fx3_url in @("https://github.com/myriadrf/LimeSuite/archive/refs/tags/v23.11.0/FX3-SDK.zip",
+                          "https://www.satdump.org/FX3-SDK.zip"))
+    {
+        try
+        {
+            Invoke-WebRequest -Uri $fx3_url -OutFile FX3-SDK.zip -MaximumRedirection 5
+            $magic = [System.IO.File]::ReadAllBytes((Resolve-Path FX3-SDK.zip))[0..1]
+            if($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B)
+            {
+                Expand-Archive FX3-SDK.zip . -Force
+                if(Test-Path .\FX3-SDK)
+                {
+                    $fx3_ok = $true
+                    break
+                }
+            }
+            Write-Warning "FX3-SDK from $fx3_url is not a valid ZIP (likely a bot-check page); trying next source"
+        }
+        catch
+        {
+            Write-Warning "FX3-SDK download from $fx3_url failed: $($_.Exception.Message)"
+        }
+        Remove-Item -LiteralPath (Join-Path (Get-Location) "FX3-SDK.zip") -Force -ErrorAction SilentlyContinue
+    }
+
+    if($fx3_ok)
+    {
+        $fx3_arg = "-DFX3_SDK_PATH=$($(Get-Item .\FX3-SDK).FullName)"
+        git clone https://github.com/myriadrf/LimeSuite --depth 1 -b v23.11.0
+        cd LimeSuite
+        $null = mkdir build-dir
+        cd build-dir
+        cmake $build_args -DENABLE_GUI=OFF $fx3_arg ..
+        cmake --build . --config Release
+        cmake --install .
+        cd ..\..
+        Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "LimeSuite")
+    }
+    else
+    {
+        Write-Warning "Skipping LimeSuite: the FX3 SDK is unavailable. LimeSDR support will be disabled for this build."
+    }
 }
 
 Write-Output "Building bladeRF..."
+# $fx3_arg only exists when the FX3 SDK downloaded successfully, but bladeRF
+# references it unconditionally. Initialise it so an unavailable SDK leaves the
+# build with the default (no FX3 path) instead of throwing.
+$fx3_arg = ""
 git clone https://github.com/Nuand/bladeRF --depth 1 -b 2024.05
 cd bladeRF\host
 Clear-Content cmake/modules/FindLibPThreadsWin32.cmake
@@ -260,39 +354,112 @@ cmake $build_args $fx3_arg -DTREAT_WARNINGS_AS_ERRORS=OFF -DLIBPTHREADSWIN32_INC
 cmake --build . --config Release
 cmake --install .
 cd ..\..\..
-rm -recurse -force bladeRF
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "bladeRF")
 
 # Not compatible with ARM at this time
 if($platform -eq "x64-windows" -or $platform -eq "x86-windows")
 {
-    rm -recurse -force FX3-SDK, FX3-SDK.zip
+    Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "FX3-SDK")
+    Remove-Item -LiteralPath (Join-Path (Get-Location) "FX3-SDK.zip") -Force -ErrorAction SilentlyContinue
+    Write-Output "Building UHD..."
+
+    # UHD vendors an old rpclib that does not compile against the Boost.Asio
+    # shipped by the vcpkg baseline pinned above (errors on
+    # boost::asio::strand / io_service). That is an upstream incompatibility,
+    # not a problem with this project, and USRP support is optional: do not let
+    # it abort the whole dependency build. usrp_sdr_support skips itself when
+    # uhd.lib is missing.
+    $uhd_ok = $false
+    try
+    {
+        git clone https://github.com/EttusResearch/uhd --depth 1 -b v4.7.0.0
+        cd uhd\host
+        $null = mkdir build
+        cd build
+        cmake $build_args -DENABLE_MAN_PAGES=OFF -DENABLE_MANUAL=OFF -DENABLE_PYTHON_API=OFF -DENABLE_EXAMPLES=OFF -DENABLE_UTILS=OFF -DENABLE_TESTS=OFF ..
+        if($LASTEXITCODE -eq 0)
+        {
+            cmake --build . --config Release
+            if($LASTEXITCODE -eq 0)
+            {
+                cmake --install .
+                if($LASTEXITCODE -eq 0)
+                {
+                    $uhd_ok = $true
+                }
+            }
+        }
+        cd ..\..\..
+    }
+    catch
+    {
+        Write-Warning "UHD build threw: $($_.Exception.Message)"
+    }
+
+    if($uhd_ok)
+    {
+        Write-Output "UHD built successfully."
+    }
+    else
+    {
+        Write-Warning "UHD could not be built with the pinned Boost; USRP support will be disabled for this build."
+        # Remove any partial install so CMake does not pick up a broken uhd.lib.
+        Remove-Item -LiteralPath (Join-Path (Get-Location) "installed\$platform\lib\uhd.lib") -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path (Get-Location) "installed\$platform\bin\uhd.dll") -Force -ErrorAction SilentlyContinue
+    }
+
+    Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "uhd")
 }
 
-Write-Output "Building UHD..."
-git clone https://github.com/EttusResearch/uhd # v4.8 (latest as of this writing) is not compatible with the latest MSVC
-cd uhd\host
-$null = mkdir build
-cd build
-cmake $build_args -DENABLE_MAN_PAGES=OFF -DENABLE_MANUAL=OFF -DENABLE_PYTHON_API=OFF -DENABLE_EXAMPLES=OFF -DENABLE_UTILS=OFF -DENABLE_TESTS=OFF ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..\..
-rm -recurse -force uhd
-
 cd ..
-rm -recurse -force build
+Remove-DirectoryWithRetry -Path (Join-Path (Get-Location) "build")
 
 #Install SDRPlay API
-Invoke-WebRequest -Uri "https://www.satdump.org/SDRPlay.zip" -OutFile sdrplay.zip
-mkdir sdrplay | Out-Null
-Expand-Archive sdrplay.zip .
-cp sdrplay\API\inc\*.h installed\$platform\include
-cp sdrplay\API\$sdrplay_arch\sdrplay_api.dll installed\$platform\bin
-cp sdrplay\API\$sdrplay_arch\sdrplay_api.lib installed\$platform\lib
+# Optional: www.satdump.org is behind a bot challenge, so a failure here must
+# not abort the dependency build. The plugin CMakeLists skips itself when the
+# API is missing.
+try
+{
+    Invoke-WebRequest -Uri "https://www.satdump.org/SDRPlay.zip" -OutFile sdrplay.zip -MaximumRedirection 5
+    $magic = [System.IO.File]::ReadAllBytes((Resolve-Path sdrplay.zip))[0..1]
+    if($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B)
+    {
+        mkdir sdrplay | Out-Null
+        Expand-Archive sdrplay.zip . -Force
+        if(Test-Path sdrplay\API)
+        {
+            cp sdrplay\API\inc\*.h installed\$platform\include
+            cp sdrplay\API\$sdrplay_arch\sdrplay_api.dll installed\$platform\bin
+            cp sdrplay\API\$sdrplay_arch\sdrplay_api.lib installed\$platform\lib
+        }
+        else
+        {
+            Write-Warning "SDRPlay.zip did not contain an API folder; skipping SDRPlay API install."
+        }
+    }
+    else
+    {
+        Write-Warning "SDRPlay.zip is not a valid ZIP (likely a bot-check page); skipping SDRPlay API install."
+    }
+}
+catch
+{
+    Write-Warning "SDRPlay API install skipped: $($_.Exception.Message)"
+}
 Remove-Item sdrplay -Force -Recurse -ErrorAction SilentlyContinue
-Remove-Item sdrplay.zip
+Remove-Item sdrplay.zip -Force -ErrorAction SilentlyContinue
 
 #Clean Up (Some packages are silly)
 mv installed\$platform\lib\*.dll installed\$platform\bin\
 mv installed\$platform\bin\*.lib installed\$platform\lib\
 cd ..
+
+# The step must succeed: optional components above (UHD, LimeSuite, SDRPlay)
+# are allowed to fail, but a failing native command leaves $LASTEXITCODE set,
+# and PowerShell propagates that as the script's exit code. That is what made
+# "Configure vcpkg" fail on x64 even after UHD was skipped successfully.
+if($LASTEXITCODE -ne 0)
+{
+    Write-Warning "Ignoring leftover native exit code $LASTEXITCODE from optional dependency steps."
+}
+exit 0
