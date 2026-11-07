@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.12)
-project(fengyun4_support)
+project(fy4_lora_support)
 
+file(GLOB fy4_lora_support_CPPS *.cpp)
+list(FILTER fy4_lora_support_CPPS EXCLUDE REGEX "/main\\.cpp$")
+add_library(fy4_lora_support SHARED ${fy4_lora_support_CPPS})
+target_link_libraries(fy4_lora_support PUBLIC satdump_core)
+target_include_directories(fy4_lora_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-file(GLOB_RECURSE fengyun4_support_CPPS *.cpp openjp2/*.c)
-add_library(fengyun4_support SHARED ${fengyun4_support_CPPS})
-target_link_libraries(fengyun4_support PUBLIC satdump_core)
-target_include_directories(fengyun4_support PUBLIC src .)
-
-install(TARGETS fengyun4_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)add_subdirectory(LoRa)
+install(TARGETS fy4_lora_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
