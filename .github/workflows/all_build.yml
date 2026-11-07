@@ -1,0 +1,597 @@
+# .github/workflows/build.yml
+
+```yaml
+name: Build All
+
+on: [push, workflow_dispatch]
+
+env:
+  BUILD_TYPE: Release
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DEPS_BRANCH: Build-temp
+
+permissions:
+  contents: write
+
+jobs:
+  build_windows_x64:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        id: win-deps-x64
+        with:
+          path: windows/deps
+          key: win-deps-x64-v10-${{ hashFiles('windows/build_deps.ps1') }}
+
+      - name: Set up Python 3.13
+        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+
+      - name: Install mako
+        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+        run: pip install mako
+
+      - name: Add msbuild to PATH
+        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup VS Dev Env
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Clean deps before build
+        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\windows\deps") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\windows\deps"
+          }
+
+      - name: Build Deps
+        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+        shell: powershell
+        working-directory: ${{github.workspace}}\windows
+        run: .\build_deps.ps1
+
+      - name: Verify Dependencies
+        shell: powershell
+        run: |
+          $depsDir = "${{github.workspace}}\windows\deps\output"
+          $missing = $false
+          $checks = @(
+              "include\curl\curl.h",
+              "include\volk\volk_alloc.hh",
+              "lib\volk.lib",
+              "lib\curl.lib"
+          )
+
+          foreach ($file in $checks) {
+              $path = Join-Path $depsDir $file
+              if (Test-Path $path) {
+                  Write-Host "OK: $file" -ForegroundColor Green
+              } else {
+                  Write-Host "MISSING: $file" -ForegroundColor Red
+                  $missing = $true
+              }
+          }
+
+          if ($missing) {
+              Get-ChildItem -Path $depsDir -Recurse -Depth 2 |
+                  Select-Object FullName | Format-Table -AutoSize
+              Write-Error "Dependencies are incomplete."
+              exit 1
+          }
+
+      - name: Link deps to vcpkg directory
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\vcpkg") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
+          }
+          New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg" | Out-Null
+          New-Item -ItemType Junction -Path "${{github.workspace}}\vcpkg\installed" -Target "${{github.workspace}}\windows\deps\output" | Out-Null
+
+      - name: Create Build Environment
+        run: cmake -E make_directory ${{runner.workspace}}/build
+
+      - name: Configure CMake
+        working-directory: ${{runner.workspace}}/build
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
+
+      - name: Build
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: ninja
+
+      - name: Build Installer
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: cpack -C $BUILD_TYPE
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-Windows_x64_Installer
+          path: ${{runner.workspace}}/build/SatDump-*.exe
+          if-no-files-found: error
+
+      - name: Add dumpbin to PATH
+        shell: powershell
+        run: |
+          $vs = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
+          $version = (Get-ChildItem $vs | Sort-Object Name -Descending | Select-Object -First 1).Name
+          "$vs\$version\bin\Hostx64\x64" >> $env:GITHUB_PATH
+
+      - name: Build Portable
+        shell: powershell
+        working-directory: ${{runner.workspace}}/build
+        run: ${{github.workspace}}\windows\make_portable.ps1 -source_path "$Env:GITHUB_WORKSPACE"
+
+      - name: Upload Portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-Windows_x64_Portable
+          path: ${{runner.workspace}}/build/portable/*
+          if-no-files-found: error
+
+  build_windows_arm64:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        id: win-deps-arm64
+        with:
+          path: windows/deps
+          key: win-deps-arm64-v10-${{ hashFiles('windows/build_deps.ps1') }}
+
+      - name: Set up Python 3.13
+        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+
+      - name: Install mako
+        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
+        run: pip install mako
+
+      - name: Add msbuild to PATH
+        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup VS Dev Env
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      - name: Clean deps before build
+        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\windows\deps") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\windows\deps"
+          }
+
+      - name: Build Deps
+        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
+        shell: powershell
+        working-directory: ${{github.workspace}}\windows
+        run: .\build_deps.ps1 -is_cross 1 -is_arm 1
+
+      - name: Verify Dependencies
+        shell: powershell
+        run: |
+          $depsDir = "${{github.workspace}}\windows\deps\output"
+          $missing = $false
+          $checks = @(
+              "include\curl\curl.h",
+              "include\volk\volk_alloc.hh",
+              "lib\volk.lib",
+              "lib\curl.lib"
+          )
+
+          foreach ($file in $checks) {
+              $path = Join-Path $depsDir $file
+              if (Test-Path $path) {
+                  Write-Host "OK: $file" -ForegroundColor Green
+              } else {
+                  Write-Host "MISSING: $file" -ForegroundColor Red
+                  $missing = $true
+              }
+          }
+
+          if ($missing) {
+              Get-ChildItem -Path $depsDir -Recurse -Depth 2 |
+                  Select-Object FullName | Format-Table -AutoSize
+              Write-Error "Dependencies are incomplete."
+              exit 1
+          }
+
+      - name: Link deps to vcpkg directory
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\vcpkg") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
+          }
+          New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg" | Out-Null
+          New-Item -ItemType Junction -Path "${{github.workspace}}\vcpkg\installed" -Target "${{github.workspace}}\windows\deps\output" | Out-Null
+
+      - name: Create Build Environment
+        run: cmake -E make_directory ${{runner.workspace}}/build
+
+      - name: Configure CMake
+        working-directory: ${{runner.workspace}}/build
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_CROSSCOMPILING=ON -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
+
+      - name: Build
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: ninja
+
+      - name: Build Installer
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: cpack -C $BUILD_TYPE
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-Windows_arm64_Installer
+          path: ${{runner.workspace}}/build/SatDump-*.exe
+          if-no-files-found: error
+
+      - name: Add dumpbin to PATH
+        shell: powershell
+        run: |
+          $vs = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
+          $version = (Get-ChildItem $vs | Sort-Object Name -Descending | Select-Object -First 1).Name
+          "$vs\$version\bin\Hostx64\x64" >> $env:GITHUB_PATH
+
+      - name: Build Portable
+        shell: powershell
+        working-directory: ${{runner.workspace}}/build
+        run: ${{github.workspace}}\windows\make_portable.ps1 -source_path "$Env:GITHUB_WORKSPACE"
+
+      - name: Upload Portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-Windows_arm64_Portable
+          path: ${{runner.workspace}}/build/portable/*
+          if-no-files-found: error
+
+  build_android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout SatDump source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Show structure
+        run: |
+          echo "===== android/ ====="
+          ls -la android/ || true
+          echo "===== .gitmodules ====="
+          cat .gitmodules || true
+
+      - name: Restore prebuilt deps from Build-temp
+        shell: bash
+        run: |
+          set -e
+          git clone --no-checkout --depth 1 --branch "$DEPS_BRANCH" \
+            https://github.com/MC-blone/Satdump-1.2.3.git /tmp/deps-cache
+          cd /tmp/deps-cache
+          git checkout "$DEPS_BRANCH" -- android/deps
+          mkdir -p "$GITHUB_WORKSPACE/android"
+          rm -rf "$GITHUB_WORKSPACE/android/deps"
+          cp -r android/deps "$GITHUB_WORKSPACE/android/deps"
+          rm -rf /tmp/deps-cache
+          ls -la "$GITHUB_WORKSPACE/android/deps/output/arm64-v8a/lib/" | head -50 || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK / NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;30.0.3'
+
+      - name: Install NDK
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if sdkmanager 'ndk;25.2.9519653'; then
+              test -d "$ANDROID_SDK_ROOT/ndk/25.2.9519653"
+              exit 0
+            fi
+            rm -rf "$ANDROID_SDK_ROOT/ndk/25.2.9519653" "$ANDROID_SDK_ROOT/.temp"
+            sleep $((attempt * 5))
+          done
+          echo 'FATAL: NDK could not be installed'
+          exit 1
+
+      - name: Install Gradle 7.6.4
+        run: |
+          mkdir -p "$RUNNER_TEMP/gradle"
+          curl -fsSL --retry 3 https://services.gradle.org/distributions/gradle-7.6.4-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+          echo "PATH=$RUNNER_TEMP/gradle/gradle-7.6.4/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Configure SDK location
+        run: |
+          mkdir -p android
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          ls -la "$(dirname "$apk")"
+          test -f "$apk"
+          cp "$apk" SatDump-1.2.3-Android-arm64.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: satdump-android
+          path: SatDump-1.2.3-Android-arm64.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  build_ubuntu_2204:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Update repositories
+        run: sudo apt update
+
+      - name: Install dependencies
+        run: sudo apt install -y libcurl4-openssl-dev libglfw3-dev libfftw3-dev libvolk2-dev build-essential cmake pkgconf libjpeg-dev libpng-dev libtiff-dev libairspy-dev libairspyhf-dev libhackrf-dev librtlsdr-dev libomp-dev libnng-dev libiio-dev libzstd-dev libad9361-dev libbladerf-dev libuhd-dev liblimesuite-dev ocl-icd-opencl-dev libjemalloc-dev portaudio19-dev libhdf5-dev
+
+      - name: Create Build Environment
+        run: cmake -E make_directory ${{runner.workspace}}/build
+
+      - name: Configure CMake
+        shell: bash
+        working-directory: ${{runner.workspace}}/build
+        run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: make -j8
+
+      - name: Package
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: make package
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-Ubuntu-22.04
+          path: ${{runner.workspace}}/build/*.deb
+          if-no-files-found: error
+
+      - name: Setup pkg2appimage
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: |
+          wget https://raw.githubusercontent.com/probonopd/AppImages/master/pkg2appimage
+          chmod +x pkg2appimage
+          sudo apt install -y imagemagick desktop-file-utils libfuse2
+
+      - name: Make AppImage
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: |
+          cp *.deb /tmp/satdump.deb
+          cp $GITHUB_WORKSPACE/SatDump.yml .
+          ./pkg2appimage SatDump.yml || true
+
+          if [ -d "SatDump/SatDump.AppDir" ]; then
+            rm -f SatDump/SatDump.AppDir/.DirIcon
+            wget -c https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+            chmod +x appimagetool
+            mkdir -p out
+            ./appimagetool SatDump/SatDump.AppDir out/SatDump-x86_64.AppImage
+          else
+            echo "AppDir not found, pkg2appimage failed"
+            exit 1
+          fi
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-AppImage
+          path: ${{runner.workspace}}/build/out/*.AppImage
+          if-no-files-found: error
+
+  build_ubuntu_2404:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Update repositories
+        run: sudo apt update
+
+      - name: Install dependencies
+        run: sudo apt install -y libcurl4-openssl-dev libglfw3-dev libfftw3-dev libvolk-dev build-essential cmake pkgconf libjpeg-dev libpng-dev libtiff-dev libairspy-dev libairspyhf-dev libhackrf-dev librtlsdr-dev libomp-dev libnng-dev libiio-dev libzstd-dev libad9361-dev libbladerf-dev libuhd-dev liblimesuite-dev ocl-icd-opencl-dev libjemalloc-dev portaudio19-dev libhdf5-dev
+
+      - name: Create Build Environment
+        run: cmake -E make_directory ${{runner.workspace}}/build
+
+      - name: Configure CMake
+        shell: bash
+        working-directory: ${{runner.workspace}}/build
+        run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: make -j8
+
+      - name: Package
+        working-directory: ${{runner.workspace}}/build
+        shell: bash
+        run: make package
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: SatDump-Ubuntu-24.04
+          path: ${{runner.workspace}}/build/*.deb
+          if-no-files-found: error
+
+  build_linux_arm64:
+    if: ${{ false }}
+    runs-on: ARM64
+
+    steps:
+      - run: echo "Linux ARM64 build skipped"
+
+  update_nightly_release:
+    needs:
+      - build_windows_x64
+      - build_windows_arm64
+      - build_ubuntu_2204
+      - build_ubuntu_2404
+      - build_android
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Install zip
+        run: sudo apt install -y zip
+
+      - name: Copy files
+        shell: bash
+        run: |
+          set -e
+          mkdir -p satdump_out
+
+          cp SatDump-Ubuntu-22.04/*.deb satdump_out/satdump_ubuntu_22.04_amd64.deb
+          cp SatDump-Ubuntu-24.04/*.deb satdump_out/satdump_ubuntu_24.04_amd64.deb
+          (cd SatDump-Windows_x64_Portable && zip -qr ../satdump_out/SatDump-Windows_x64_Portable.zip .)
+          cp SatDump-Windows_x64_Installer/*.exe satdump_out/SatDump-Windows_x64_Installer.exe
+          cp satdump-android/SatDump-1.2.3-Android-arm64.apk satdump_out/SatDump-Android.apk
+          cp SatDump-AppImage/*.AppImage satdump_out/SatDump.AppImage
+          (cd SatDump-Windows_arm64_Portable && zip -qr ../satdump_out/SatDump-Windows_arm64_Portable.zip .)
+          cp SatDump-Windows_arm64_Installer/*.exe satdump_out/SatDump-Windows_arm64_Installer.exe
+
+      - name: Update Nightly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload nightly satdump_out/* -R ${{github.repository}} --clobber
+
+  publish_test_release:
+    name: Publish Test-1.2.3-v1.0
+    needs:
+      - build_windows_x64
+      - build_windows_arm64
+      - build_android
+      - build_ubuntu_2204
+      - build_ubuntu_2404
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release
+
+          copy_one() {
+            local pattern="$1"
+            local output="$2"
+            local count
+            count=$(find "$pattern" -maxdepth 1 -type f | wc -l)
+            if [ "$count" -ne 1 ]; then
+              echo "Expected exactly one file in $pattern, found $count"
+              exit 1
+            fi
+            cp "$pattern"/* "release/$output"
+          }
+
+          copy_one release_assets/SatDump-Windows_x64_Installer SatDump-Windows_x64_Installer.exe
+          copy_one release_assets/SatDump-Windows_arm64_Installer SatDump-Windows_arm64_Installer.exe
+          copy_one release_assets/SatDump-Ubuntu-22.04 satdump_ubuntu_22.04_amd64.deb
+          copy_one release_assets/SatDump-Ubuntu-24.04 satdump_ubuntu_24.04_amd64.deb
+          copy_one release_assets/SatDump-AppImage SatDump.AppImage
+          copy_one release_assets/satdump-android SatDump-Android-arm64.apk
+
+          (cd release_assets/SatDump-Windows_x64_Portable && zip -qr "$GITHUB_WORKSPACE/release/SatDump-Windows_x64_Portable.zip" .)
+          (cd release_assets/SatDump-Windows_arm64_Portable && zip -qr "$GITHUB_WORKSPACE/release/SatDump-Windows_arm64_Portable.zip" .)
+
+          echo "===== Release files ====="
+          ls -lh release/
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 8
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: Test-1.2.3-v1.0
+        shell: bash
+        run: |
+          set -e
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "SatDump 1.2.3 v1.0 Test" \
+                --notes "正式测试构建。包含 Windows x64/ARM64、Ubuntu 22.04/24.04、AppImage 和 Android ARM64。"
+            else
+              gh release create "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "SatDump 1.2.3 v1.0 Test" \
+                --notes "正式测试构建。包含 Windows x64/ARM64、Ubuntu 22.04/24.04、AppImage 和 Android ARM64。" \
+                --target "$GITHUB_SHA"
+            fi
+          fi
+
+          gh release upload "$TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          echo "Release published:"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+```
