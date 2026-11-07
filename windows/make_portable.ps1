@@ -1,9 +1,12 @@
 ```powershell
 param(
-    [string]$source_path="$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..",
+    [string]$source_path,
     [string]$triplet="x64-windows"
 )
 
+if ([string]::IsNullOrWhiteSpace($source_path)) {
+    $source_path = Join-Path $PSScriptRoot ".."
+}
 $source_path = (Resolve-Path $source_path).Path
 $build_path = (Get-Location).Path
 $binary_path = Join-Path $build_path "Release"
