@@ -1,0 +1,13 @@
+prefix=/home/runner/work/Satdump-1.2.3/Satdump-1.2.3/android/deps/output/arm64-v8a
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+LV_CXXFLAGS=
+
+
+Name: volk
+Description: VOLK: Vector Optimized Library of Kernels
+Requires:
+Version: 3.1
+Libs: -L${libdir} -lvolk
+Cflags: -I${includedir} ${LV_CXXFLAGS}

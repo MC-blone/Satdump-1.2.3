@@ -1,0 +1,11 @@
+prefix=/home/runner/work/Satdump-1.2.3/Satdump-1.2.3/android/deps/output/x86
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: wolfssl
+Description: wolfssl C library.
+Version: 5.7.2
+Libs: -L${libdir} -lwolfssl
+Libs.private: -lm
+Cflags: -I${includedir}
