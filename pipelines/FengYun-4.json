@@ -1,6 +1,6 @@
 {
     "fengyun4_a_emwin_lora": {
-        "name": "FengYun-4A EMWIN LoRa",
+        "name": "FengYun-4A EMAIB LoRa",
         "live": true,
         "live_cfg": {
             "pkt_size": 10240,

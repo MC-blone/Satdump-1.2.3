@@ -79,7 +79,7 @@ namespace fengyun4
 
         void LoRaDemodModule::process()
         {
-            if (input_data_type == DATA_FILE)
+            if (input_data_type == DATA_FILE && file_source)
                 filesize = file_source->getFilesize();
             else
                 filesize = 0;
@@ -90,15 +90,14 @@ namespace fengyun4
             logger->info("LoRa demod output: " + d_output_file_hint + ".soft");
             logger->info("SF: " + std::to_string(sf) + " BW: " + std::to_string(bw_hz));
 
-            BaseDemodModule::start();
-            if (agc)
-                agc->start();
-
             if (!agc)
             {
                 logger->error("AGC block not initialized");
                 return;
             }
+
+            // 关键：只调用一次基类 start，内部会启动 agc、file_source 等
+            BaseDemodModule::start();
 
             unsigned g = std::gcd((unsigned)d_samplerate, (unsigned)bw_hz);
             if (g == 0)
@@ -215,7 +214,7 @@ namespace fengyun4
 
         void LoRaDemodModule::drawUI(bool window)
         {
-            ImGui::Begin("FY-4A EMWIN LoRa Demod", NULL, window ? 0 : NOWINDOW_FLAGS);
+            ImGui::Begin("FY-4A EMAIB LoRa Demod", NULL, window ? 0 : NOWINDOW_FLAGS);
 
             ImGui::Text("SF: %d   BW: %d Hz", sf, bw_hz);
             ImGui::Text("Symbols processed: %d", last_syms);
