@@ -1,6 +1,4 @@
-# .github/workflows/build.yml
 
-```yaml
 name: Build All
 
 on: [push, workflow_dispatch]
@@ -594,4 +592,3 @@ jobs:
 
           echo "Release published:"
           echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
-```
