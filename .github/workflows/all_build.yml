@@ -1,125 +1,118 @@
-
 name: Build All
 
 on: [push, workflow_dispatch]
 
 env:
   BUILD_TYPE: Release
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   DEPS_BRANCH: Build-temp
 
 permissions:
   contents: write
 
 jobs:
-  build_windows_x64:
+  build_windows:
+    name: Windows ${{ matrix.arch }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64-windows
+            arch: x64
+            artifact_arch: x64
+          - platform: arm64-windows
+            arch: ARM64
+            artifact_arch: arm64
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Cache dependencies
+      - name: Cache vcpkg
         uses: actions/cache@v4
-        id: win-deps-x64
+        id: vcpkg-cache
         with:
-          path: windows/deps
-          key: win-deps-x64-v10-${{ hashFiles('windows/build_deps.ps1') }}
+          path: vcpkg
+          key: windows-${{ matrix.platform }}-${{ hashFiles('windows/Configure-vcpkg.ps1') }}
 
-      - name: Set up Python 3.13
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.13
+          python-version: '3.12'
 
-      - name: Install mako
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
-        run: pip install mako
+      - name: Install Python dependencies
+        shell: powershell
+        run: |
+          python -m pip install mako
+          "SATDUMP_PYTHON_EXECUTABLE=$((Get-Command python).Source)" >> $env:GITHUB_ENV
 
-      - name: Add msbuild to PATH
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+      - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Setup VS Dev Env
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Clean deps before build
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+      - name: Configure vcpkg
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          if (Test-Path "${{github.workspace}}\windows\deps") {
-              Remove-Item -Recurse -Force "${{github.workspace}}\windows\deps"
-          }
+          & "$env:GITHUB_WORKSPACE\windows\Configure-vcpkg.ps1" -platform "${{ matrix.platform }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build Deps
-        if: steps.win-deps-x64.outputs.cache-hit != 'true'
-        shell: powershell
-        working-directory: ${{github.workspace}}\windows
-        run: .\build_deps.ps1
-
-      - name: Verify Dependencies
+      - name: Clean vcpkg temporary files
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          $depsDir = "${{github.workspace}}\windows\deps\output"
-          $missing = $false
-          $checks = @(
-              "include\curl\curl.h",
-              "include\volk\volk_alloc.hh",
-              "lib\volk.lib",
-              "lib\curl.lib"
-          )
-
-          foreach ($file in $checks) {
-              $path = Join-Path $depsDir $file
-              if (Test-Path $path) {
-                  Write-Host "OK: $file" -ForegroundColor Green
-              } else {
-                  Write-Host "MISSING: $file" -ForegroundColor Red
-                  $missing = $true
-              }
+          foreach ($dir in @("packages", "downloads", "buildtrees")) {
+            $path = Join-Path $env:GITHUB_WORKSPACE "vcpkg\$dir"
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force
+            }
           }
-
-          if ($missing) {
-              Get-ChildItem -Path $depsDir -Recurse -Depth 2 |
-                  Select-Object FullName | Format-Table -AutoSize
-              Write-Error "Dependencies are incomplete."
-              exit 1
-          }
-
-      - name: Link deps to vcpkg directory
-        shell: powershell
-        run: |
-          if (Test-Path "${{github.workspace}}\vcpkg") {
-              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
-          }
-          New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg" | Out-Null
-          New-Item -ItemType Junction -Path "${{github.workspace}}\vcpkg\installed" -Target "${{github.workspace}}\windows\deps\output" | Out-Null
-
-      - name: Create Build Environment
-        run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
-        working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
+        shell: powershell
+        run: |
+          $args = @(
+            "-A", "${{ matrix.arch }}",
+            "-DBUILD_MSVC=ON",
+            "-DVCPKG_TARGET_TRIPLET=${{ matrix.platform }}",
+            "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE\vcpkg\scripts\buildsystems\vcpkg.cmake",
+            "-DPLUGIN_LIMESDR_SDR_SUPPORT=OFF",
+            "-DPLUGIN_USRP_SDR_SUPPORT=OFF",
+            "-DPLUGIN_SDRPLAY_SDR_SUPPORT=OFF",
+            "-DPLUGIN_HYDRASDR_SDR_SUPPORT=OFF",
+            "-DPLUGIN_FOBOSSDR_SDR_SUPPORT=OFF"
+          )
+
+          if ("${{ matrix.arch }}" -eq "ARM64") {
+            $args += @(
+              "-DVCPKG_HOST_TRIPLET=x64-windows",
+              "-DVCPKG_USE_HOST_TOOLS=ON",
+              "-DCMAKE_SYSTEM_VERSION=10.0.22621.0"
+            )
+          }
+
+          cmake -S "$env:GITHUB_WORKSPACE" -B "$env:GITHUB_WORKSPACE\build" @args
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build
-        working-directory: ${{runner.workspace}}/build
-        shell: bash
-        run: ninja
+        shell: powershell
+        run: |
+          cmake --build "$env:GITHUB_WORKSPACE\build" --config $env:BUILD_TYPE --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Installer
-        working-directory: ${{runner.workspace}}/build
-        shell: bash
-        run: cpack -C $BUILD_TYPE
+        shell: powershell
+        working-directory: ${{github.workspace}}\build
+        run: |
+          cpack -C $env:BUILD_TYPE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Installer
         uses: actions/upload-artifact@v4
         with:
-          name: SatDump-Windows_x64_Installer
-          path: ${{runner.workspace}}/build/SatDump-*.exe
+          name: SatDump-Windows_${{ matrix.artifact_arch }}_Installer
+          path: ${{github.workspace}}/build/SatDump-*.exe
           if-no-files-found: error
 
       - name: Add dumpbin to PATH
@@ -131,143 +124,16 @@ jobs:
 
       - name: Build Portable
         shell: powershell
-        working-directory: ${{runner.workspace}}/build
-        run: ${{github.workspace}}\windows\make_portable.ps1 -source_path "$Env:GITHUB_WORKSPACE"
+        working-directory: ${{github.workspace}}\build
+        run: |
+          & "$env:GITHUB_WORKSPACE\windows\make_portable.ps1" -source_path "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Portable
         uses: actions/upload-artifact@v4
         with:
-          name: SatDump-Windows_x64_Portable
-          path: ${{runner.workspace}}/build/portable/*
-          if-no-files-found: error
-
-  build_windows_arm64:
-    runs-on: windows-2022
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        id: win-deps-arm64
-        with:
-          path: windows/deps
-          key: win-deps-arm64-v10-${{ hashFiles('windows/build_deps.ps1') }}
-
-      - name: Set up Python 3.13
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: 3.13
-
-      - name: Install mako
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        run: pip install mako
-
-      - name: Add msbuild to PATH
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Setup VS Dev Env
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64_arm64
-
-      - name: Clean deps before build
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        shell: powershell
-        run: |
-          if (Test-Path "${{github.workspace}}\windows\deps") {
-              Remove-Item -Recurse -Force "${{github.workspace}}\windows\deps"
-          }
-
-      - name: Build Deps
-        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
-        shell: powershell
-        working-directory: ${{github.workspace}}\windows
-        run: .\build_deps.ps1 -is_cross 1 -is_arm 1
-
-      - name: Verify Dependencies
-        shell: powershell
-        run: |
-          $depsDir = "${{github.workspace}}\windows\deps\output"
-          $missing = $false
-          $checks = @(
-              "include\curl\curl.h",
-              "include\volk\volk_alloc.hh",
-              "lib\volk.lib",
-              "lib\curl.lib"
-          )
-
-          foreach ($file in $checks) {
-              $path = Join-Path $depsDir $file
-              if (Test-Path $path) {
-                  Write-Host "OK: $file" -ForegroundColor Green
-              } else {
-                  Write-Host "MISSING: $file" -ForegroundColor Red
-                  $missing = $true
-              }
-          }
-
-          if ($missing) {
-              Get-ChildItem -Path $depsDir -Recurse -Depth 2 |
-                  Select-Object FullName | Format-Table -AutoSize
-              Write-Error "Dependencies are incomplete."
-              exit 1
-          }
-
-      - name: Link deps to vcpkg directory
-        shell: powershell
-        run: |
-          if (Test-Path "${{github.workspace}}\vcpkg") {
-              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
-          }
-          New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg" | Out-Null
-          New-Item -ItemType Junction -Path "${{github.workspace}}\vcpkg\installed" -Target "${{github.workspace}}\windows\deps\output" | Out-Null
-
-      - name: Create Build Environment
-        run: cmake -E make_directory ${{runner.workspace}}/build
-
-      - name: Configure CMake
-        working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_CROSSCOMPILING=ON -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
-
-      - name: Build
-        working-directory: ${{runner.workspace}}/build
-        shell: bash
-        run: ninja
-
-      - name: Build Installer
-        working-directory: ${{runner.workspace}}/build
-        shell: bash
-        run: cpack -C $BUILD_TYPE
-
-      - name: Upload Installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: SatDump-Windows_arm64_Installer
-          path: ${{runner.workspace}}/build/SatDump-*.exe
-          if-no-files-found: error
-
-      - name: Add dumpbin to PATH
-        shell: powershell
-        run: |
-          $vs = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
-          $version = (Get-ChildItem $vs | Sort-Object Name -Descending | Select-Object -First 1).Name
-          "$vs\$version\bin\Hostx64\x64" >> $env:GITHUB_PATH
-
-      - name: Build Portable
-        shell: powershell
-        working-directory: ${{runner.workspace}}/build
-        run: ${{github.workspace}}\windows\make_portable.ps1 -source_path "$Env:GITHUB_WORKSPACE"
-
-      - name: Upload Portable
-        uses: actions/upload-artifact@v4
-        with:
-          name: SatDump-Windows_arm64_Portable
-          path: ${{runner.workspace}}/build/portable/*
+          name: SatDump-Windows_${{ matrix.artifact_arch }}_Portable
+          path: ${{github.workspace}}/build/portable/*
           if-no-files-found: error
 
   build_android:
@@ -473,14 +339,12 @@ jobs:
   build_linux_arm64:
     if: ${{ false }}
     runs-on: ARM64
-
     steps:
       - run: echo "Linux ARM64 build skipped"
 
   update_nightly_release:
     needs:
-      - build_windows_x64
-      - build_windows_arm64
+      - build_windows
       - build_ubuntu_2204
       - build_ubuntu_2404
       - build_android
@@ -490,6 +354,8 @@ jobs:
     steps:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: nightly_assets
 
       - name: Install zip
         run: sudo apt install -y zip
@@ -500,14 +366,14 @@ jobs:
           set -e
           mkdir -p satdump_out
 
-          cp SatDump-Ubuntu-22.04/*.deb satdump_out/satdump_ubuntu_22.04_amd64.deb
-          cp SatDump-Ubuntu-24.04/*.deb satdump_out/satdump_ubuntu_24.04_amd64.deb
-          (cd SatDump-Windows_x64_Portable && zip -qr ../satdump_out/SatDump-Windows_x64_Portable.zip .)
-          cp SatDump-Windows_x64_Installer/*.exe satdump_out/SatDump-Windows_x64_Installer.exe
-          cp satdump-android/SatDump-1.2.3-Android-arm64.apk satdump_out/SatDump-Android.apk
-          cp SatDump-AppImage/*.AppImage satdump_out/SatDump.AppImage
-          (cd SatDump-Windows_arm64_Portable && zip -qr ../satdump_out/SatDump-Windows_arm64_Portable.zip .)
-          cp SatDump-Windows_arm64_Installer/*.exe satdump_out/SatDump-Windows_arm64_Installer.exe
+          cp nightly_assets/SatDump-Ubuntu-22.04/*.deb satdump_out/satdump_ubuntu_22.04_amd64.deb
+          cp nightly_assets/SatDump-Ubuntu-24.04/*.deb satdump_out/satdump_ubuntu_24.04_amd64.deb
+          (cd nightly_assets/SatDump-Windows_x64_Portable && zip -qr "$GITHUB_WORKSPACE/satdump_out/SatDump-Windows_x64_Portable.zip" .)
+          cp nightly_assets/SatDump-Windows_x64_Installer/*.exe satdump_out/SatDump-Windows_x64_Installer.exe
+          cp nightly_assets/satdump-android/SatDump-1.2.3-Android-arm64.apk satdump_out/SatDump-Android.apk
+          cp nightly_assets/SatDump-AppImage/*.AppImage satdump_out/SatDump.AppImage
+          (cd nightly_assets/SatDump-Windows_arm64_Portable && zip -qr "$GITHUB_WORKSPACE/satdump_out/SatDump-Windows_arm64_Portable.zip" .)
+          cp nightly_assets/SatDump-Windows_arm64_Installer/*.exe satdump_out/SatDump-Windows_arm64_Installer.exe
 
       - name: Update Nightly
         env:
@@ -517,8 +383,7 @@ jobs:
   publish_test_release:
     name: Publish Test-1.2.3-v1.0
     needs:
-      - build_windows_x64
-      - build_windows_arm64
+      - build_windows
       - build_android
       - build_ubuntu_2204
       - build_ubuntu_2404
@@ -540,13 +405,13 @@ jobs:
           copy_one() {
             local pattern="$1"
             local output="$2"
-            local count
-            count=$(find "$pattern" -maxdepth 1 -type f | wc -l)
-            if [ "$count" -ne 1 ]; then
-              echo "Expected exactly one file in $pattern, found $count"
+            local files=("$pattern"/*)
+            if [ ! -d "$pattern" ] || [ "${#files[@]}" -ne 1 ] || [ ! -f "${files[0]}" ]; then
+              echo "Expected exactly one file in $pattern"
+              ls -la "$pattern" || true
               exit 1
             fi
-            cp "$pattern"/* "release/$output"
+            cp "${files[0]}" "release/$output"
           }
 
           copy_one release_assets/SatDump-Windows_x64_Installer SatDump-Windows_x64_Installer.exe
