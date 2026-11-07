@@ -54,13 +54,13 @@
                 "value": true,
                 "name": "Save telemetry data",
                 "description": "Whether to process and save telemetry data to a JSONC file"
-            },
-            "no_save_img": {
+            }
+/*            "no_save_img": {
                 "type": "bool",
                 "value": false,
                 "name": "No Save Img",
-                "description": "Only preview and save .svissr data, do not save images."
-            }
+                "description": "Only preview and save .svissr data, do not save images.
+            }*/
         },
         "work": {
             "baseband": {},
@@ -79,6 +79,7 @@
             "products": {
                 "fengyun_svissr_image_decoder": {
                     "satname": "FY-2x"
+                    "no_save_img":false
                 }
             }
         }
