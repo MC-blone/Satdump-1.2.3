@@ -37,26 +37,40 @@ git clone https://github.com/curl/curl --depth 1 -b curl-8_9_1
 cd curl
 mkdir build
 cd build
-cmake $cmake_params .. -DHTTP_ONLY=ON -DBUILD_STATIC_LIBS=OFF -DCURL_USE_SCHANNEL=ON -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF
+
+cmake $cmake_params .. `
+    -DHTTP_ONLY=ON `
+    -DBUILD_SHARED_LIBS=ON `
+    -DBUILD_STATIC_LIBS=OFF `
+    -DBUILD_CURL_EXE=OFF `
+    -DCURL_USE_SCHANNEL=ON `
+    -DUSE_LIBIDN2=OFF `
+    -DCURL_USE_LIBPSL=OFF `
+    -DIMPORT_LIB_SUFFIX=_imp
+
+if ($LASTEXITCODE -ne 0) {
+    throw "CURL CMake configuration failed"
+}
+
 ninja install
 
-# 【关键修复】强制拷贝 curl 头文件和库文件到 output 目录
-Write-Host "Copying curl headers and libs to output folder..."
-if (!(Test-Path "$output_folder\include")) { New-Item -ItemType Directory -Path "$output_folder\include" | Out-Null }
-if (!(Test-Path "$output_folder\lib")) { New-Item -ItemType Directory -Path "$output_folder\lib" | Out-Null }
+if ($LASTEXITCODE -ne 0) {
+    throw "CURL build or installation failed"
+}
 
-if (Test-Path "..\include\curl") {
-    Copy-Item -Path "..\include\curl" -Destination "$output_folder\include\" -Recurse -Force
+$curl_header = "$output_folder\include\curl\curl.h"
+$curl_library = "$output_folder\lib\libcurl_imp.lib"
+
+if (!(Test-Path $curl_header)) {
+    throw "CURL header missing: $curl_header"
 }
-Get-ChildItem -Path "lib" -Filter "*curl*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
-    Copy-Item -Path $_.FullName -Destination "$output_folder\lib\" -Force
+
+if (!(Test-Path $curl_library)) {
+    throw "CURL import library missing: $curl_library"
 }
-if (Test-Path "lib\pkgconfig\libcurl.pc") {
-    if (!(Test-Path "$output_folder\lib\pkgconfig")) { New-Item -ItemType Directory -Path "$output_folder\lib\pkgconfig" | Out-Null }
-    Copy-Item -Path "lib\pkgconfig\libcurl.pc" -Destination "$output_folder\lib\pkgconfig\" -Force
-}
+
+Write-Host "CURL successfully installed"
 cd ../..
-
 # Volk
 git clone https://github.com/gnuradio/volk --depth 1 -b v3.1.2
 cd volk

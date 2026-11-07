@@ -70,7 +70,7 @@ jobs:
               "include\curl\curl.h",
               "include\volk\volk_alloc.hh",
               "lib\volk.lib",
-              "lib\curl.lib"
+              "lib\libcurl_imp.lib"
           )
           
           foreach ($file in $checks) {
