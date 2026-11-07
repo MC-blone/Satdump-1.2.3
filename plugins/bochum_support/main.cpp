@@ -79,8 +79,10 @@ namespace bochum
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&val_true, sizeof(val_true)) < 0)
             throw satdump_exception("Error setting socket SO_REUSEADDR option!");
         
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&val_true, sizeof(val_true)) < 0)
-            throw satdump_exception("Error setting socket SO_REUSEPORT option!");
+        #if !defined(_WIN32) && defined(SO_REUSEPORT)
+            if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&val_true, sizeof(val_true)) < 0)
+                throw satdump_exception("Error setting socket SO_REUSEPORT option!");
+#endif
 
         memset(&recv_addr, 0, sizeof(recv_addr));
         recv_addr.sin_family = AF_INET;
