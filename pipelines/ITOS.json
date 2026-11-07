@@ -18,7 +18,7 @@
         ],
         "parameters": {
             "samplerate": {
-                "value": 3e9
+                "value": 3e6
             },
             "baseband_format": {
                 "value": "cs16"
