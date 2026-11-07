@@ -3,19 +3,15 @@ param(
     [bool]$is_arm=0
 )
 
-# if(!!(Get-Command 'tf' -ErrorAction SilentlyContinue) -eq $false)
-# {
-#     Write-Error "You must run this script within Developer Powershell for Visual Studio"
-#     exit
-# }
-
 mkdir deps
 cd deps
 
 mkdir output
 $output_folder=$(Resolve-Path output)
 $python_interpreter=$($(Get-Command python).Path)
-$cmake_params="-G Ninja", "-DCMAKE_FIND_ROOT_PATH='$output_folder'", "-DCMAKE_INSTALL_PREFIX='$output_folder'", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_SYSTEM_NAME=Windows", "-DPYTHON_EXECUTABLE:FILEPATH=$python_interpreter"
+
+# 【关键修复】去掉路径两边的单引号，防止 CMake 把引号当成路径的一部分
+$cmake_params="-G Ninja", "-DCMAKE_FIND_ROOT_PATH=$output_folder", "-DCMAKE_INSTALL_PREFIX=$output_folder", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_SYSTEM_NAME=Windows", "-DPYTHON_EXECUTABLE:FILEPATH=$python_interpreter"
 
 if($is_arm) {
     $cmake_params+="-DCMAKE_SYSTEM_PROCESSOR=ARM64"
@@ -43,6 +39,22 @@ mkdir build
 cd build
 cmake $cmake_params .. -DHTTP_ONLY=ON -DBUILD_STATIC_LIBS=OFF -DCURL_USE_SCHANNEL=ON -DUSE_LIBIDN2=OFF -DCURL_USE_LIBPSL=OFF
 ninja install
+
+# 【关键修复】强制拷贝 curl 头文件和库文件到 output 目录
+Write-Host "Copying curl headers and libs to output folder..."
+if (!(Test-Path "$output_folder\include")) { New-Item -ItemType Directory -Path "$output_folder\include" | Out-Null }
+if (!(Test-Path "$output_folder\lib")) { New-Item -ItemType Directory -Path "$output_folder\lib" | Out-Null }
+
+if (Test-Path "..\include\curl") {
+    Copy-Item -Path "..\include\curl" -Destination "$output_folder\include\" -Recurse -Force
+}
+Get-ChildItem -Path "lib" -Filter "*curl*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
+    Copy-Item -Path $_.FullName -Destination "$output_folder\lib\" -Force
+}
+if (Test-Path "lib\pkgconfig\libcurl.pc") {
+    if (!(Test-Path "$output_folder\lib\pkgconfig")) { New-Item -ItemType Directory -Path "$output_folder\lib\pkgconfig" | Out-Null }
+    Copy-Item -Path "lib\pkgconfig\libcurl.pc" -Destination "$output_folder\lib\pkgconfig\" -Force
+}
 cd ../..
 
 # Volk
@@ -53,6 +65,14 @@ cd build
 git submodule update --init
 cmake $cmake_params .. -DENABLE_TESTING=OFF -DENABLE_MODTOOL=OFF -DENABLE_STATIC_LIBS=OFF
 ninja install
+
+# 【关键修复】强制拷贝 volk 头文件和库文件到 output 目录
+if (Test-Path "..\include\volk") {
+    Copy-Item -Path "..\include\volk" -Destination "$output_folder\include\" -Recurse -Force
+}
+Get-ChildItem -Path "lib" -Filter "*volk*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
+    Copy-Item -Path $_.FullName -Destination "$output_folder\lib\" -Force
+}
 cd ../..
 
 # NNG
@@ -317,16 +337,5 @@ cd build
 cmake $cmake_params .. -DBUILD_SHARED_LIBS=ON 
 ninja install
 cd ../..
-
-<#
-# libarmadillo
-git clone https://gitlab.com/armadillo-lib/armadillo-code armadillo --depth 1 -b 15.6.x
-cd armadillo
-mkdir build
-cd build
-cmake $cmake_params .. -DBUILD_SHARED_LIBS=ON 
-ninja install
-cd ../..
-#>
 
 cd ..
