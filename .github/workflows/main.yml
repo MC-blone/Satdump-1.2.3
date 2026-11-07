@@ -24,7 +24,7 @@ jobs:
         id: win-deps-x64
         with:
           path: windows/deps
-          key: win-deps-x64-${{ hashFiles('windows/build_deps.ps1') }}
+          key: win-deps-x64-v3-${{ hashFiles('windows/build_deps.ps1') }}
 
       - name: Set up Python 3.13
         if: steps.win-deps-x64.outputs.cache-hit != 'true'
@@ -45,31 +45,66 @@ jobs:
         with:
           arch: x64
 
+      - name: Clean deps before build
+        if: steps.win-deps-x64.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\windows\deps") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\windows\deps"
+          }
+
       - name: Build Deps
         if: steps.win-deps-x64.outputs.cache-hit != 'true'
         shell: powershell
         working-directory: ${{github.workspace}}\windows
         run: .\build_deps.ps1
 
-      - name: Sync deps to vcpkg directory
+      - name: Verify Dependencies
         shell: powershell
         run: |
-          # 欺骗 CMake，把 2.0 的 deps 伪装成 1.2.3 的 vcpkg 目录结构
-          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\include")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\include" | Out-Null }
-          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\lib")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\lib" | Out-Null }
-          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\bin")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\bin" | Out-Null }
+          $depsDir = "${{github.workspace}}\windows\deps\output"
+          Write-Host "Checking dependencies in $depsDir"
           
-          Copy-Item -Path "${{github.workspace}}\windows\deps\output\include\*" -Destination "${{github.workspace}}\vcpkg\installed\include" -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "${{github.workspace}}\windows\deps\output\lib\*" -Destination "${{github.workspace}}\vcpkg\installed\lib" -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "${{github.workspace}}\windows\deps\output\bin\*" -Destination "${{github.workspace}}\vcpkg\installed\bin" -Recurse -Force -ErrorAction SilentlyContinue
+          $missing = $false
+          $checks = @(
+              "include\curl\curl.h",
+              "include\volk\volk_alloc.hh",
+              "lib\volk.lib",
+              "lib\curl.lib"
+          )
+          
+          foreach ($file in $checks) {
+              $path = Join-Path $depsDir $file
+              if (Test-Path $path) {
+                  Write-Host "OK: $file" -ForegroundColor Green
+              } else {
+                  Write-Host "MISSING: $file" -ForegroundColor Red
+                  $missing = $true
+              }
+          }
+          
+          if ($missing) {
+              Write-Host "Listing output directory structure:"
+              Get-ChildItem -Path $depsDir -Recurse -Depth 2 | Select-Object FullName | Format-Table -AutoSize
+              Write-Error "Dependencies are incomplete, aborting build."
+              exit 1
+          }
+
+      - name: Link deps to vcpkg directory
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\vcpkg") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
+          }
+          New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg" | Out-Null
+          New-Item -ItemType Junction -Path "${{github.workspace}}\vcpkg\installed" -Target "${{github.workspace}}\windows\deps\output" | Out-Null
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        # 强制指定 include 和 lib 路径，双保险
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output;${{github.workspace}}/vcpkg/installed" -DCMAKE_CXX_FLAGS="/I${{github.workspace}}/windows/deps/output/include /I${{github.workspace}}/vcpkg/installed/include" "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
@@ -114,7 +149,7 @@ jobs:
         id: win-deps-arm64
         with:
           path: windows/deps
-          key: win-deps-arm64-${{ hashFiles('windows/build_deps.ps1') }}
+          key: win-deps-arm64-v3-${{ hashFiles('windows/build_deps.ps1') }}
 
       - name: Set up Python 3.13
         if: steps.win-deps-arm64.outputs.cache-hit != 'true'
@@ -135,29 +170,66 @@ jobs:
         with:
           arch: amd64_arm64
 
+      - name: Clean deps before build
+        if: steps.win-deps-arm64.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\windows\deps") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\windows\deps"
+          }
+
       - name: Build Deps
         if: steps.win-deps-arm64.outputs.cache-hit != 'true'
         shell: powershell
         working-directory: ${{github.workspace}}\windows
         run: .\build_deps.ps1 -is_cross 1 -is_arm 1
 
-      - name: Sync deps to vcpkg directory
+      - name: Verify Dependencies
         shell: powershell
         run: |
-          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\include")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\include" | Out-Null }
-          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\lib")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\lib" | Out-Null }
-          if (!(Test-Path "${{github.workspace}}\vcpkg\installed\bin")) { New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg\installed\bin" | Out-Null }
+          $depsDir = "${{github.workspace}}\windows\deps\output"
+          Write-Host "Checking dependencies in $depsDir"
           
-          Copy-Item -Path "${{github.workspace}}\windows\deps\output\include\*" -Destination "${{github.workspace}}\vcpkg\installed\include" -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "${{github.workspace}}\windows\deps\output\lib\*" -Destination "${{github.workspace}}\vcpkg\installed\lib" -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "${{github.workspace}}\windows\deps\output\bin\*" -Destination "${{github.workspace}}\vcpkg\installed\bin" -Recurse -Force -ErrorAction SilentlyContinue
+          $missing = $false
+          $checks = @(
+              "include\curl\curl.h",
+              "include\volk\volk_alloc.hh",
+              "lib\volk.lib",
+              "lib\curl.lib"
+          )
+          
+          foreach ($file in $checks) {
+              $path = Join-Path $depsDir $file
+              if (Test-Path $path) {
+                  Write-Host "OK: $file" -ForegroundColor Green
+              } else {
+                  Write-Host "MISSING: $file" -ForegroundColor Red
+                  $missing = $true
+              }
+          }
+          
+          if ($missing) {
+              Write-Host "Listing output directory structure:"
+              Get-ChildItem -Path $depsDir -Recurse -Depth 2 | Select-Object FullName | Format-Table -AutoSize
+              Write-Error "Dependencies are incomplete, aborting build."
+              exit 1
+          }
+
+      - name: Link deps to vcpkg directory
+        shell: powershell
+        run: |
+          if (Test-Path "${{github.workspace}}\vcpkg") {
+              Remove-Item -Recurse -Force "${{github.workspace}}\vcpkg"
+          }
+          New-Item -ItemType Directory -Force -Path "${{github.workspace}}\vcpkg" | Out-Null
+          New-Item -ItemType Junction -Path "${{github.workspace}}\vcpkg\installed" -Target "${{github.workspace}}\windows\deps\output" | Out-Null
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{runner.workspace}}/build
 
       - name: Configure CMake
         working-directory: ${{runner.workspace}}/build
-        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output;${{github.workspace}}/vcpkg/installed" -DCMAKE_CXX_FLAGS="/I${{github.workspace}}/windows/deps/output/include /I${{github.workspace}}/vcpkg/installed/include" "$Env:GITHUB_WORKSPACE"
+        run: cmake -G Ninja -DCMAKE_FIND_ROOT_PATH="${{github.workspace}}/windows/deps/output" -DCMAKE_INSTALL_PREFIX="${{github.workspace}}/windows/deps/output" -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_PROCESSOR=arm64-windows -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_PREFIX_PATH="${{github.workspace}}/windows/deps/output" "$Env:GITHUB_WORKSPACE"
 
       - name: Build
         working-directory: ${{runner.workspace}}/build
