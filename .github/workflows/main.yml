@@ -77,6 +77,9 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE\vcpkg\scripts\buildsystems\vcpkg.cmake",
             "-DPLUGIN_LIMESDR_SDR_SUPPORT=OFF",
             "-DPLUGIN_USRP_SDR_SUPPORT=OFF"
+            "-DPLUGIN_SDRPLAY_SDR_SUPPORT=OFF",
+            "-DPLUGIN_HYDRASDR_SDR_SUPPORT=OFF",
+            "-DPLUGIN_FOBOSSDR_SDR_SUPPORT=OFF"
           )
 
           if ("${{ matrix.arch }}" -eq "ARM64") {
