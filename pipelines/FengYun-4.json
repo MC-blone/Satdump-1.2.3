@@ -1,30 +1,35 @@
 {
-    "fengyun4_a_emwin": {
-        "name": "FengYun-4A EMWIN",
+    "fengyun4_a_emwin_lora": {
+        "name": "FengYun-4A EMWIN LoRa",
         "live": true,
         "live_cfg": {
             "pkt_size": 10240,
             "default": [
-                [
-                    1,
-                    0
-                ]
+                [1, 0],
+                [2,0],
+                [3,0]
             ]
         },
         "frequencies": [
-            [
-                "EMWIN",
-                1697e6
-            ]
+            ["EMWIN", 1697e6]
         ],
         "work": {
             "baseband": {},
             "soft": {
-                "psk_demod": {
-                    "constellation": "bpsk",
-                    "symbolrate": 350e3,
-                    "rrc_alpha": 0.5,
-                    "pll_bw": 0.2
+                "lora_demod": {
+                    "symbolrate": 812500,
+                    "sf": 9,
+                    "bw": 812500
+                }
+            },
+            "cadu": {
+                "emwin_cadu_decoder": {
+                    "sf": 9
+                }
+            },
+            "products": {
+                "emwin_text_decoder": {
+                    "sf": 9
                 }
             }
         }
@@ -35,41 +40,20 @@
         "live_cfg": {
             "pkt_size": 10240,
             "default": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ],
-                [
-                    3,
-                    0
-                ]
+                [1, 0],
+                [2, 0],
+                [3, 0]
             ],
             "server": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ]
+                [1, 0],
+                [2, 0]
             ],
             "client": [
-                [
-                    3,
-                    0
-                ]
+                [3, 0]
             ]
         },
         "frequencies": [
-            [
-                "LRIT",
-                1697e6
-            ]
+            ["LRIT", 1697e6]
         ],
         "parameters": {
             "ts_input": {
@@ -83,11 +67,11 @@
             "baseband": {},
             "bbframe": {
                 "dvbs2_demod": {
-                    "symbolrate": 150e3,
-                    "rrc_alpha": 0.444444,
+                    "symbolrate": 120e3,
+                    "rrc_alpha": 0.4444444444444444444444,
                     "pll_bw": 0.008,
                     "clock_alpha": 2.5e-3,
-                    "modcod": 9,
+                    "modcod": 10,
                     "sof_thresold": 10
                 }
             },
@@ -108,41 +92,20 @@
         "live_cfg": {
             "pkt_size": 10240,
             "default": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ],
-                [
-                    3,
-                    0
-                ]
+                [1, 0],
+                [2, 0],
+                [3, 0]
             ],
             "server": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ]
+                [1, 0],
+                [2, 0]
             ],
             "client": [
-                [
-                    3,
-                    0
-                ]
+                [3, 0]
             ]
         },
         "frequencies": [
-            [
-                "LRIT",
-                1697e6
-            ]
+            ["LRIT", 1697e6]
         ],
         "parameters": {
             "ts_input": {
@@ -156,11 +119,11 @@
             "baseband": {},
             "bbframe": {
                 "dvbs2_demod": {
-                    "symbolrate": 150e3,
-                    "rrc_alpha": 0.444444,
+                    "symbolrate": 120e3,
+                    "rrc_alpha": 0.4444444444444444444444,
                     "pll_bw": 0.008,
                     "clock_alpha": 2.5e-3,
-                    "modcod": 9,
+                    "modcod": 10,
                     "sof_thresold": 10
                 }
             },
@@ -181,41 +144,20 @@
         "live_cfg": {
             "pkt_size": 10240,
             "default": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ],
-                [
-                    3,
-                    0
-                ]
+                [1, 0],
+                [2, 0],
+                [3, 0]
             ],
             "server": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ]
+                [1, 0],
+                [2, 0]
             ],
             "client": [
-                [
-                    3,
-                    0
-                ]
+                [3, 0]
             ]
         },
         "frequencies": [
-            [
-                "HRIT",
-                1679e6
-            ]
+            ["HRIT", 1679e6]
         ],
         "parameters": {
             "ts_input": {
@@ -253,41 +195,20 @@
         "live_cfg": {
             "pkt_size": 10240,
             "default": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ],
-                [
-                    3,
-                    0
-                ]
+                [1, 0],
+                [2, 0],
+                [3, 0]
             ],
             "server": [
-                [
-                    1,
-                    0
-                ],
-                [
-                    2,
-                    0
-                ]
+                [1, 0],
+                [2, 0]
             ],
             "client": [
-                [
-                    3,
-                    0
-                ]
+                [3, 0]
             ]
         },
         "frequencies": [
-            [
-                "HRIT",
-                1679e6
-            ]
+            ["HRIT", 1679e6]
         ],
         "parameters": {
             "ts_input": {
