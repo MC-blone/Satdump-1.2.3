@@ -465,3 +465,9 @@ option(PLUGIN_BITVIEW_APP "Enable BitView Application (Very WIP)" OFF)
 if(PLUGIN_BITVIEW_APP)
   add_subdirectory(bitview_app)
 endif()
+
+option(PLUGIN_LORA "Enable the generic LoRa PHY support plugin" OFF)
+
+if(PLUGIN_LORA OR PLUGIN_FY4 OR PLUGINS_ALL)
+  add_subdirectory(lora_support)
+endif()

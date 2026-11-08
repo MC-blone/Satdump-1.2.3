@@ -1,0 +1,3531 @@
+
+
+========== PROJECT INFORMATION ==========
+ROOT=/data/data/com.termux/files/home/Satdump-1.2.3
+DATE=Sun Nov  8 12:51:02 CST 2026
+ M plugins/CMakeLists.txt
+ D plugins/fengyun4_support/LoRa/module_emwin_cadu_decoder.cpp
+ D plugins/fengyun4_support/LoRa/module_emwin_cadu_decoder.h
+ D plugins/fengyun4_support/LoRa/module_lora_demod.cpp
+ D plugins/fengyun4_support/LoRa/module_lora_demod.h
+ M plugins/fengyun4_support/main.cpp
+?? collect_lora_context.sh
+?? d.sh
+?? lora_context_bundle.txt
+?? plugins/lora_support/
+
+
+========== LORA PLUGIN FILES ==========
+plugins/lora_support/CMakeLists.txt
+plugins/lora_support/LoRa/module_lora_demod.cpp
+plugins/lora_support/LoRa/module_lora_demod.h
+plugins/lora_support/main.cpp
+
+
+========== FILE: plugins/lora_support/CMakeLists.txt ==========
+cmake_minimum_required(VERSION 3.12)
+project(lora_support)
+
+file(GLOB_RECURSE lora_support_CPPS *.cpp)
+add_library(lora_support SHARED ${lora_support_CPPS})
+target_link_libraries(lora_support PUBLIC satdump_core)
+target_include_directories(lora_support PUBLIC src .)
+install(TARGETS lora_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+
+========== FILE: plugins/lora_support/LoRa/module_lora_demod.cpp ==========
+#include "module_lora_demod.h"
+#include "logger.h"
+#include "imgui/imgui.h"
+#include "core/config.h"
+#include <fftw3.h>
+#include <cmath>
+#include <cstring>
+#include <numeric>
+#include <mutex>
+#include "common/dsp/resamp/rational_resampler.h"
+namespace
+{
+    static inline complex_t cmul(complex_t a, complex_t b)
+    {
+        complex_t r;
+        r.real = a.real * b.real - a.imag * b.imag;
+        r.imag = a.real * b.imag + a.imag * b.real;
+        return r;
+    }
+
+    static inline complex_t cconj(complex_t a)
+    {
+        complex_t r;
+        r.real = a.real;
+        r.imag = -a.imag;
+        return r;
+    }
+
+    static inline float cnorm(complex_t a)
+    {
+        return a.real * a.real + a.imag * a.imag;
+    }
+}
+
+namespace fengyun4
+{
+    namespace emwin
+    {
+        LoRaDemodModule::LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
+            : BaseDemodModule(input_file, output_file_hint, parameters)
+        {
+            if (parameters.count("sf") > 0)
+                sf = parameters["sf"].get<int>();
+            if (parameters.count("bw") > 0)
+                bw_hz = parameters["bw"].get<int>();
+
+            if (sf < 7 || sf > 12)
+                sf = 9;
+            if (bw_hz <= 0)
+                bw_hz = 812500;
+            fft_size = 1 << sf;
+
+            MIN_SPS = 1.0f;
+            MAX_SPS = 1e9f;
+
+            if (d_symbolrate <= 0)
+                d_symbolrate = (int)d_samplerate;
+
+            name = "FY-4A EMWIN LoRa Demod";
+            show_freq = false;
+
+            soft_buffer = new int8_t[fft_size];
+            if (soft_buffer)
+                memset(soft_buffer, 0, (size_t)fft_size);
+        }
+
+        LoRaDemodModule::~LoRaDemodModule()
+        {
+            if (soft_buffer)
+            {
+                delete[] soft_buffer;
+                soft_buffer = nullptr;
+            }
+        }
+
+        void LoRaDemodModule::stop()
+        {
+            stop_requested.store(true);
+            std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> rsp;
+            {
+                std::lock_guard<std::mutex> lock(rsp_mtx);
+                rsp = active_rsp;
+            }
+            if (rsp && rsp->output_stream)
+                rsp->output_stream->stopReader();
+        }
+
+        void LoRaDemodModule::init()
+        {
+            BaseDemodModule::initb();
+        }
+
+        void LoRaDemodModule::process()
+        {
+            stop_requested.store(false);
+            if (input_data_type == DATA_FILE && file_source)
+                filesize = file_source->getFilesize();
+            else
+                filesize = 0;
+
+            data_out = std::ofstream(d_output_file_hint + ".soft", std::ios::binary);
+            d_output_files.push_back(d_output_file_hint + ".soft");
+
+            logger->info("LoRa demod output: " + d_output_file_hint + ".soft");
+            logger->info("SF: " + std::to_string(sf) + " BW: " + std::to_string(bw_hz));
+
+            if (!agc)
+            {
+                logger->error("AGC block not initialized");
+                return;
+            }
+
+            // 关键：只调用一次基类 start，内部会启动 agc、file_source 等
+            BaseDemodModule::start();
+
+            unsigned g = std::gcd((unsigned)d_samplerate, (unsigned)bw_hz);
+            if (g == 0)
+                g = 1;
+            auto rsp = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(
+                agc->output_stream,
+                (unsigned)(bw_hz / g),
+                (unsigned)(d_samplerate / g));
+            rsp->start();
+
+            const int sym_len = fft_size;
+            if (sym_len <= 0 || !soft_buffer)
+            {
+                rsp->stop();
+                BaseDemodModule::stop();
+                return;
+            }
+
+            std::vector<complex_t> chirp((size_t)fft_size);
+            const float pi_f = 3.14159265358979323846f;
+            for (int i = 0; i < fft_size; i++)
+            {
+                double x = (double)i;
+                double phase = 2.0 * M_PI * (-0.5 * x + x * x / (2.0 * fft_size));
+                chirp[(size_t)i].real = (float)std::cos(phase);
+                chirp[(size_t)i].imag = (float)std::sin(phase);
+            }
+
+            std::vector<complex_t> fft_in((size_t)fft_size);
+            std::vector<complex_t> fft_out((size_t)fft_size);
+
+            fftwf_plan plan = fftwf_plan_dft_1d(
+                fft_size,
+                reinterpret_cast<fftwf_complex *>(fft_in.data()),
+                reinterpret_cast<fftwf_complex *>(fft_out.data()),
+                FFTW_FORWARD, FFTW_ESTIMATE);
+
+            if (!plan)
+            {
+                logger->error("Failed to create FFT plan");
+                rsp->stop();
+                BaseDemodModule::stop();
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(rsp_mtx);
+                active_rsp = rsp;
+            }
+
+            std::vector<complex_t> rolling;
+            rolling.reserve((size_t)sym_len * 8);
+
+            time_t lastTime = 0;
+            int total_syms = 0;
+
+            while (demod_should_run() && !stop_requested.load())
+            {
+                int n = rsp->output_stream->read();
+                if (n < 0)
+                    break;
+                if (n > 0 && rsp->output_stream->readBuf != nullptr)
+                {
+                    complex_t *buf = rsp->output_stream->readBuf;
+                    for (int i = 0; i < n; i++)
+                        rolling.push_back(buf[i]);
+                }
+                rsp->output_stream->flush();
+
+                while ((int)rolling.size() >= sym_len)
+                {
+                    for (int i = 0; i < sym_len; i++)
+                        fft_in[(size_t)i] = cmul(rolling[(size_t)i], cconj(chirp[(size_t)i]));
+
+                    fftwf_execute(plan);
+
+                    int peak = 0;
+                    float peak_val = 0.0f;
+                    for (int i = 0; i < fft_size; i++)
+                    {
+                        float m = cnorm(fft_out[(size_t)i]);
+                        if (m > peak_val)
+                        {
+                            peak_val = m;
+                            peak = i;
+                        }
+                    }
+
+                    for (int b = 0; b < sf; b++)
+                    {
+                        int bit = (peak >> (sf - 1 - b)) & 1;
+                        soft_buffer[b] = bit ? (int8_t)100 : (int8_t)-100;
+                    }
+                    data_out.write((char *)soft_buffer, sf);
+
+                    total_syms++;
+                    rolling.erase(rolling.begin(), rolling.begin() + sym_len);
+                }
+
+                last_syms = total_syms;
+
+                if (input_data_type == DATA_FILE && file_source)
+                    progress = file_source->getPosition();
+
+                if (time(NULL) % 10 == 0 && lastTime != time(NULL))
+                {
+                    lastTime = time(NULL);
+                    if (filesize > 0)
+                    {
+                        double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
+                        logger->info("Progress " + std::to_string(pct) + "%%");
+                    }
+                }
+            }
+
+            fftwf_destroy_plan(plan);
+            data_out.close();
+            rsp->stop();
+            {
+                std::lock_guard<std::mutex> lock(rsp_mtx);
+                active_rsp.reset();
+            }
+            BaseDemodModule::stop();
+        }
+
+        void LoRaDemodModule::drawUI(bool window)
+        {
+            ImGui::Begin("FY-4A EMAIB LoRa Demod", NULL, window ? 0 : NOWINDOW_FLAGS);
+
+            ImGui::Text("SF: %d   BW: %d Hz", sf, bw_hz);
+            ImGui::Text("Symbols processed: %d", last_syms);
+
+            if (input_data_type == DATA_FILE && filesize > 0)
+                ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
+
+            drawStopButton();
+            ImGui::End();
+        }
+
+        std::string LoRaDemodModule::getID()
+        {
+            return "lora_demod";
+        }
+
+        std::vector<std::string> LoRaDemodModule::getParameters()
+        {
+            return {"symbolrate", "sf", "bw"};
+        }
+
+        std::shared_ptr<ProcessingModule> LoRaDemodModule::getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
+        {
+            return std::make_shared<LoRaDemodModule>(input_file, output_file_hint, parameters);
+        }
+    }
+}
+
+========== FILE: plugins/lora_support/LoRa/module_lora_demod.h ==========
+#pragma once
+
+#include "core/module.h"
+#include "modules/demod/module_demod_base.h"
+#include "common/dsp/resamp/rational_resampler.h"
+#include <fstream>
+#include <atomic>
+#include <mutex>
+#include <vector>
+
+namespace fengyun4
+{
+    namespace emwin
+    {
+        class LoRaDemodModule : public demod::BaseDemodModule
+        {
+        protected:
+            int8_t *soft_buffer = nullptr;
+            int sf = 9;
+            int bw_hz = 812500;
+            int fft_size = 512;
+            int last_syms = 0;
+            std::atomic<bool> stop_requested{false};
+            std::mutex rsp_mtx;
+            std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> active_rsp;
+
+            void drawUI(bool window) override;
+            void process() override;
+
+        public:
+            LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+            ~LoRaDemodModule();
+
+            void stop() override;
+            void init() override;
+
+            static std::string getID();
+            std::string getIDM() override { return getID(); }
+            static std::vector<std::string> getParameters();
+            static std::shared_ptr<ProcessingModule> getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+        };
+    }
+}
+
+========== FILE: plugins/lora_support/main.cpp ==========
+#include "core/plugin.h"
+#include "core/module.h"
+#include "LoRa/module_lora_demod.h"
+
+class LoRaSupport : public satdump::Plugin
+{
+public:
+    std::string getID()
+    {
+        return "lora_support";
+    }
+
+    void init()
+    {
+        satdump::eventBus->register_handler<RegisterModulesEvent>(registerPluginsHandler);
+    }
+
+    static void registerPluginsHandler(const RegisterModulesEvent &evt)
+    {
+        REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::LoRaDemodModule);
+    }
+};
+
+========== FY4 REMAINING LORA FILES ==========
+plugins/fengyun4_support/LoRa/module_emwin_text_decoder.cpp
+plugins/fengyun4_support/LoRa/module_emwin_text_decoder.h
+
+
+========== FILE: plugins/fengyun4_support/LoRa/module_emwin_text_decoder.cpp ==========
+#include "module_emwin_text_decoder.h"
+#include "logger.h"
+#include "imgui/imgui.h"
+#include <filesystem>
+#include <cstring>
+#include <ctime>
+#include <cstdio>
+#include <cmath>
+
+namespace
+{
+    std::string fmt_time(double t)
+    {
+        time_t tv = (time_t)t;
+        std::tm *tm_v = gmtime(&tv);
+        char buf[64] = {0};
+        if (tm_v)
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_v);
+        else
+            snprintf(buf, sizeof(buf), "unknown");
+        return std::string(buf);
+    }
+}
+
+namespace fengyun4
+{
+    namespace emwin
+    {
+        EmwinTextDecoderModule::EmwinTextDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
+            : ProcessingModule(input_file, output_file_hint, parameters)
+        {
+            if (parameters.count("sf") > 0)
+                sf = parameters["sf"].get<int>();
+            if (sf < 7 || sf > 12)
+                sf = 9;
+        }
+
+        EmwinTextDecoderModule::~EmwinTextDecoderModule()
+        {
+        }
+
+        std::vector<ModuleDataType> EmwinTextDecoderModule::getInputTypes()
+        {
+            return {DATA_FILE};
+        }
+
+        std::vector<ModuleDataType> EmwinTextDecoderModule::getOutputTypes()
+        {
+            return {DATA_FILE};
+        }
+
+        void EmwinTextDecoderModule::process_final_text(const std::string &text, double timestamp)
+        {
+            if (text.empty())
+                return;
+
+            if (!d_output_file_hint.empty())
+            {
+                std::string base_dir = d_output_file_hint;
+                size_t slash = base_dir.find_last_of("/\\");
+                if (slash != std::string::npos)
+                    base_dir = base_dir.substr(0, slash);
+                if (base_dir.empty())
+                    base_dir = ".";
+                base_dir += "/EMWIN";
+
+                std::error_code ec;
+                std::filesystem::create_directories(base_dir, ec);
+
+                time_t time_v = (time_t)timestamp;
+                std::tm *tm_v = gmtime(&time_v);
+                char name[160] = {0};
+                if (tm_v)
+                    snprintf(name, sizeof(name), "%04d%02d%02dT%02d%02d%02dZ_%04d.txt",
+                             tm_v->tm_year + 1900, tm_v->tm_mon + 1, tm_v->tm_mday,
+                             tm_v->tm_hour, tm_v->tm_min, tm_v->tm_sec,
+                             file_seq % 10000);
+                else
+                    snprintf(name, sizeof(name), "unknown_%04d.txt", file_seq % 10000);
+                file_seq++;
+
+                std::string full_path = base_dir + "/" + name;
+                std::ofstream outf(full_path, std::ios::binary | std::ios::app);
+                if (outf)
+                {
+                    outf << text;
+                    if (!text.empty() && text.back() != '\n')
+                        outf << "\n";
+                    outf.close();
+                    d_output_files.push_back(full_path);
+                }
+            }
+
+            logger->info("EMWIN text segment saved (%d bytes)", (int)text.size());
+
+            if (is_gui)
+            {
+                std::lock_guard<std::mutex> lk(msg_mtx);
+                nlohmann::json j;
+                j["timestamp"] = timestamp;
+                j["message"] = text;
+                msg_history.push_back(j);
+                if (msg_history.size() > 200)
+                    msg_history.erase(msg_history.begin());
+                last_msg_count = (int)msg_history.size();
+            }
+        }
+
+        void EmwinTextDecoderModule::process()
+        {
+            if (input_data_type == DATA_FILE)
+            {
+                std::ifstream tmp(d_input_file, std::ios::binary | std::ios::ate);
+                if (tmp.is_open())
+                {
+                    filesize = (uint64_t)tmp.tellg();
+                    tmp.close();
+                }
+                else
+                {
+                    filesize = 0;
+                }
+                data_in = std::ifstream(d_input_file, std::ios::binary);
+            }
+            else
+            {
+                filesize = 0;
+            }
+
+            logger->info("Using input cadu " + d_input_file);
+
+            double base_time = (double)time(NULL);
+            std::string text_accum;
+            text_accum.reserve(4096);
+
+            const int buf_size = 8192;
+            std::vector<uint8_t> rd((size_t)buf_size, 0);
+
+            time_t lastTime = 0;
+
+            while (input_data_type == DATA_FILE ? !data_in.eof() : input_active.load())
+            {
+                int n = 0;
+
+                if (input_data_type == DATA_FILE)
+                {
+                    data_in.read((char *)rd.data(), (std::streamsize)rd.size());
+                    std::streamsize got = data_in.gcount();
+                    if (got <= 0)
+                        break;
+                    n = (int)got;
+                }
+                else
+                {
+                    if (!input_fifo)
+                        break;
+                    input_fifo->read((uint8_t *)rd.data(), buf_size);
+                    if (!input_active.load())
+                        break;
+                    n = buf_size;
+                }
+
+                for (int i = 0; i < n; i++)
+                {
+                    uint8_t v = rd[(size_t)i];
+                    bool printable = (v >= 0x20 && v <= 0x7E) || v == '\n' || v == '\r' || v == '\t';
+
+                    if (printable)
+                    {
+                        text_accum.push_back((char)v);
+                        if (text_accum.size() > 4096)
+                        {
+                            process_final_text(text_accum, base_time);
+                            text_accum.clear();
+                        }
+                    }
+                    else
+                    {
+                        if (text_accum.size() > 8)
+                            process_final_text(text_accum, base_time);
+                        text_accum.clear();
+                    }
+                }
+
+                if (input_data_type == DATA_FILE && data_in)
+                    progress = (uint64_t)(std::streamoff)data_in.tellg();
+
+                if (time(NULL) % 10 == 0 && lastTime != time(NULL))
+                {
+                    lastTime = time(NULL);
+                    if (filesize > 0)
+                    {
+                        double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
+                        logger->info("Progress " + std::to_string(pct) + "%%");
+                    }
+                }
+            }
+
+            if (!text_accum.empty())
+            {
+                process_final_text(text_accum, base_time);
+                text_accum.clear();
+            }
+
+            if (input_data_type == DATA_FILE && data_in.is_open())
+                data_in.close();
+        }
+
+        void EmwinTextDecoderModule::drawUI(bool window)
+        {
+            is_gui = true;
+
+            ImGuiIO &io = ImGui::GetIO();
+
+            ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.6f), ImGuiCond_FirstUseEver);
+            bool main_open = ImGui::Begin("FY-4A EMWIN Text Decoder", NULL, (window ? 0 : NOWINDOW_FLAGS) | ImGuiWindowFlags_NoCollapse);
+
+            if (main_open)
+            {
+                ImGui::Text("SF: %d", sf);
+                ImGui::Text("Last message count: %d", last_msg_count);
+
+                if (input_data_type == DATA_FILE && filesize > 0)
+                    ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
+
+                ImGui::Text("Decoded text is shown in the floating window.");
+            }
+            ImGui::End();
+
+            ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.6f), ImGuiCond_FirstUseEver);
+            bool msg_open = ImGui::Begin("EMWIN Messages", NULL, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoCollapse);
+
+            if (msg_open)
+            {
+                std::lock_guard<std::mutex> lk(msg_mtx);
+
+                float wrap_pos = ImGui::GetContentRegionMax().x;
+                ImGui::BeginTable("##emwinmsgtable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit);
+                ImGui::TableSetupColumn("Timestamp", ImGuiTableColumnFlags_NoResize, 160 * ui_scale);
+                ImGui::TableSetupColumn("Message", 0, -1);
+                ImGui::TableHeadersRow();
+
+                for (int i = (int)msg_history.size() - 1; i >= 0; i--)
+                {
+                    try
+                    {
+                        auto &msg = msg_history[(size_t)i];
+                        double ts = msg["timestamp"].get<double>();
+                        std::string text = msg["message"].get<std::string>();
+
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextColored(style::theme.yellow, "%s", fmt_time(ts).c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::PushTextWrapPos(wrap_pos);
+                        ImGui::TextColored(style::theme.green, "%s", text.c_str());
+                        ImGui::PopTextWrapPos();
+                    }
+                    catch (std::exception &)
+                    {
+                    }
+                }
+
+                ImGui::EndTable();
+            }
+            ImGui::End();
+        }
+
+        std::string EmwinTextDecoderModule::getID()
+        {
+            return "emwin_text_decoder";
+        }
+
+        std::vector<std::string> EmwinTextDecoderModule::getParameters()
+        {
+            return {"sf"};
+        }
+
+        std::shared_ptr<ProcessingModule> EmwinTextDecoderModule::getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
+        {
+            return std::make_shared<EmwinTextDecoderModule>(input_file, output_file_hint, parameters);
+        }
+    }
+}
+
+========== FILE: plugins/fengyun4_support/LoRa/module_emwin_text_decoder.h ==========
+#pragma once
+
+#include "core/module.h"
+#include <fstream>
+#include <mutex>
+#include <vector>
+#include <string>
+#include <atomic>
+
+namespace fengyun4
+{
+    namespace emwin
+    {
+        class EmwinTextDecoderModule : public ProcessingModule
+        {
+        protected:
+            uint8_t *buffer = nullptr;
+            std::ifstream data_in;
+            std::atomic<uint64_t> filesize{0};
+            std::atomic<uint64_t> progress{0};
+
+            int sf = 9;
+            int total_syms = 0;
+            int valid_syms = 0;
+            int file_seq = 0;
+
+            std::mutex msg_mtx;
+            std::vector<nlohmann::json> msg_history;
+            int last_msg_count = 0;
+
+            bool is_gui = false;
+
+            void process_final_text(const std::string &text, double timestamp);
+
+        public:
+            EmwinTextDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+            ~EmwinTextDecoderModule();
+            void process() override;
+            void drawUI(bool window) override;
+            std::vector<ModuleDataType> getInputTypes() override;
+            std::vector<ModuleDataType> getOutputTypes() override;
+
+            static std::string getID();
+            virtual std::string getIDM() { return getID(); }
+            static std::vector<std::string> getParameters();
+            static std::shared_ptr<ProcessingModule> getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+        };
+    }
+}
+
+========== PLUGIN REGISTRATION AND CMAKE ==========
+
+
+========== FILE: plugins/CMakeLists.txt ==========
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
+
+# We need those to be available for plugins!
+include_directories(../src-core ../src-interface)
+
+option(PLUGINS_ALL "Enable all plugins by default" ON)
+
+option(PLUGIN_SPACEX "Enable the SpaceX support plugin" OFF)
+
+# ##############################################################################
+option(PLUGIN_SCRIPTING "Enable the scripting support plugin (EXPERIMENTAL)"
+       OFF)
+
+if(PLUGIN_SCRIPTING) # OR PLUGINS_ALL)
+  add_subdirectory(scripting_support)
+endif()
+
+# ##############################################################################
+if(PLUGIN_SPACEX OR PLUGINS_ALL)
+  add_subdirectory(spacex_support)
+endif()
+
+option(PLUGIN_FY2 "Enable the FengYun-2 (S-VISSR, etc) support plugin" OFF)
+
+if(PLUGIN_FY2 OR PLUGINS_ALL)
+  add_subdirectory(fengyun2_support)
+endif()
+
+option(PLUGIN_FY3 "Enable the FengYun-3 (AHRPT, MPT, DPT, etc) support plugin"
+       OFF)
+
+if(PLUGIN_FY3 OR PLUGINS_ALL)
+  add_subdirectory(fengyun3_support)
+endif()
+
+option(PLUGIN_FY4 "Enable the FengYun-4 (LRIT, HRIT) support plugin" OFF)
+
+if(PLUGIN_FY4 OR PLUGINS_ALL)
+  add_subdirectory(fengyun4_support)
+endif()
+
+option(PLUGIN_PROBA "Enable the Proba (1, 2, V, etc) support plugin" OFF)
+
+if(PLUGIN_PROBA OR PLUGINS_ALL)
+  add_subdirectory(proba_support)
+endif()
+
+option(PLUGIN_EOS "Enable the EOS (Aqua, Terra, Aura) support plugin" OFF)
+
+if(PLUGIN_EOS OR PLUGINS_ALL)
+  add_subdirectory(eos_support)
+endif()
+
+option(PLUGIN_METEOR "Enable the Meteor (HRPT, LRPT, etc) support plugin" OFF)
+
+if(PLUGIN_METEOR OR PLUGINS_ALL)
+  add_subdirectory(meteor_support)
+endif()
+
+option(PLUGIN_JPSS "Enable the JPSS (SNPP, JPSS-1, etc) support plugin" OFF)
+
+if(PLUGIN_JPSS OR PLUGINS_ALL)
+  add_subdirectory(jpss_support)
+endif()
+
+option(PLUGIN_GOES "Enable the GOES (GVAR, HRIT, GRB, etc) support plugin" OFF)
+
+if(PLUGIN_GOES OR PLUGINS_ALL)
+  add_subdirectory(goes_support)
+endif()
+
+option(PLUGIN_ELEKTRO_ARKTIKA
+       "Enable the Elektro/Arktika (RDAS, xRIT, etc) support plugin" OFF)
+
+if(PLUGIN_ELEKTRO_ARKTIKA OR PLUGINS_ALL)
+  add_subdirectory(elektro_arktika_support)
+endif()
+
+option(PLUGIN_GK2A "Enable the GK2A (xRIT, etc) support plugin" OFF)
+
+if(PLUGIN_GK2A OR PLUGINS_ALL)
+  add_subdirectory(gk2a_support)
+endif()
+
+option(
+  PLUGIN_NOAA_METOP
+  "Enable the NOAA/MetOp POES (AHRPT, HRPT, X-Band dumps, GAC, etc) support plugin"
+  OFF)
+
+if(PLUGIN_NOAA_METOP OR PLUGINS_ALL)
+  add_subdirectory(noaa_metop_support)
+endif()
+
+option(PLUGIN_DMSP "Enable the DMSP support plugin" OFF)
+
+if(PLUGIN_DMSP OR PLUGINS_ALL)
+  add_subdirectory(dmsp_support)
+endif()
+
+option(PLUGIN_JASON3 "Enable the Jason-3 (S-Band dumps) support plugin" OFF)
+
+if(PLUGIN_JASON3 OR PLUGINS_ALL)
+  add_subdirectory(jason3_support)
+endif()
+
+option(PLUGIN_AIM "Enable the AIM support plugin" OFF)
+
+if(PLUGIN_AIM OR PLUGINS_ALL)
+  add_subdirectory(aim_support)
+endif()
+
+option(PLUGIN_WSF "Enable the WSF (WSF-M) support plugin" OFF)
+
+if(PLUGIN_WSF OR PLUGINS_ALL)
+  add_subdirectory(wsf_support)
+endif()
+
+option(PLUGIN_AWS "Enable the AWS (Sterna) support plugin" OFF)
+
+if(PLUGIN_AWS OR PLUGINS_ALL)
+  add_subdirectory(aws_support)
+endif()
+
+option(PLUGIN_MATS "Enable the MATS support plugin" OFF)
+
+if(PLUGIN_MATS OR PLUGINS_ALL)
+  add_subdirectory(mats_support)
+endif()
+
+option(PLUGIN_HINODE "Enable the Hinode support plugin" OFF)
+
+if(PLUGIN_HINODE OR PLUGINS_ALL)
+  add_subdirectory(hinode_support)
+endif()
+
+option(PLUGIN_OCEANSAT "Enable the Oceansat (X-Band, etc) support plugin" OFF)
+
+if(PLUGIN_OCEANSAT OR PLUGINS_ALL)
+  add_subdirectory(oceansat_support)
+endif()
+
+option(PLUGIN_LANDSAT "Enable the LandSat support plugin" OFF)
+
+if(PLUGIN_LANDSAT OR PLUGINS_ALL)
+  add_subdirectory(landsat_support)
+endif()
+
+option(PLUGIN_HIMAWARI "Enable the Himawari (HimawariCast) support plugin" OFF)
+
+if(PLUGIN_HIMAWARI OR PLUGINS_ALL)
+  add_subdirectory(himawari_support)
+endif()
+
+option(PLUGIN_GEONETCAST "Enable the GeoNetCast support plugin" OFF)
+
+if(PLUGIN_GEONETCAST OR PLUGINS_ALL)
+  add_subdirectory(geonetcast_support)
+endif()
+
+option(PLUGIN_BLUEWALKER3 "Enable the BlueWalker-3 support plugin" OFF)
+
+if(PLUGIN_BLUEWALKER3 OR PLUGINS_ALL)
+  add_subdirectory(bluewalker3_support)
+endif()
+
+option(PLUGIN_ANALOG
+       "Enable the support plugin for analog protocols such as NOAA APT" OFF)
+
+if(PLUGIN_ANALOG OR PLUGINS_ALL)
+  add_subdirectory(analog_support)
+endif()
+
+option(PLUGIN_ORBCOMM "Enable the support plugin for the Orbcomm constellation"
+       OFF)
+
+if(PLUGIN_ORBCOMM OR PLUGINS_ALL)
+  add_subdirectory(orbcomm_support)
+endif()
+
+option(PLUGIN_GCOM "Enable the support plugin for the GCOM satellites" OFF)
+
+if(PLUGIN_GCOM OR PLUGINS_ALL)
+  add_subdirectory(gcom_support)
+endif()
+
+option(PLUGIN_TUBSAT
+       "Enable the support plugin for the TUBSAT satellites (TUBIN, etc)" OFF)
+
+if(PLUGIN_TUBSAT OR PLUGINS_ALL)
+  add_subdirectory(tubsat_support)
+endif()
+
+option(PLUGIN_UMKA "Enable the support plugin for the UmKA satellite" OFF)
+
+if(PLUGIN_UMKA OR PLUGINS_ALL)
+  add_subdirectory(umka_support)
+endif()
+
+option(PLUGIN_DSCOVR "Enable the DSCOVR support plugin" OFF)
+
+if(PLUGIN_DSCOVR OR PLUGINS_ALL)
+  add_subdirectory(dscovr_support)
+endif()
+
+option(PLUGIN_STEREO "Enable the support plugin for the STEREO probes" OFF)
+
+if(PLUGIN_STEREO OR PLUGINS_ALL)
+  add_subdirectory(stereo_support)
+endif()
+
+option(PLUGIN_INMARSAT "Enable the support plugin for Inmarsat" OFF)
+
+if(PLUGIN_INMARSAT OR PLUGINS_ALL)
+  add_subdirectory(inmarsat_support)
+endif()
+
+option(PLUGIN_CUBESAT "Enable the support plugin for CubeSats" OFF)
+
+if(PLUGIN_CUBESAT OR PLUGINS_ALL)
+  add_subdirectory(cubesat_support)
+endif()
+
+option(PLUGIN_OTHERS "Enable the support plugin for a few other random satellites" OFF)
+
+if(PLUGIN_OTHERS OR PLUGINS_ALL)
+  add_subdirectory(others_support)
+endif()
+
+option(PLUGIN_OFFICIAL_PRODUCTS "Enable the support plugin for official satellite products" OFF)
+
+if(PLUGIN_OFFICIAL_PRODUCTS OR PLUGINS_ALL)
+  add_subdirectory(official_products_support)
+endif()
+
+option(PLUGIN_DVB "Enable the support plugin for DVB Standards (DVB-S, DVB-S2)" OFF)
+
+if(PLUGIN_DVB OR PLUGINS_ALL)
+  add_subdirectory(dvb_support)
+endif()
+
+option(PLUGIN_CLUSTER "Enable the CLUSTER support plugin" OFF)
+
+if(PLUGIN_CLUSTER OR PLUGINS_ALL)
+  add_subdirectory(cluster_support)
+endif()
+
+option(PLUGIN_METEOSAT "Enable the Meteosat (MSG Raw data) support plugin" OFF)
+
+if(PLUGIN_METEOSAT OR PLUGINS_ALL)
+  add_subdirectory(meteosat_support)
+endif()
+
+option(PLUGIN_EARTHCARE "Enable the EarthCARE support plugin" OFF)
+
+if(PLUGIN_EARTHCARE OR PLUGINS_ALL)
+  add_subdirectory(earthcare_support)
+endif()
+
+# add_subdirectory(sample)
+option(PLUGIN_GVAR_EXTENDED "Enable the GVAR Extended plugin" OFF)
+
+if(PLUGIN_GVAR_EXTENDED)
+  add_subdirectory(gvar_extended)
+endif()
+
+# ##############################################################################
+option(PLUGIN_SIMD_SSE41 "Enable SIMD SSE41 plugin" ON)
+
+if(PLUGIN_SIMD_SSE41)
+  add_subdirectory(simd_extensions/simd_sse41)
+endif()
+
+option(PLUGIN_SIMD_NEON "Enable SIMD NEON plugin" ON)
+
+if(PLUGIN_SIMD_NEON)
+  add_subdirectory(simd_extensions/simd_neon)
+endif()
+
+option(PLUGIN_SIMD_AVX2 "Enable SIMD AVX2 plugin" ON)
+
+if(PLUGIN_SIMD_AVX2)
+  add_subdirectory(simd_extensions/simd_avx2)
+endif()
+
+# ##############################################################################
+option(PLUGIN_AIRSPY_SDR_SUPPORT "Enable Airspy SDR Support plugin" ON)
+
+if(PLUGIN_AIRSPY_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/airspy_sdr_support)
+endif()
+
+option(PLUGIN_HYDRASDR_SDR_SUPPORT "Enable HydraSDR Support plugin" ON)
+
+if(PLUGIN_HYDRASDR_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/hydrasdr_sdr_support)
+endif()
+
+option(PLUGIN_AIRSPYHF_SDR_SUPPORT "Enable AirspyHF SDR Support plugin" ON)
+
+if(PLUGIN_AIRSPYHF_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/airspyhf_sdr_support)
+endif()
+
+option(PLUGIN_HACKRF_SDR_SUPPORT "Enable HackRF SDR Support plugin" ON)
+
+if(PLUGIN_HACKRF_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/hackrf_sdr_support)
+endif()
+
+option(PLUGIN_LIMESDR_SDR_SUPPORT "Enable LimeSDR SDR Support plugin" ON)
+
+if(PLUGIN_LIMESDR_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/limesdr_sdr_support)
+endif()
+
+option(PLUGIN_SDRPLAY_SDR_SUPPORT "Enable SDRPlay SDR Support plugin" ON)
+
+if(PLUGIN_SDRPLAY_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/sdrplay_sdr_support)
+endif()
+
+option(PLUGIN_PLUTOSDR_SDR_SUPPORT "Enable PlutoSDR SDR Support plugin" ON)
+
+if(PLUGIN_PLUTOSDR_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/plutosdr_sdr_support)
+endif()
+
+option(PLUGIN_BLADERF_SDR_SUPPORT "Enable BladeRF SDR Support plugin" ON)
+
+if(PLUGIN_BLADERF_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/bladerf_sdr_support)
+endif()
+
+option(PLUGIN_USRP_SDR_SUPPORT "Enable USRP SDR Support plugin" ON)
+
+if(PLUGIN_USRP_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/usrp_sdr_support)
+endif()
+
+option(PLUGIN_RTLSDR_SDR_SUPPORT "Enable RTL-SDR SDR Support plugin" ON)
+
+if(PLUGIN_RTLSDR_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/rtlsdr_sdr_support)
+endif()
+
+option(PLUGIN_MIRISDR_SDR_SUPPORT "Enable MiriSDR SDR Support plugin" ON)
+
+if(PLUGIN_MIRISDR_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/mirisdr_sdr_support)
+endif()
+
+option(PLUGIN_SPYSERVER_SUPPORT "Enable SpyServer Support plugin" ON)
+
+if(PLUGIN_SPYSERVER_SUPPORT)
+  add_subdirectory(sdr_sources/spyserver_support)
+endif()
+
+option(PLUGIN_RTLTCP_SUPPORT "Enable RTL-TCP Support plugin" ON)
+
+if(PLUGIN_RTLTCP_SUPPORT)
+  add_subdirectory(sdr_sources/rtltcp_support)
+endif()
+
+option(PLUGIN_SDRPP_SERVER_SUPPORT "Enable SDR++ Server Support plugin" ON)
+
+if(PLUGIN_SDRPP_SERVER_SUPPORT)
+  add_subdirectory(sdr_sources/sdrpp_server_support)
+endif()
+
+option(PLUGIN_AARONIA_SDR_SUPPORT "Enable Aaronia Spectran Support plugin" ON)
+
+if(PLUGIN_AARONIA_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/aaronia_sdr_support)
+endif()
+
+option(PLUGIN_HAROGIC_SDR_SUPPORT "Enable Aaronia Spectran Support plugin" OFF)
+
+if(PLUGIN_HAROGIC_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/harogic_sdr_support)
+endif()
+
+option(PLUGIN_RFNM_SDR_SUPPORT "Enable RFNM Support plugin" ON)
+
+if(PLUGIN_RFNM_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/rfnm_sdr_support)
+endif()
+
+option(PLUGIN_FOBOSSDR_SDR_SUPPORT "Enable FobosSDR Support plugin" ON)
+
+if(PLUGIN_FOBOSSDR_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/fobos_sdr_support)
+endif()
+
+option(PLUGIN_RTAUDIO_SDR_SUPPORT "Enable RtAudio Source Support plugin" OFF)
+
+if(PLUGIN_RTAUDIO_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/rtaudio_sdr_support)
+endif()
+
+option(PLUGIN_NET_SOURCE_SDR_SUPPORT "Enable Network Source Support plugin" ON)
+
+if(PLUGIN_NET_SOURCE_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/net_source_support)
+endif()
+
+option(PLUGIN_REMOTE_SDR_SUPPORT "Enable Remote SDR Support plugin (WIP!)" ON)
+
+if(PLUGIN_REMOTE_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/remote_sdr_support)
+endif()
+
+# Disable by default, sort of experimental
+option(PLUGIN_SDDC_SDR_SUPPORT
+       "Enable SDDC (RX666, RX888, etc) SDR Support plugin" OFF)
+
+if(PLUGIN_SDDC_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/sddc_sdr_support)
+endif()
+
+# NOT recommended
+option(PLUGIN_SOAPY_SDR_SUPPORT
+       "Enable Soapy SDR Support plugin (NOT RECOMMENDED!)" OFF)
+
+if(PLUGIN_SOAPY_SDR_SUPPORT)
+  add_subdirectory(sdr_sources/soapy_sdr_support)
+endif()
+
+# ##############################################################################
+option(PLUGIN_RTAUDIO_SINK "Enable RtAudio Audio Sink plugin" OFF)
+
+if(PLUGIN_RTAUDIO_SINK)
+  add_subdirectory(audio_sinks/rtaudio_audio_sink)
+endif()
+
+option(PLUGIN_PORTAUDIO_SINK "Enable PortAudio Audio Sink plugin" ON)
+
+if(PLUGIN_PORTAUDIO_SINK)
+  add_subdirectory(audio_sinks/portaudio_audio_sink)
+endif()
+
+option(PLUGIN_AAUDIO_SINK "Enable AAudio Audio Sink plugin" ON)
+
+if(PLUGIN_AAUDIO_SINK)
+  add_subdirectory(audio_sinks/aaudio_audio_sink)
+endif()
+
+# ##############################################################################
+option(PLUGIN_BOCHUM_SUPPORT "Enable Bochum-specific plugin" ON)
+
+if(PLUGIN_BOCHUM_SUPPORT)
+  add_subdirectory(bochum_support)
+endif()
+
+# ##############################################################################
+option(PLUGIN_STANDARD_CPP_COMPOS "Enable Standard C++ Composites plugin" OFF)
+
+if(PLUGIN_STANDARD_CPP_COMPOS OR PLUGINS_ALL)
+  add_subdirectory(standard_cpp_compos_support)
+endif()
+
+# ##############################################################################
+option(PLUGIN_BITVIEW_APP "Enable BitView Application (Very WIP)" OFF)
+
+if(PLUGIN_BITVIEW_APP)
+  add_subdirectory(bitview_app)
+endif()
+
+option(PLUGIN_LORA "Enable the generic LoRa PHY support plugin" OFF)
+
+if(PLUGIN_LORA OR PLUGIN_FY4 OR PLUGINS_ALL)
+  add_subdirectory(lora_support)
+endif()
+
+========== FILE: plugins/lora_support/main.cpp ==========
+#include "core/plugin.h"
+#include "core/module.h"
+#include "LoRa/module_lora_demod.h"
+
+class LoRaSupport : public satdump::Plugin
+{
+public:
+    std::string getID()
+    {
+        return "lora_support";
+    }
+
+    void init()
+    {
+        satdump::eventBus->register_handler<RegisterModulesEvent>(registerPluginsHandler);
+    }
+
+    static void registerPluginsHandler(const RegisterModulesEvent &evt)
+    {
+        REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::LoRaDemodModule);
+    }
+};
+
+========== FILE: plugins/lora_support/CMakeLists.txt ==========
+cmake_minimum_required(VERSION 3.12)
+project(lora_support)
+
+file(GLOB_RECURSE lora_support_CPPS *.cpp)
+add_library(lora_support SHARED ${lora_support_CPPS})
+target_link_libraries(lora_support PUBLIC satdump_core)
+target_include_directories(lora_support PUBLIC src .)
+install(TARGETS lora_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+
+========== FILE: plugins/fengyun4_support/main.cpp ==========
+#include "core/plugin.h"
+#include "logger.h"
+#include "core/module.h"
+
+#include "fy4/module_fy4_lrit_data_decoder.h"
+#include "LoRa/module_emwin_text_decoder.h"
+
+class FengYun4Support : public satdump::Plugin
+{
+public:
+    std::string getID()
+    {
+        return "fenyun4_support";
+    }
+
+    void init()
+    {
+        satdump::eventBus->register_handler<RegisterModulesEvent>(registerPluginsHandler);
+    }
+
+    static void registerPluginsHandler(const RegisterModulesEvent &evt)
+    {
+        REGISTER_MODULE_EXTERNAL(evt.modules_registry, fy4::lrit::FY4LRITDataDecoderModule);
+        REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::EmwinTextDecoderModule);
+    }
+};
+
+========== FILE: plugins/fengyun4_support/CMakeLists.txt ==========
+cmake_minimum_required(VERSION 3.12)
+project(fengyun4_support)
+
+file(GLOB_RECURSE fengyun4_support_CPPS *.cpp openjp2/*.c)
+add_library(fengyun4_support SHARED ${fengyun4_support_CPPS})
+target_link_libraries(fengyun4_support PUBLIC satdump_core)
+target_include_directories(fengyun4_support PUBLIC src .)
+
+install(TARGETS fengyun4_support DESTINATION ${CMAKE_INSTALL_LIBDIR}/satdump/plugins)
+
+
+========== DEMOD BASE INTERFACE ==========
+
+
+========== FILE: src-core/modules/demod/module_demod_base.h ==========
+#pragma once
+
+#include "core/module.h"
+#include <thread>
+#include <fstream>
+#include <atomic>
+#include "common/dsp/utils/agc.h"
+#include "common/dsp/io/file_source.h"
+#include "common/dsp/path/splitter.h"
+#include "common/dsp/fft/fft_pan.h"
+#include "common/dsp/utils/correct_iq.h"
+#include "common/dsp/resamp/smart_resampler.h"
+#include "common/dsp/utils/freq_shift.h"
+#include "common/dsp/utils/snr_estimator.h"
+#include "common/widgets/constellation.h"
+#include "common/widgets/snr_plot.h"
+#include "common/widgets/fft_plot.h"
+#include "common/widgets/waterfall_plot.h"
+#include "common/dsp/utils/doppler_correct.h"
+#include "common/dsp/io/file_sink.h"
+
+namespace demod
+{
+    /*
+    This class is meant to handle all common basics shared between demodulators,
+    such as file input, DC Blocking, resampling if the symbolrate is out of bounds
+    and so on.
+
+    This is not meant to be used by itself, and would serve no purpose anyway
+    */
+    class BaseDemodModule : public ProcessingModule
+    {
+    protected:
+        std::shared_ptr<dsp::FileSourceBlock> file_source;
+        std::shared_ptr<dsp::FreqShiftBlock> freq_shift;
+        std::shared_ptr<dsp::DopplerCorrectBlock> doppler_shift;
+        std::shared_ptr<dsp::SplitterBlock> fft_splitter;
+        std::shared_ptr<dsp::FFTPanBlock> fft_proc;
+        std::shared_ptr<dsp::CorrectIQBlock<complex_t>> dc_blocker;
+        std::shared_ptr<dsp::SmartResamplerBlock<complex_t>> resampler;
+        std::shared_ptr<dsp::AGCBlock<complex_t>> agc;
+
+        std::string name = "Demodulator";
+
+        // Defaults can be overwritten by an implementation's constructor
+        int d_buffer_size = 8192;
+        bool d_iq_swap = false;
+        float d_agc_rate = 1e-2;
+        bool d_dc_block = false;
+        long d_frequency_shift = 0;
+        long d_samplerate = -1;
+        int d_symbolrate = 0;
+
+        bool d_doppler_enable = false;
+        float d_doppler_alpha = 0.01;
+
+        std::string d_dump_intermediate = "";
+        std::shared_ptr<dsp::FileSinkBlock> intermediate_file_sink;
+
+        // Computed values
+        float final_samplerate;
+        float final_sps;
+
+        // Min/Max sample per symbol the demodulator will accept before resampling the input
+        float MIN_SPS = 1.1;
+        float MAX_SPS = 4.0;
+        bool resample = false;
+
+        std::ofstream data_out;
+
+        std::atomic<uint64_t> filesize;
+        std::atomic<uint64_t> progress;
+
+        M2M4SNREstimator snr_estimator;
+        float snr, peak_snr;
+
+        bool show_freq = false;
+        float display_freq = 0;
+
+        // UI Stuff
+        widgets::ConstellationViewer constellation;
+        widgets::SNRPlotViewer snr_plot;
+        bool show_fft = false;
+        std::shared_ptr<widgets::FFTPlot> fft_plot;
+        std::shared_ptr<widgets::WaterfallPlot> waterfall_plot;
+
+        bool showWaterfall = false;
+        void drawFFT();
+
+        // Util
+        int8_t clamp(float x)
+        {
+            if (x < -128.0)
+                return -127;
+            if (x > 127.0)
+                return 127;
+            return x;
+        }
+
+        // Stopping, etc
+        bool demod_should_stop = false;
+        bool demod_should_run()
+        {
+            return (input_data_type == DATA_FILE ? !file_source->eof() : input_active.load()) && !demod_should_stop;
+        }
+        void drawStopButton();
+
+    public:
+        BaseDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+        ~BaseDemodModule();
+        virtual void initb(bool resample_here = true);
+        virtual void start();
+        virtual void stop();
+        // void process();
+        virtual void drawUI(bool window);
+        virtual std::vector<ModuleDataType> getInputTypes();
+        virtual std::vector<ModuleDataType> getOutputTypes();
+
+    public:
+        // static std::string getID();
+        // virtual std::string getIDM() { return getID(); };
+        static std::vector<std::string> getParameters();
+        // static std::shared_ptr<ProcessingModule> getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
+    };
+}
+
+========== FILE: src-core/modules/demod/module_demod_base.cpp ==========
+#include "module_demod_base.h"
+#include "logger.h"
+#include "imgui/imgui.h"
+#include "core/config.h"
+#include "common/dsp_source_sink/format_notated.h"
+
+namespace demod
+{
+    BaseDemodModule::BaseDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters) : ProcessingModule(input_file, output_file_hint, parameters),
+                                                                                                                        constellation(100.0f / 127.0f, 100.0f / 127.0f, demod_constellation_size)
+    {
+        // Parameters parsing
+        if (parameters.count("samplerate") > 0)
+            d_samplerate = parameters["samplerate"].get<long>();
+        else
+            throw satdump_exception("Samplerate parameter must be present!");
+
+        if (parameters.count("buffer_size") > 0)
+            d_buffer_size = parameters["buffer_size"].get<long>();
+        else
+            d_buffer_size = std::min<int>(dsp::STREAM_BUFFER_SIZE, std::max<int>(8192 + 1, d_samplerate / 200));
+
+        if (parameters.count("symbolrate") > 0)
+            d_symbolrate = parameters["symbolrate"].get<long>();
+
+        if (parameters.count("agc_rate") > 0)
+            d_agc_rate = parameters["agc_rate"].get<float>();
+
+        if (parameters.count("dc_block") > 0)
+            d_dc_block = parameters["dc_block"].get<bool>();
+
+        if (parameters.count("freq_shift") > 0)
+            d_frequency_shift = parameters["freq_shift"].get<long>();
+
+        if (parameters.count("iq_swap") > 0)
+            d_iq_swap = parameters["iq_swap"].get<bool>();
+
+        /////////////////////
+        if (parameters.count("enable_doppler") > 0)
+            d_doppler_enable = parameters["enable_doppler"].get<bool>();
+
+        if (parameters.count("doppler_alpha") > 0)
+            d_doppler_alpha = parameters["doppler_alpha"].get<float>();
+        /////////////////////
+
+        if (parameters.count("dump_intermediate") > 0)
+            d_dump_intermediate = parameters["dump_intermediate"].get<std::string>();
+
+        snr = 0;
+        peak_snr = 0;
+
+        showWaterfall = satdump::config::main_cfg["user_interface"]["show_waterfall_demod_fft"]["value"].get<bool>();
+    }
+
+    void BaseDemodModule::initb(bool resample_here)
+    {
+        if (d_parameters.contains("min_sps"))
+            MIN_SPS = d_parameters["min_sps"].get<float>();
+        if (d_parameters.contains("max_sps"))
+            MAX_SPS = d_parameters["max_sps"].get<float>();
+
+        float input_sps = (float)d_samplerate / (float)d_symbolrate; // Compute input SPS
+        resample = input_sps > MAX_SPS || input_sps < MIN_SPS;       // If SPS is out of allowed range, we resample
+
+        int range = pow(10, (std::to_string(int(d_symbolrate)).size() - 1)); // Avoid complex resampling
+
+        final_samplerate = d_samplerate;
+
+        if (d_parameters.count("custom_samplerate") > 0)
+            final_samplerate = d_parameters["custom_samplerate"].get<long>();
+        else if (MAX_SPS == MIN_SPS)
+            final_samplerate = d_symbolrate * MAX_SPS;
+        else if (input_sps > MAX_SPS)
+            final_samplerate = resample ? (round(d_symbolrate / range) * range) * MAX_SPS : d_samplerate; // Get the final samplerate we'll be working with
+        else if (input_sps < MIN_SPS)
+            final_samplerate = resample ? d_symbolrate * MIN_SPS : d_samplerate; // Get the final samplerate we'll be working with
+
+        float decimation_factor = d_samplerate / final_samplerate; // Decimation factor to rescale our input buffer
+
+        if (resample)
+            d_buffer_size *= ceil(decimation_factor);
+        if (d_buffer_size > 8192 * 20)
+            d_buffer_size = 8192 * 20;
+
+        final_sps = final_samplerate / (float)d_symbolrate;
+
+        logger->debug("Input SPS : %f", input_sps);
+        logger->debug("Resample : " + std::to_string(resample));
+        logger->debug("Samplerate : %f", final_samplerate);
+        logger->debug("Dec factor : %f", decimation_factor);
+        logger->debug("Final SPS : %f", final_sps);
+
+        if (input_sps < 1.0)
+            throw satdump_exception("SPS is invalid. Must be above 1!");
+
+        // Init DSP Blocks
+        if (input_data_type == DATA_FILE)
+            file_source = std::make_shared<dsp::FileSourceBlock>(d_input_file, d_parameters["baseband_format"].get<std::string>(), d_buffer_size, d_iq_swap);
+
+        if (d_dc_block)
+            dc_blocker = std::make_shared<dsp::CorrectIQBlock<complex_t>>(input_data_type == DATA_DSP_STREAM ? input_stream : file_source->output_stream);
+
+        // Cleanup things a bit
+        std::shared_ptr<dsp::stream<complex_t>> input_data = d_dc_block ? dc_blocker->output_stream : (input_data_type == DATA_DSP_STREAM ? input_stream : file_source->output_stream);
+
+        if (d_frequency_shift != 0)
+            freq_shift = std::make_shared<dsp::FreqShiftBlock>(input_data, d_samplerate, d_frequency_shift);
+
+        if (d_doppler_enable)
+        {
+            double frequency = -1;
+            if (d_parameters.count("satellite_frequency"))
+                frequency = d_parameters["satellite_frequency"].get<double>();
+            else
+                throw satdump_exception("Satellite Frequency is required for doppler correction!");
+
+            if (d_frequency_shift != 0)
+                frequency += d_frequency_shift;
+
+            int norad = -1;
+            if (d_parameters.count("satellite_norad"))
+                norad = d_parameters["satellite_norad"].get<double>();
+            else
+                throw satdump_exception("Satellite NORAD is required for doppler correction!");
+
+            // QTH, with a way to override it
+            double qth_lon = 0, qth_lat = 0, qth_alt = 0;
+            try
+            {
+                qth_lon = satdump::config::main_cfg["satdump_general"]["qth_lon"]["value"].get<double>();
+                qth_lat = satdump::config::main_cfg["satdump_general"]["qth_lat"]["value"].get<double>();
+                qth_alt = satdump::config::main_cfg["satdump_general"]["qth_alt"]["value"].get<double>();
+            }
+            catch (std::exception &)
+            {
+            }
+
+            if (d_parameters.count("qth_lon"))
+                qth_lon = d_parameters["qth_lon"].get<double>();
+            if (d_parameters.count("qth_lat"))
+                qth_lat = d_parameters["qth_lat"].get<double>();
+            if (d_parameters.count("qth_alt"))
+                qth_alt = d_parameters["qth_alt"].get<double>();
+
+            doppler_shift = std::make_shared<dsp::DopplerCorrectBlock>(d_frequency_shift != 0 ? freq_shift->output_stream : input_data,
+                                                                       d_samplerate, d_doppler_alpha, frequency, norad,
+                                                                       qth_lon, qth_lat, qth_alt);
+            if (input_data_type == DATA_FILE)
+            {
+                if (d_parameters.count("start_timestamp") > 0)
+                    doppler_shift->start_time = d_parameters["start_timestamp"].get<double>();
+                else
+                {
+                    logger->error("Start Timestamp is required for doppler correction! Disabling doppler.");
+                    doppler_shift.reset();
+                    d_doppler_enable = false;
+                }
+            }
+        }
+
+        std::shared_ptr<dsp::stream<complex_t>> input_data_final = d_doppler_enable ? doppler_shift->output_stream
+                                                                                    : (d_frequency_shift != 0 ? freq_shift->output_stream : input_data);
+
+        if (input_data_type == DATA_FILE)
+        {
+            fft_splitter = std::make_shared<dsp::SplitterBlock>(input_data_final);
+            fft_splitter->add_output("fft");
+            fft_splitter->set_enabled("fft", show_fft);
+
+            if (d_dump_intermediate != "")
+            {
+                fft_splitter->add_output("intermediate");
+                fft_splitter->set_enabled("intermediate", true);
+                intermediate_file_sink = std::make_shared<dsp::FileSinkBlock>(fft_splitter->get_output("intermediate"));
+            }
+
+            fft_proc = std::make_shared<dsp::FFTPanBlock>(fft_splitter->get_output("fft"));
+            fft_proc->set_fft_settings(8192, final_samplerate, 120);
+            fft_proc->avg_num = 10;
+            fft_plot = std::make_shared<widgets::FFTPlot>(fft_proc->output_stream->writeBuf, 8192, -10, 20, 10);
+            waterfall_plot = std::make_shared<widgets::WaterfallPlot>(8192, 500);
+            waterfall_plot->set_rate(120, 10);
+            fft_proc->on_fft = [this](float *v)
+            { waterfall_plot->push_fft(v); };
+        }
+
+        std::shared_ptr<dsp::stream<complex_t>> input_data_final_fft = input_data_type == DATA_FILE ? fft_splitter->output_stream : input_data_final;
+
+        // Init resampler if required
+        if (resample && resample_here)
+            resampler = std::make_shared<dsp::SmartResamplerBlock<complex_t>>(input_data_final_fft, final_samplerate, d_samplerate);
+
+        // AGC
+        agc = std::make_shared<dsp::AGCBlock<complex_t>>((resample && resample_here) ? resampler->output_stream : input_data_final_fft, d_agc_rate, 1.0f, 1.0f, 65536);
+    }
+
+    std::vector<ModuleDataType> BaseDemodModule::getInputTypes()
+    {
+        return {DATA_FILE, DATA_DSP_STREAM};
+    }
+
+    std::vector<ModuleDataType> BaseDemodModule::getOutputTypes()
+    {
+        return {DATA_FILE, DATA_STREAM};
+    }
+
+    BaseDemodModule::~BaseDemodModule()
+    {
+    }
+
+    void BaseDemodModule::start()
+    {
+        // Start
+        if (input_data_type == DATA_FILE)
+            file_source->start();
+        if (d_dc_block)
+            dc_blocker->start();
+        if (d_frequency_shift != 0)
+            freq_shift->start();
+        if (d_doppler_enable)
+            doppler_shift->start();
+        if (input_data_type == DATA_FILE)
+            fft_splitter->start();
+        if (input_data_type == DATA_FILE && d_dump_intermediate != "")
+        {
+            intermediate_file_sink->start();
+            intermediate_file_sink->set_output_sample_type(d_dump_intermediate);
+            std::string int_file = d_output_file_hint + "_" + std::to_string((uint64_t)d_samplerate) + "_intermediate_iq";
+            logger->trace("Recording intermediate to " + int_file);
+            intermediate_file_sink->start_recording(int_file, d_samplerate);
+        }
+        if (input_data_type == DATA_FILE)
+            fft_proc->start();
+        if (resample && resampler)
+            resampler->start();
+        agc->start();
+    }
+
+    void BaseDemodModule::stop()
+    {
+        // Stop
+        if (input_data_type == DATA_FILE)
+            file_source->stop();
+        if (d_dc_block)
+            dc_blocker->stop();
+        if (d_frequency_shift != 0)
+            freq_shift->stop();
+        if (d_doppler_enable)
+            doppler_shift->stop();
+        if (input_data_type == DATA_FILE)
+            fft_splitter->stop();
+        if (input_data_type == DATA_FILE && d_dump_intermediate != "")
+        {
+            intermediate_file_sink->stop_recording();
+            intermediate_file_sink->stop();
+        }
+        if (input_data_type == DATA_FILE)
+            fft_proc->stop();
+        if (resample && resampler)
+            resampler->stop();
+        agc->stop();
+    }
+
+    void BaseDemodModule::drawUI(bool window)
+    {
+        ImGui::Begin(name.c_str(), NULL, window ? 0 : NOWINDOW_FLAGS);
+
+        ImGui::BeginGroup();
+        constellation.draw(); // Constellation
+        ImGui::EndGroup();
+
+        ImGui::SameLine();
+
+        ImGui::BeginGroup();
+        {
+            // Show SNR information
+            ImGui::Button("Signal", {200 * ui_scale, 20 * ui_scale});
+            if (show_freq)
+            {
+                ImGui::Text("Freq : ");
+                ImGui::SameLine();
+                ImGui::TextColored(style::theme.orange, "%s", format_notated(display_freq, "Hz", 4).c_str());
+            }
+            snr_plot.draw(snr, peak_snr);
+            if (!streamingInput)
+                if (ImGui::Checkbox("Show FFT", &show_fft))
+                    fft_splitter->set_enabled("fft", show_fft);
+        }
+        ImGui::EndGroup();
+
+        if (!streamingInput)
+            ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
+
+        drawStopButton();
+
+        ImGui::End();
+
+        drawFFT();
+    }
+
+    void BaseDemodModule::drawFFT()
+    {
+        if (show_fft && !streamingInput)
+        {
+            ImGui::SetNextWindowSize({400 * (float)ui_scale, (float)(showWaterfall ? 400 : 200) * (float)ui_scale});
+            if (ImGui::Begin("Baseband FFT", NULL, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoResize))
+            {
+                fft_plot->draw({float(ImGui::GetWindowSize().x - 0), float(ImGui::GetWindowSize().y - 40 * ui_scale) * float(showWaterfall ? 0.5 : 1.0)});
+
+                // Find "actual" left edge of FFT, before frequency shift.
+                // Inset by 10% (819), then account for > 100% freq shifts via modulo
+                int pos = (abs((float)d_frequency_shift / (float)d_samplerate) * (float)8192) + 819;
+                pos %= 8192;
+
+                // Compute min and max of the middle 80% of original baseband
+                float min = 1000;
+                float max = -1000;
+                for (int i = 0; i < 6554; i++) // 8192 * 80% = 6554
+                {
+                    if (fft_proc->output_stream->writeBuf[pos] < min)
+                        min = fft_proc->output_stream->writeBuf[pos];
+                    if (fft_proc->output_stream->writeBuf[pos] > max)
+                        max = fft_proc->output_stream->writeBuf[pos];
+                    pos++;
+                    if (pos >= 8192)
+                        pos = 0;
+                }
+
+                waterfall_plot->scale_min = fft_plot->scale_min = fft_plot->scale_min * 0.99 + min * 0.01;
+                waterfall_plot->scale_max = fft_plot->scale_max = fft_plot->scale_max * 0.99 + max * 0.01;
+
+                if (showWaterfall)
+                    waterfall_plot->draw({ImGui::GetWindowSize().x - 0, (float)(ImGui::GetWindowSize().y - 45 * ui_scale) / 2});
+            }
+
+            ImGui::End();
+        }
+    }
+
+    void BaseDemodModule::drawStopButton()
+    {
+        if (input_data_type != DATA_FILE)
+            return;
+
+        if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))
+        {
+            ImGuiStyle &style = ImGui::GetStyle();
+            ImVec2 cur_pos = ImGui::GetCursorPos();
+            cur_pos.x = ImGui::GetContentRegionMax().x - ImGui::CalcTextSize("Abort").x - style.FramePadding.x * 2.0f;
+            cur_pos.y -= 20.0f * ui_scale + style.ItemSpacing.y;
+            ImGui::SetCursorPos(cur_pos);
+            ImGui::PushStyleColor(ImGuiCol_Button, style::theme.red.Value);
+            if (ImGui::Button("Abort##demodstop", ImVec2(0.0f, 20.0f * ui_scale)))
+                demod_should_stop = true;
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("This Abort button will simulate the \ndemodulation being finished. \nProcessing will carry on!");
+        }
+    }
+
+    std::vector<std::string> BaseDemodModule::getParameters()
+    {
+        return {"samplerate", "symbolrate", "agc_rate", "iq_swap", "buffer_size", "dc_block", "baseband_format"};
+    }
+}
+
+========== DSP BLOCK AND STREAM INTERFACES ==========
+
+
+========== FILE: src-core/common/dsp/block.h ==========
+#pragma once
+
+#include "common/dsp/buffer.h"
+#include <thread>
+#include <memory>
+#include "complex.h"
+#include "logger.h"
+#include "core/exception.h"
+
+#define BRANCHLESS_CLIP(x, clip) (0.5 * (std::abs(x + clip) - std::abs(x - clip)))
+#ifndef M_PI
+#define M_PI 3.14159265358979323846 /* pi */
+#endif
+
+namespace dsp
+{
+    template <typename IN_T, typename OUT_T>
+    class Block
+    {
+    protected:
+        std::thread d_thread;
+        bool should_run = false;
+        virtual void work() = 0;
+        bool d_got_input;
+        void run()
+        {
+            while (should_run)
+                work();
+        }
+
+    public:
+        std::shared_ptr<dsp::stream<IN_T>> input_stream;
+        std::shared_ptr<dsp::stream<OUT_T>> output_stream;
+
+    public:
+        Block(std::shared_ptr<dsp::stream<IN_T>> input) : input_stream(input)
+        {
+            d_got_input = true;
+            output_stream = std::make_shared<dsp::stream<OUT_T>>();
+        }
+        ~Block()
+        {
+            if (should_run)
+            {
+                logger->critical("CRITICAL! BLOCK SHOULD BE STOPPED BEFORE CALLING DESTRUCTOR!");
+                stop();
+            }
+        }
+        virtual void start()
+        {
+            should_run = true;
+            d_thread = std::thread(&Block::run, this);
+        }
+        virtual void stop()
+        {
+            should_run = false;
+
+            if (d_got_input)
+                if (input_stream)
+                    input_stream->stopReader();
+            if (output_stream)
+                output_stream->stopWriter();
+
+            if (d_thread.joinable())
+                d_thread.join();
+        }
+    };
+
+    template <typename IN_T, typename OUT_T>
+    class HierBlock
+    {
+    public:
+        std::shared_ptr<dsp::stream<IN_T>> input_stream;
+        std::shared_ptr<dsp::stream<OUT_T>> output_stream;
+
+    public:
+        HierBlock(std::shared_ptr<dsp::stream<IN_T>> input) : input_stream(input)
+        {
+        }
+        ~HierBlock()
+        {
+        }
+        virtual void start() = 0;
+        virtual void stop() = 0;
+    };
+
+    // This is here as many blocks require it
+    float branchless_clip(float x, float clip);
+    double hz_to_rad(double freq, double samplerate);
+    double rad_to_hz(double rad, double samplerate);
+}
+
+========== FILE: src-core/common/dsp/buffer.h ==========
+#pragma once
+#include <mutex>
+#include <condition_variable>
+#include <volk/volk.h>
+#include <string.h>
+#include "common/dsp/complex.h"
+#include "dll_export.h"
+
+namespace dsp
+{
+    // Default buffer sizes
+    SATDUMP_DLL extern int STREAM_BUFFER_SIZE;
+    SATDUMP_DLL extern int RING_BUF_SZ;
+
+    /*
+    Util function to create a volk aligned buffer
+    */
+    template <typename T>
+    T *create_volk_buffer(int size, bool zero = true)
+    {
+        T *buffer = (T *)volk_malloc(size * sizeof(T), volk_get_alignment());
+        if (zero)
+            for (int i = 0; i < size; i++)
+                buffer[i] = 0;
+        return buffer;
+    }
+
+    template <class T>
+    class stream
+    {
+    public:
+        stream(int stream_size = STREAM_BUFFER_SIZE)
+        {
+            writeBuf = create_volk_buffer<T>(stream_size);
+            readBuf = create_volk_buffer<T>(stream_size);
+
+            for (int i = 0; i < stream_size; i++)
+            {
+                writeBuf[i] = 0;
+                readBuf[i] = 0;
+            }
+        }
+
+        ~stream()
+        {
+            volk_free(writeBuf);
+            volk_free(readBuf);
+        }
+
+        bool swap(int size)
+        {
+            {
+                // Wait to either swap or stop
+                std::unique_lock<std::mutex> lck(swapMtx);
+                swapCV.wait(lck, [this]
+                            { return (canSwap || writerStop); });
+
+                // If writer was stopped, abandon operation
+                if (writerStop)
+                {
+                    return false;
+                }
+
+                // Swap buffers
+                dataSize = size;
+                T *temp = writeBuf;
+                writeBuf = readBuf;
+                readBuf = temp;
+                canSwap = false;
+            }
+
+            // Notify reader that some data is ready
+            {
+                std::lock_guard<std::mutex> lck(rdyMtx);
+                dataReady = true;
+            }
+            rdyCV.notify_all();
+
+            return true;
+        }
+
+        int read()
+        {
+            // Wait for data to be ready or to be stopped
+            std::unique_lock<std::mutex> lck(rdyMtx);
+            rdyCV.wait(lck, [this]
+                       { return (dataReady || readerStop); });
+
+            return (readerStop ? -1 : dataSize);
+        }
+
+        void flush()
+        {
+            // Clear data ready
+            {
+                std::lock_guard<std::mutex> lck(rdyMtx);
+                dataReady = false;
+            }
+
+            // Notify writer that buffers can be swapped
+            {
+                std::lock_guard<std::mutex> lck(swapMtx);
+                canSwap = true;
+            }
+
+            swapCV.notify_all();
+        }
+
+        void stopWriter()
+        {
+            {
+                std::lock_guard<std::mutex> lck(swapMtx);
+                writerStop = true;
+            }
+            swapCV.notify_all();
+        }
+
+        void clearWriteStop()
+        {
+            writerStop = false;
+        }
+
+        void stopReader()
+        {
+            {
+                std::lock_guard<std::mutex> lck(rdyMtx);
+                readerStop = true;
+            }
+            rdyCV.notify_all();
+        }
+
+        void clearReadStop() { readerStop = false; }
+        int getDataSize() { return dataSize; }
+        bool getReady() { return dataReady; }
+
+        T *writeBuf;
+        T *readBuf;
+
+    private:
+        std::mutex swapMtx;
+        std::condition_variable swapCV;
+        bool canSwap = true;
+
+        std::mutex rdyMtx;
+        std::condition_variable rdyCV;
+        bool dataReady = false;
+
+        bool readerStop = false;
+        bool writerStop = false;
+
+        int dataSize = 0;
+    };
+
+    template <class T>
+    class RingBuffer
+    {
+    public:
+        RingBuffer()
+        {
+        }
+
+        RingBuffer(int maxLatency) { init(maxLatency); }
+
+        ~RingBuffer()
+        {
+            if (size != 0)
+                delete[] _buffer;
+            size = 0;
+        }
+
+        void init(int maxLatency)
+        {
+            size = RING_BUF_SZ;
+            _buffer = new T[size];
+            _stopReader = false;
+            _stopWriter = false;
+            this->maxLatency = maxLatency;
+            writec = 0;
+            readc = 0;
+            readable = 0;
+            writable = size;
+            memset((void *)_buffer, 0, size * sizeof(T));
+        }
+
+        int read(T *data, int len)
+        {
+            int dataRead = 0;
+            int toRead = 0;
+            while (dataRead < len)
+            {
+                toRead = std::min<int>(waitUntilReadable(), len - dataRead);
+                if (toRead < 0)
+                {
+                    return -1;
+                };
+
+                if ((toRead + readc) > size)
+                {
+                    memcpy(&data[dataRead], &_buffer[readc], (size - readc) * sizeof(T));
+                    memcpy(&data[dataRead + (size - readc)], &_buffer[0], (toRead - (size - readc)) * sizeof(T));
+                }
+                else
+                {
+                    memcpy(&data[dataRead], &_buffer[readc], toRead * sizeof(T));
+                }
+
+                dataRead += toRead;
+
+                _readable_mtx.lock();
+                readable -= toRead;
+                _readable_mtx.unlock();
+                _writable_mtx.lock();
+                writable += toRead;
+                _writable_mtx.unlock();
+                readc = (readc + toRead) % size;
+                canWriteVar.notify_one();
+            }
+            return len;
+        }
+
+        int readAndSkip(T *data, int len, int skip)
+        {
+            int dataRead = 0;
+            int toRead = 0;
+            while (dataRead < len)
+            {
+                toRead = std::min<int>(waitUntilReadable(), len - dataRead);
+                if (toRead < 0)
+                {
+                    return -1;
+                };
+
+                if ((toRead + readc) > size)
+                {
+                    memcpy(&data[dataRead], &_buffer[readc], (size - readc) * sizeof(T));
+                    memcpy(&data[dataRead + (size - readc)], &_buffer[0], (toRead - (size - readc)) * sizeof(T));
+                }
+                else
+                {
+                    memcpy(&data[dataRead], &_buffer[readc], toRead * sizeof(T));
+                }
+
+                dataRead += toRead;
+
+                _readable_mtx.lock();
+                readable -= toRead;
+                _readable_mtx.unlock();
+                _writable_mtx.lock();
+                writable += toRead;
+                _writable_mtx.unlock();
+                readc = (readc + toRead) % size;
+                canWriteVar.notify_one();
+            }
+            dataRead = 0;
+            while (dataRead < skip)
+            {
+                toRead = std::min<int>(waitUntilReadable(), skip - dataRead);
+                if (toRead < 0)
+                {
+                    return -1;
+                };
+
+                dataRead += toRead;
+
+                _readable_mtx.lock();
+                readable -= toRead;
+                _readable_mtx.unlock();
+                _writable_mtx.lock();
+                writable += toRead;
+                _writable_mtx.unlock();
+                readc = (readc + toRead) % size;
+                canWriteVar.notify_one();
+            }
+            return len;
+        }
+
+        int waitUntilReadable()
+        {
+            if (_stopReader)
+            {
+                return -1;
+            }
+            int _r = getReadable();
+            if (_r != 0)
+            {
+                return _r;
+            }
+            std::unique_lock<std::mutex> lck(_readable_mtx);
+            canReadVar.wait(lck, [=]()
+                            { return ((this->getReadable(false) > 0) || this->getReadStop()); });
+            if (_stopReader)
+            {
+                return -1;
+            }
+            return getReadable(false);
+        }
+
+        int getReadable(bool lock = true)
+        {
+            if (lock)
+            {
+                _readable_mtx.lock();
+            };
+            int _r = readable;
+            if (lock)
+            {
+                _readable_mtx.unlock();
+            };
+            return _r;
+        }
+
+        int write(T *data, int len)
+        {
+            int dataWritten = 0;
+            int toWrite = 0;
+            while (dataWritten < len)
+            {
+                toWrite = std::min<int>(waitUntilwritable(), len - dataWritten);
+                if (toWrite < 0)
+                {
+                    return -1;
+                };
+
+                if ((toWrite + writec) > size)
+                {
+                    memcpy(&_buffer[writec], &data[dataWritten], (size - writec) * sizeof(T));
+                    memcpy(&_buffer[0], &data[dataWritten + (size - writec)], (toWrite - (size - writec)) * sizeof(T));
+                }
+                else
+                {
+                    memcpy(&_buffer[writec], &data[dataWritten], toWrite * sizeof(T));
+                }
+
+                dataWritten += toWrite;
+
+                _readable_mtx.lock();
+                readable += toWrite;
+                _readable_mtx.unlock();
+                _writable_mtx.lock();
+                writable -= toWrite;
+                _writable_mtx.unlock();
+                writec = (writec + toWrite) % size;
+
+                canReadVar.notify_one();
+            }
+            return len;
+        }
+
+        int waitUntilwritable()
+        {
+            if (_stopWriter)
+            {
+                return -1;
+            }
+            int _w = getWritable();
+            if (_w != 0)
+            {
+                return _w;
+            }
+            std::unique_lock<std::mutex> lck(_writable_mtx);
+            canWriteVar.wait(lck, [=]()
+                             { return ((this->getWritable(false) > 0) || this->getWriteStop()); });
+            if (_stopWriter)
+            {
+                return -1;
+            }
+            return getWritable(false);
+        }
+
+        int getWritable(bool lock = true)
+        {
+            if (lock)
+            {
+                _writable_mtx.lock();
+            };
+            int _w = writable;
+            if (lock)
+            {
+                _writable_mtx.unlock();
+                _readable_mtx.lock();
+            };
+            int _r = readable;
+            if (lock)
+            {
+                _readable_mtx.unlock();
+            };
+            return std::max<int>(std::min<int>(_w, maxLatency - _r), 0);
+        }
+
+        void stopReader()
+        {
+            _stopReader = true;
+            canReadVar.notify_one();
+        }
+
+        void stopWriter()
+        {
+            _stopWriter = true;
+            canWriteVar.notify_one();
+        }
+
+        bool getReadStop() { return _stopReader; }
+        bool getWriteStop() { return _stopWriter; }
+        void clearReadStop() { _stopReader = false; }
+        void clearWriteStop() { _stopWriter = false; }
+        void setMaxLatency(int maxLatency) { this->maxLatency = maxLatency; }
+
+    private:
+        T *_buffer;
+        int size = 0;
+        int readc;
+        int writec;
+        int readable;
+        int writable;
+        int maxLatency;
+        bool _stopReader;
+        bool _stopWriter;
+        std::mutex _readable_mtx;
+        std::mutex _writable_mtx;
+        std::condition_variable canReadVar;
+        std::condition_variable canWriteVar;
+    };
+};
+
+========== RATIONAL RESAMPLER ==========
+
+
+========== FILE: src-core/common/dsp/resamp/rational_resampler.h ==========
+#pragma once
+
+#include "common/dsp/block.h"
+#include <vector>
+#include "polyphase_bank.h"
+
+namespace dsp
+{
+    template <typename T>
+    class RationalResamplerBlock : public Block<T, T>
+    {
+    private:
+        // Settings
+        int d_interpolation;
+        int d_decimation;
+        int d_ctr;
+
+        int inc = 0, outc = 0;
+
+        // Buffer
+        T *buffer;
+
+        // Taps
+        PolyphaseBank pfb;
+
+        void work();
+
+    public:
+        RationalResamplerBlock(std::shared_ptr<dsp::stream<T>> input, unsigned interpolation, unsigned decimation, std::vector<float> custom_taps = std::vector<float>());
+        ~RationalResamplerBlock();
+
+        int process(T *input, int nsamples, T *output);
+
+        void set_ratio(unsigned interpolation, unsigned decimation, std::vector<float> custom_taps = std::vector<float>());
+    };
+}
+
+========== FILE: src-core/common/dsp/resamp/rational_resampler.cpp ==========
+#include "rational_resampler.h"
+#include <numeric>
+#include "common/dsp/filter/firdes.h"
+
+namespace dsp
+{
+    template <typename T>
+    RationalResamplerBlock<T>::RationalResamplerBlock(std::shared_ptr<dsp::stream<T>> input, unsigned interpolation, unsigned decimation, std::vector<float> custom_taps)
+        : Block<T, T>(input),
+          d_interpolation(interpolation),
+          d_decimation(decimation),
+          d_ctr(0)
+    {
+        // Buffer
+        buffer = create_volk_buffer<T>(2 * STREAM_BUFFER_SIZE);
+
+        set_ratio(interpolation, decimation, custom_taps);
+    }
+
+    template <typename T>
+    RationalResamplerBlock<T>::~RationalResamplerBlock()
+    {
+        volk_free(buffer);
+    }
+
+    template <typename T>
+    void RationalResamplerBlock<T>::set_ratio(unsigned interpolation, unsigned decimation, std::vector<float> custom_taps)
+    {
+        d_interpolation = interpolation;
+        d_decimation = decimation;
+
+        // Start by reducing the interp and decim by their GCD
+        int gcd = std::gcd(interpolation, decimation);
+        d_interpolation /= gcd;
+        d_decimation /= gcd;
+
+        // Generate taps
+        std::vector<float> rtaps = custom_taps.size() > 0 ? custom_taps : firdes::design_resampler_filter_float(d_interpolation, d_decimation, 0.4); // 0.4 = Fractional BW
+        pfb.init(rtaps, d_interpolation);
+    }
+
+    template <typename T>
+    int RationalResamplerBlock<T>::process(T *input, int nsamples, T *output)
+    {
+        memcpy(&buffer[pfb.ntaps - 1], input, nsamples * sizeof(T));
+
+        outc = 0;
+        while (inc < nsamples)
+        {
+            if constexpr (std::is_same_v<T, float>)
+                volk_32f_x2_dot_prod_32f(&output[outc++], &buffer[inc], pfb.taps[d_ctr], pfb.ntaps);
+            if constexpr (std::is_same_v<T, complex_t>)
+                volk_32fc_32f_dot_prod_32fc((lv_32fc_t *)&output[outc++], (lv_32fc_t *)&buffer[inc], pfb.taps[d_ctr], pfb.ntaps);
+            d_ctr += this->d_decimation;
+            inc += d_ctr / d_interpolation;
+            d_ctr = d_ctr % d_interpolation;
+        }
+
+        inc -= nsamples;
+
+        memmove(&buffer[0], &buffer[nsamples], pfb.ntaps * sizeof(T));
+
+        return outc;
+    }
+
+    template <typename T>
+    void RationalResamplerBlock<T>::work()
+    {
+        int nsamples = Block<T, T>::input_stream->read();
+        if (nsamples <= 0)
+        {
+            Block<T, T>::input_stream->flush();
+            return;
+        }
+
+        int outn = process(Block<T, T>::input_stream->readBuf, nsamples, Block<T, T>::output_stream->writeBuf);
+
+        Block<T, T>::input_stream->flush();
+        Block<T, T>::output_stream->swap(outn);
+    }
+
+    template class RationalResamplerBlock<complex_t>;
+    template class RationalResamplerBlock<float>;
+}
+
+
+========== FILE: src-core/common/dsp/resamp/polyphase_bank.h ==========
+#pragma once
+
+#include <cstring>
+#include <vector>
+
+namespace dsp
+{
+    class PolyphaseBank
+    {
+    private:
+        bool is_init = false;
+
+    public:
+        int nfilt;
+        int ntaps;
+        float **taps;
+
+    public:
+        PolyphaseBank();
+        void init(std::vector<float> rtaps, int nfilt);
+        ~PolyphaseBank();
+        PolyphaseBank(const PolyphaseBank &) = delete;
+    };
+} // namespace dsp
+
+
+========== FILE: src-core/common/dsp/resamp/polyphase_bank.cpp ==========
+#include "polyphase_bank.h"
+#include <volk/volk.h>
+
+namespace dsp
+{
+    void PolyphaseBank::init(std::vector<float> rtaps, int nfilt2)
+    {
+        if (is_init)
+        {
+            for (int i = 0; i < this->nfilt; i++)
+                volk_free(taps[i]);
+            volk_free(taps);
+        }
+
+        this->nfilt = nfilt2;
+        this->ntaps = (rtaps.size() + nfilt - 1) / nfilt;
+
+        // Get alignement parameters
+        int align = volk_get_alignment();
+
+        // If Ntaps is slightly over 1, add 1 tap
+        if (fmod(double(rtaps.size()) / double(nfilt), 1.0) > 0.0)
+            ntaps++;
+
+        // Init tap buffers
+        taps = (float **)volk_malloc(nfilt * sizeof(float *), align);
+        for (int i = 0; i < nfilt; i++)
+        {
+            this->taps[i] = (float *)volk_malloc(ntaps * sizeof(float), align);
+            for (int y = 0; y < ntaps; y++)
+                this->taps[i][y] = 0;
+        }
+
+        // Setup taps
+        for (int i = 0; i < nfilt * ntaps; i++)
+            taps[(nfilt - 1) - (i % nfilt)][i / nfilt] = (i < (int)rtaps.size()) ? rtaps[i] : 0;
+
+        is_init = true;
+    }
+
+    PolyphaseBank::PolyphaseBank() {}
+
+    PolyphaseBank::~PolyphaseBank()
+    {
+        if (is_init)
+        {
+            for (int i = 0; i < nfilt; i++)
+                volk_free(taps[i]);
+            volk_free(taps);
+        }
+    }
+} // namespace dsp
+
+
+========== STREAM READ WRITE AND STOP API SEARCH ==========
+
+
+========== STREAM API REFERENCES ==========
+src-core/common/dsp/block.h:32:        std::shared_ptr<dsp::stream<IN_T>> input_stream;
+src-core/common/dsp/block.h:33:        std::shared_ptr<dsp::stream<OUT_T>> output_stream;
+src-core/common/dsp/block.h:36:        Block(std::shared_ptr<dsp::stream<IN_T>> input) : input_stream(input)
+src-core/common/dsp/block.h:39:            output_stream = std::make_shared<dsp::stream<OUT_T>>();
+src-core/common/dsp/block.h:59:                if (input_stream)
+src-core/common/dsp/block.h:60:                    input_stream->stopReader();
+src-core/common/dsp/block.h:61:            if (output_stream)
+src-core/common/dsp/block.h:62:                output_stream->stopWriter();
+src-core/common/dsp/block.h:73:        std::shared_ptr<dsp::stream<IN_T>> input_stream;
+src-core/common/dsp/block.h:74:        std::shared_ptr<dsp::stream<OUT_T>> output_stream;
+src-core/common/dsp/block.h:77:        HierBlock(std::shared_ptr<dsp::stream<IN_T>> input) : input_stream(input)
+src-core/common/dsp/buffer.h:29:    class stream
+src-core/common/dsp/buffer.h:34:            writeBuf = create_volk_buffer<T>(stream_size);
+src-core/common/dsp/buffer.h:35:            readBuf = create_volk_buffer<T>(stream_size);
+src-core/common/dsp/buffer.h:39:                writeBuf[i] = 0;
+src-core/common/dsp/buffer.h:40:                readBuf[i] = 0;
+src-core/common/dsp/buffer.h:46:            volk_free(writeBuf);
+src-core/common/dsp/buffer.h:47:            volk_free(readBuf);
+src-core/common/dsp/buffer.h:66:                T *temp = writeBuf;
+src-core/common/dsp/buffer.h:67:                writeBuf = readBuf;
+src-core/common/dsp/buffer.h:68:                readBuf = temp;
+src-core/common/dsp/buffer.h:123:        void stopReader()
+src-core/common/dsp/buffer.h:136:        T *writeBuf;
+src-core/common/dsp/buffer.h:137:        T *readBuf;
+src-core/common/dsp/buffer.h:175:            _stopReader = false;
+src-core/common/dsp/buffer.h:279:            if (_stopReader)
+src-core/common/dsp/buffer.h:291:            if (_stopReader)
+src-core/common/dsp/buffer.h:390:        void stopReader()
+src-core/common/dsp/buffer.h:392:            _stopReader = true;
+src-core/common/dsp/buffer.h:402:        bool getReadStop() { return _stopReader; }
+src-core/common/dsp/buffer.h:404:        void clearReadStop() { _stopReader = false; }
+src-core/common/dsp/buffer.h:416:        bool _stopReader;
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:44:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:47:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:53:        memcpy(&buffer[pfb.ntaps - 1], Block<T, T>::input_stream->readBuf, (pfb.ntaps - 1) * sizeof(T));
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:55:        memcpy(&buffer[pfb.ntaps - 1 + bufs], Block<T, T>::input_stream->readBuf, nsamples * sizeof(T));
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:89:                    volk_32f_x2_dot_prod_32f(&zc_sample, &Block<T, T>::input_stream->readBuf[inc - (pfb.ntaps - 1) - offzc], pfb.taps[imuz], pfb.ntaps);
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:98:                    volk_32f_x2_dot_prod_32f(&sample, &Block<T, T>::input_stream->readBuf[inc - (pfb.ntaps - 1)], pfb.taps[imu], pfb.ntaps);
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:110:                Block<T, T>::output_stream->writeBuf[ouc++] = sample;
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:118:                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t *)&zc_sample, (lv_32fc_t *)&Block<T, T>::input_stream->readBuf[inc - (pfb.ntaps - 1) - offzc], pfb.taps[imuz], pfb.ntaps);
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:127:                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t *)&sample, (lv_32fc_t *)&Block<T, T>::input_stream->readBuf[inc - (pfb.ntaps - 1)], pfb.taps[imu], pfb.ntaps);
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:140:                Block<T, T>::output_stream->writeBuf[ouc++] = sample;
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:162:        memcpy(buffer, &Block<T, T>::input_stream->readBuf[nsamples - pfb.ntaps + 1], (pfb.ntaps - 1) * sizeof(T));
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:167:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.cpp:168:        Block<T, T>::output_stream->swap(ouc);
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:47:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:50:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:56:        memcpy(&buffer[pfb.ntaps - 1], Block<T, T>::input_stream->readBuf, (pfb.ntaps - 1) * sizeof(T));
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:58:        memcpy(&buffer[pfb.ntaps - 1], Block<T, T>::input_stream->readBuf, nsamples * sizeof(T));
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:86:                    volk_32f_x2_dot_prod_32f(&sample, &Block<T, T>::input_stream->readBuf[inc - (pfb.ntaps - 1)], pfb.taps[imu], pfb.ntaps);
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:97:                Block<T, T>::output_stream->writeBuf[ouc++] = sample;
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:105:                    volk_32fc_32f_dot_prod_32fc((lv_32fc_t *)&p_0T, (lv_32fc_t *)&Block<T, T>::input_stream->readBuf[inc - (pfb.ntaps - 1)], pfb.taps[imu], pfb.ntaps);
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:118:                Block<T, T>::output_stream->writeBuf[ouc++] = p_0T;
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:140:        memcpy(buffer, &Block<T, T>::input_stream->readBuf[nsamples - pfb.ntaps + 1], (pfb.ntaps - 1) * sizeof(T));
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:145:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/clock_recovery/clock_recovery_mm.cpp:146:        Block<T, T>::output_stream->swap(ouc);
+src-core/common/dsp/demod/delay_one_imag.cpp:12:        int nsamples = input_stream->read();
+src-core/common/dsp/demod/delay_one_imag.cpp:15:            input_stream->flush();
+src-core/common/dsp/demod/delay_one_imag.cpp:22:            float imag = i == 0 ? lastSamp : input_stream->readBuf[i - 1].imag;
+src-core/common/dsp/demod/delay_one_imag.cpp:23:            float real = input_stream->readBuf[i].real;
+src-core/common/dsp/demod/delay_one_imag.cpp:24:            output_stream->writeBuf[i] = complex_t(real, imag);
+src-core/common/dsp/demod/delay_one_imag.cpp:27:        lastSamp = input_stream->readBuf[nsamples - 1].imag;
+src-core/common/dsp/demod/delay_one_imag.cpp:29:        input_stream->flush();
+src-core/common/dsp/demod/delay_one_imag.cpp:30:        output_stream->swap(nsamples);
+src-core/common/dsp/demod/pm_to_bpsk.cpp:17:        int nsamples = input_stream->read();
+src-core/common/dsp/demod/pm_to_bpsk.cpp:20:            input_stream->flush();
+src-core/common/dsp/demod/pm_to_bpsk.cpp:25:            input_stream->readBuf[i] = complex_t(0, input_stream->readBuf[i].imag);
+src-core/common/dsp/demod/pm_to_bpsk.cpp:28:        volk_32fc_s32fc_x2_rotator2_32fc((lv_32fc_t *)output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, (lv_32fc_t *)&phase_delta, (lv_32fc_t *)&phase, nsamples);
+src-core/common/dsp/demod/pm_to_bpsk.cpp:30:        volk_32fc_s32fc_x2_rotator_32fc((lv_32fc_t *)output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, phase_delta, (lv_32fc_t *)&phase, nsamples);
+src-core/common/dsp/demod/pm_to_bpsk.cpp:33:        input_stream->flush();
+src-core/common/dsp/demod/pm_to_bpsk.cpp:34:        output_stream->swap(nsamples);
+src-core/common/dsp/demod/quadrature_demod.cpp:56:        int nsamples = input_stream->read();
+src-core/common/dsp/demod/quadrature_demod.cpp:59:            input_stream->flush();
+src-core/common/dsp/demod/quadrature_demod.cpp:63:        process(input_stream->readBuf, nsamples, output_stream->writeBuf);
+src-core/common/dsp/demod/quadrature_demod.cpp:65:        input_stream->flush();
+src-core/common/dsp/demod/quadrature_demod.cpp:66:        output_stream->swap(nsamples);
+src-core/common/dsp/fft/fft_pan.cpp:72:        int nsamples = input_stream->read();
+src-core/common/dsp/fft/fft_pan.cpp:75:            input_stream->flush();
+src-core/common/dsp/fft/fft_pan.cpp:83:            memcpy(&fft_reshape_buffer[in_reshape_buffer], input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/fft/fft_pan.cpp:86:        input_stream->flush();
+src-core/common/dsp/fft/fft_pan.cpp:109:                    output_stream->writeBuf[i] = output_stream->writeBuf[i] * (1.0f - avg_rate) + fft_output_buffer[i] * avg_rate;
+src-core/common/dsp/fft/fft_pan.cpp:111:                on_fft(output_stream->writeBuf);
+src-core/common/dsp/filter/decimating_fir.cpp:57:                // volk_32f_x2_dot_prod_32f(&output_stream->writeBuf[i], &buffer[i + 1], taps, ntaps);
+src-core/common/dsp/filter/decimating_fir.cpp:70:                // volk_32fc_32f_dot_prod_32fc(&output_stream->writeBuf[i], &buffer[i + 1], taps, ntaps);
+src-core/common/dsp/filter/decimating_fir.cpp:88:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/filter/decimating_fir.cpp:91:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/decimating_fir.cpp:95:        int outn = process(Block<T, T>::input_stream->readBuf, nsamples, Block<T, T>::output_stream->writeBuf);
+src-core/common/dsp/filter/decimating_fir.cpp:97:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/decimating_fir.cpp:98:        Block<T, T>::output_stream->swap(outn);
+src-core/common/dsp/filter/deemphasis.cpp:28:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/filter/deemphasis.cpp:31:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/deemphasis.cpp:35:        memcpy(&buffer[in_buffer], Block<T, T>::input_stream->readBuf, nsamples * sizeof(T));
+src-core/common/dsp/filter/deemphasis.cpp:41:            T input = Block<T, T>::input_stream->readBuf[i];
+src-core/common/dsp/filter/deemphasis.cpp:42:            T output = Block<T, T>::output_stream->readBuf[i];
+src-core/common/dsp/filter/deemphasis.cpp:78:            Block<T, T>::output_stream->writeBuf[i] = output;
+src-core/common/dsp/filter/deemphasis.cpp:81:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/deemphasis.cpp:82:        //Block<T, T>::output_stream->swap(nsamples);
+src-core/common/dsp/filter/deemphasis.cpp:83:        Block<T, T>::output_stream->swap(consumed);
+src-core/common/dsp/filter/fft_filter.cpp:57:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/filter/fft_filter.cpp:60:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/fft_filter.cpp:64:        memcpy(&buffer[in_buffer], Block<T, T>::input_stream->readBuf, nsamples * sizeof(T));
+src-core/common/dsp/filter/fft_filter.cpp:89:                memcpy(&Block<T, T>::output_stream->writeBuf[i], (complex_t *)fft_inv_out, d_nsamples * sizeof(complex_t));
+src-core/common/dsp/filter/fft_filter.cpp:94:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/fft_filter.cpp:95:        Block<T, T>::output_stream->swap(consumed);
+src-core/common/dsp/filter/fir.cpp:49:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/filter/fir.cpp:52:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/fir.cpp:56:        memcpy(&buffer[ntaps], Block<T, T>::input_stream->readBuf, nsamples * sizeof(T));
+src-core/common/dsp/filter/fir.cpp:57:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/filter/fir.cpp:64:                // volk_32f_x2_dot_prod_32f(&output_stream->writeBuf[i], &buffer[i + 1], taps, ntaps);
+src-core/common/dsp/filter/fir.cpp:69:                volk_32f_x2_dot_prod_32f_a(&Block<T, T>::output_stream->writeBuf[i], ar, taps[al], ntaps + al);
+src-core/common/dsp/filter/fir.cpp:77:                // volk_32fc_32f_dot_prod_32fc(&output_stream->writeBuf[i], &buffer[i + 1], taps, ntaps);
+src-core/common/dsp/filter/fir.cpp:82:                volk_32fc_32f_dot_prod_32fc_a((lv_32fc_t *)&Block<T, T>::output_stream->writeBuf[i], (lv_32fc_t *)ar, taps[al], ntaps + al);
+src-core/common/dsp/filter/fir.cpp:86:        Block<T, T>::output_stream->swap(nsamples);
+src-core/common/dsp/hier/gfsk_mod.cpp:8:        fir_shaping = std::make_shared<dsp::RationalResamplerBlock<float>>(input_stream, 2, 1, dsp::firdes::convolve(dsp::firdes::gaussian(1, 2, alpha, taps), {1, 1}));
+src-core/common/dsp/hier/gfsk_mod.cpp:9:        vco_gen = std::make_shared<dsp::VCOBlock>(fir_shaping->output_stream, sensitivity, 1.0);
+src-core/common/dsp/hier/gfsk_mod.cpp:10:        output_stream = vco_gen->output_stream;
+src-core/common/dsp/io/file_sink.cpp:119:        int nsamples = input_stream->read();
+src-core/common/dsp/io/file_sink.cpp:122:            input_stream->flush();
+src-core/common/dsp/io/file_sink.cpp:131:                output_file.write((char *)input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/io/file_sink.cpp:136:                volk_32f_s32f_convert_32i(buffer_s32, (float*)input_stream->readBuf, 2147483647, nsamples * 2);
+src-core/common/dsp/io/file_sink.cpp:142:                volk_32f_s32f_convert_16i(buffer_s16, (float *)input_stream->readBuf, 32767, nsamples * 2);
+src-core/common/dsp/io/file_sink.cpp:148:                volk_32f_s32f_convert_8i(buffer_s8, (float *)input_stream->readBuf, 127, nsamples * 2);
+src-core/common/dsp/io/file_sink.cpp:155:                current_size_out += ziqWriter->write(input_stream->readBuf, nsamples);
+src-core/common/dsp/io/file_sink.cpp:162:                int sz = ziq2::ziq2_write_iq_pkt((uint8_t *)buffer_s8, input_stream->readBuf, mag_buffer, nsamples, d_sample_format.ziq_depth);
+src-core/common/dsp/io/file_sink.cpp:168:            input_stream->flush();
+src-core/common/dsp/io/file_source.cpp:29:            int read = baseband_reader.read_samples(output_stream->writeBuf, d_buffer_size);
+src-core/common/dsp/io/file_source.cpp:33:                    output_stream->writeBuf[i] = complex_t(output_stream->writeBuf[i].imag, output_stream->writeBuf[i].real);
+src-core/common/dsp/io/file_source.cpp:35:            output_stream->swap(read);
+src-core/common/dsp/io/net_sink.cpp:41:        int nsamples = input_stream->read();
+src-core/common/dsp/io/net_sink.cpp:44:            input_stream->flush();
+src-core/common/dsp/io/net_sink.cpp:54:                udp_sender->send((uint8_t *)&input_stream->readBuf[nsent], to_send * sizeof(complex_t));
+src-core/common/dsp/io/net_sink.cpp:60:            nng_send(n_sock, &input_stream->readBuf[0], nsamples * sizeof(complex_t), NNG_FLAG_NONBLOCK);
+src-core/common/dsp/io/net_sink.cpp:63:        input_stream->flush();
+src-core/common/dsp/path/splitter.cpp:31:            return outputs[id].output_stream;
+src-core/common/dsp/path/splitter.cpp:49:            outputs[id].output_stream = std::make_shared<dsp::stream<complex_t>>();
+src-core/common/dsp/path/splitter.cpp:77:            return vfo_outputs[id].output_stream;
+src-core/common/dsp/path/splitter.cpp:95:            vfo_outputs[id].output_stream = std::make_shared<dsp::stream<complex_t>>();
+src-core/common/dsp/path/splitter.cpp:111:        int nsamples = input_stream->read();
+src-core/common/dsp/path/splitter.cpp:114:            input_stream->flush();
+src-core/common/dsp/path/splitter.cpp:122:            memcpy(output_stream->writeBuf, input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/path/splitter.cpp:127:                memcpy(o.second.output_stream->writeBuf, input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/path/splitter.cpp:135:                    memcpy(o.second.output_stream->writeBuf, input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/path/splitter.cpp:138:                    volk_32fc_s32fc_x2_rotator2_32fc((lv_32fc_t *)o.second.output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, (lv_32fc_t *)&o.second.phase_delta, (lv_32fc_t *)&o.second.phase, nsamples);
+src-core/common/dsp/path/splitter.cpp:140:                    volk_32fc_s32fc_x2_rotator_32fc((lv_32fc_t *)o.second.output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, o.second.phase_delta, (lv_32fc_t *)&o.second.phase, nsamples);
+src-core/common/dsp/path/splitter.cpp:145:        input_stream->flush();
+src-core/common/dsp/path/splitter.cpp:148:            output_stream->swap(nsamples);
+src-core/common/dsp/path/splitter.cpp:152:                o.second.output_stream->swap(nsamples);
+src-core/common/dsp/path/splitter.cpp:156:                o.second.output_stream->swap(nsamples);
+src-core/common/dsp/path/splitter.h:20:            std::shared_ptr<dsp::stream<complex_t>> output_stream;
+src-core/common/dsp/path/splitter.h:29:            std::shared_ptr<dsp::stream<complex_t>> output_stream;
+src-core/common/dsp/path/splitter.h:63:            if (d_got_input && input_stream.use_count())
+src-core/common/dsp/path/splitter.h:64:                input_stream->stopReader();
+src-core/common/dsp/path/splitter.h:65:            // output_stream->stopWriter();
+src-core/common/dsp/path/splitter_vfo.cpp:36:            return outputs[id].freq_shiter->output_stream;
+src-core/common/dsp/path/splitter_vfo.cpp:54:            outputs[id].output_stream = std::make_shared<dsp::stream<complex_t>>();
+src-core/common/dsp/path/splitter_vfo.cpp:69:        int nsamples = input_stream->read();
+src-core/common/dsp/path/splitter_vfo.cpp:72:            input_stream->flush();
+src-core/common/dsp/path/splitter_vfo.cpp:79:            memcpy(output_stream->writeBuf, input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/path/splitter_vfo.cpp:83:                memcpy(o.second.output_stream->writeBuf, input_stream->readBuf, nsamples * sizeof(complex_t));
+src-core/common/dsp/path/splitter_vfo.cpp:85:        input_stream->flush();
+src-core/common/dsp/path/splitter_vfo.cpp:88:            output_stream->swap(nsamples);
+src-core/common/dsp/path/splitter_vfo.cpp:92:                o.second.output_stream->swap(nsamples);
+src-core/common/dsp/path/splitter_vfo.h:18:            std::shared_ptr<dsp::stream<complex_t>> output_stream;
+src-core/common/dsp/path/splitter_vfo.h:42:            if (d_got_input && input_stream.use_count())
+src-core/common/dsp/path/splitter_vfo.h:43:                input_stream->stopReader();
+src-core/common/dsp/path/splitter_vfo.h:44:            // output_stream->stopWriter();
+src-core/common/dsp/pll/bpsk_carrier_pll.cpp:27:        int nsamples = input_stream->read();
+src-core/common/dsp/pll/bpsk_carrier_pll.cpp:30:            input_stream->flush();
+src-core/common/dsp/pll/bpsk_carrier_pll.cpp:39:            output_stream->writeBuf[i] = (input_stream->readBuf[i] * complex_t(re, -im)).imag;
+src-core/common/dsp/pll/bpsk_carrier_pll.cpp:42:            float error = fast_atan2f(input_stream->readBuf[i].imag, input_stream->readBuf[i].real) - phase;
+src-core/common/dsp/pll/bpsk_carrier_pll.cpp:59:        input_stream->flush();
+src-core/common/dsp/pll/bpsk_carrier_pll.cpp:60:        output_stream->swap(nsamples);
+src-core/common/dsp/pll/costas_loop.cpp:16:        int nsamples = input_stream->read();
+src-core/common/dsp/pll/costas_loop.cpp:19:            input_stream->flush();
+src-core/common/dsp/pll/costas_loop.cpp:26:            tmp_val = input_stream->readBuf[i] * complex_t(cosf(-phase), sinf(-phase));
+src-core/common/dsp/pll/costas_loop.cpp:27:            output_stream->writeBuf[i] = tmp_val;
+src-core/common/dsp/pll/costas_loop.cpp:67:        input_stream->flush();
+src-core/common/dsp/pll/costas_loop.cpp:68:        output_stream->swap(nsamples);
+src-core/common/dsp/pll/pll_carrier_tracking.cpp:26:        int nsamples = input_stream->read();
+src-core/common/dsp/pll/pll_carrier_tracking.cpp:29:            input_stream->flush();
+src-core/common/dsp/pll/pll_carrier_tracking.cpp:42:            output_stream->writeBuf[i] = input_stream->readBuf[i] * vcoValue;
+src-core/common/dsp/pll/pll_carrier_tracking.cpp:45:            phase_error = fast_atan2f(input_stream->readBuf[i].imag, input_stream->readBuf[i].real) - d_phase;
+src-core/common/dsp/pll/pll_carrier_tracking.cpp:66:        input_stream->flush();
+src-core/common/dsp/pll/pll_carrier_tracking.cpp:67:        output_stream->swap(nsamples);
+src-core/common/dsp/resamp/power_decim.cpp:60:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/resamp/power_decim.cpp:63:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/resamp/power_decim.cpp:67:        int outn = process(Block<T, T>::input_stream->readBuf, nsamples, Block<T, T>::output_stream->writeBuf);
+src-core/common/dsp/resamp/power_decim.cpp:69:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/resamp/power_decim.cpp:70:        Block<T, T>::output_stream->swap(outn);
+src-core/common/dsp/resamp/rational_resampler.cpp:69:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/resamp/rational_resampler.cpp:72:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/resamp/rational_resampler.cpp:76:        int outn = process(Block<T, T>::input_stream->readBuf, nsamples, Block<T, T>::output_stream->writeBuf);
+src-core/common/dsp/resamp/rational_resampler.cpp:78:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/resamp/rational_resampler.cpp:79:        Block<T, T>::output_stream->swap(outn);
+src-core/common/dsp/resamp/smart_resampler.cpp:95:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/resamp/smart_resampler.cpp:98:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/resamp/smart_resampler.cpp:102:        int outn = process(Block<T, T>::input_stream->readBuf, nsamples, Block<T, T>::output_stream->writeBuf);
+src-core/common/dsp/resamp/smart_resampler.cpp:104:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/resamp/smart_resampler.cpp:105:        Block<T, T>::output_stream->swap(outn);
+src-core/common/dsp/utils/agc.cpp:18:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/utils/agc.cpp:21:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/utils/agc.cpp:27:            T output = Block<T, T>::input_stream->readBuf[i] * gain;
+src-core/common/dsp/utils/agc.cpp:38:            Block<T, T>::output_stream->writeBuf[i] = output;
+src-core/common/dsp/utils/agc.cpp:41:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/utils/agc.cpp:42:        Block<T, T>::output_stream->swap(nsamples);
+src-core/common/dsp/utils/agc2.cpp:16:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/utils/agc2.cpp:19:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/utils/agc2.cpp:25:            T sample = Block<T, T>::input_stream->readBuf[i];
+src-core/common/dsp/utils/agc2.cpp:42:            Block<T, T>::output_stream->writeBuf[i] = sample;
+src-core/common/dsp/utils/agc2.cpp:45:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/utils/agc2.cpp:46:        Block<T, T>::output_stream->swap(nsamples);
+src-core/common/dsp/utils/complex_to_mag.cpp:16:        int nsamples = input_stream->read();
+src-core/common/dsp/utils/complex_to_mag.cpp:19:            input_stream->flush();
+src-core/common/dsp/utils/complex_to_mag.cpp:23:        volk_32fc_magnitude_32f_u(output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, nsamples);
+src-core/common/dsp/utils/complex_to_mag.cpp:25:        input_stream->flush();
+src-core/common/dsp/utils/complex_to_mag.cpp:26:        output_stream->swap(nsamples);
+src-core/common/dsp/utils/correct_iq.cpp:20:        int nsamples = Block<T, T>::input_stream->read();
+src-core/common/dsp/utils/correct_iq.cpp:23:            Block<T, T>::input_stream->flush();
+src-core/common/dsp/utils/correct_iq.cpp:29:            acc = acc * beta + Block<T, T>::input_stream->readBuf[i] * alpha;                      // Compute a moving average, of both I & Q
+src-core/common/dsp/utils/correct_iq.cpp:30:            Block<T, T>::output_stream->writeBuf[i] = Block<T, T>::input_stream->readBuf[i] - acc; // Substract it to the input buffer, moving back to 0
+src-core/common/dsp/utils/correct_iq.cpp:33:        Block<T, T>::input_stream->flush();
+src-core/common/dsp/utils/correct_iq.cpp:34:        Block<T, T>::output_stream->swap(nsamples);
+src-core/common/dsp/utils/doppler_correct.cpp:42:        int nsamples = input_stream->read();
+src-core/common/dsp/utils/doppler_correct.cpp:45:            input_stream->flush();
+src-core/common/dsp/utils/doppler_correct.cpp:52:            output_stream->writeBuf[i] = input_stream->readBuf[i] * complex_t(cosf(-curr_phase), sinf(-curr_phase));
+src-core/common/dsp/utils/doppler_correct.cpp:67:        input_stream->flush();
+src-core/common/dsp/utils/doppler_correct.cpp:68:        output_stream->swap(nsamples);
+src-core/common/dsp/utils/freq_shift.cpp:18:        int nsamples = input_stream->read();
+src-core/common/dsp/utils/freq_shift.cpp:21:            input_stream->flush();
+src-core/common/dsp/utils/freq_shift.cpp:27:        volk_32fc_s32fc_x2_rotator2_32fc((lv_32fc_t *)output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, (lv_32fc_t *)&phase_delta, (lv_32fc_t *)&phase, nsamples);
+src-core/common/dsp/utils/freq_shift.cpp:29:        volk_32fc_s32fc_x2_rotator_32fc((lv_32fc_t *)output_stream->writeBuf, (lv_32fc_t *)input_stream->readBuf, phase_delta, (lv_32fc_t *)&phase, nsamples);
+src-core/common/dsp/utils/freq_shift.cpp:33:        input_stream->flush();
+src-core/common/dsp/utils/freq_shift.cpp:34:        output_stream->swap(nsamples);
+src-core/common/dsp/utils/real_to_complex.cpp:16:        int nsamples = input_stream->read();
+src-core/common/dsp/utils/real_to_complex.cpp:19:            input_stream->flush();
+src-core/common/dsp/utils/real_to_complex.cpp:24:            output_stream->writeBuf[i] = input_stream->readBuf[i];
+src-core/common/dsp/utils/real_to_complex.cpp:26:        input_stream->flush();
+src-core/common/dsp/utils/real_to_complex.cpp:27:        output_stream->swap(nsamples);
+src-core/common/dsp/utils/vco.cpp:17:        int nsamples = input_stream->read();
+src-core/common/dsp/utils/vco.cpp:20:            input_stream->flush();
+src-core/common/dsp/utils/vco.cpp:26:            output_stream->writeBuf[i].real = cosf(d_phase) * d_amp;
+src-core/common/dsp/utils/vco.cpp:27:            output_stream->writeBuf[i].imag = sinf(d_phase) * d_amp;
+src-core/common/dsp/utils/vco.cpp:28:            d_phase += input_stream->readBuf[i] * d_k;
+src-core/common/dsp/utils/vco.cpp:37:        input_stream->flush();
+src-core/common/dsp/utils/vco.cpp:38:        output_stream->swap(nsamples);
+src-core/modules/demod/module_demod_base.cpp:101:            dc_blocker = std::make_shared<dsp::CorrectIQBlock<complex_t>>(input_data_type == DATA_DSP_STREAM ? input_stream : file_source->output_stream);
+src-core/modules/demod/module_demod_base.cpp:104:        std::shared_ptr<dsp::stream<complex_t>> input_data = d_dc_block ? dc_blocker->output_stream : (input_data_type == DATA_DSP_STREAM ? input_stream : file_source->output_stream);
+src-core/modules/demod/module_demod_base.cpp:145:            doppler_shift = std::make_shared<dsp::DopplerCorrectBlock>(d_frequency_shift != 0 ? freq_shift->output_stream : input_data,
+src-core/modules/demod/module_demod_base.cpp:161:        std::shared_ptr<dsp::stream<complex_t>> input_data_final = d_doppler_enable ? doppler_shift->output_stream
+src-core/modules/demod/module_demod_base.cpp:162:                                                                                    : (d_frequency_shift != 0 ? freq_shift->output_stream : input_data);
+
+
+========== FFT API REFERENCES ==========
+
+
+========== FFTW AND FFT API ==========
+src-core/common/dsp/fft/fft_pan.cpp:42:        fftw_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+src-core/common/dsp/fft/fft_pan.cpp:43:        fftw_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+src-core/common/dsp/fft/fft_pan.cpp:44:        fftw_plan = fftwf_plan_dft_1d(fft_size, fftw_in, fftw_out, FFTW_FORWARD, FFTW_ESTIMATE);
+src-core/common/dsp/fft/fft_pan.cpp:100:                fftwf_execute(fftw_plan);
+src-core/common/dsp/filter/fft_filter.cpp:21:        fft_fwd_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * d_fftsize);
+src-core/common/dsp/filter/fft_filter.cpp:22:        fft_fwd_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * d_fftsize);
+src-core/common/dsp/filter/fft_filter.cpp:23:        fft_inv_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * d_fftsize);
+src-core/common/dsp/filter/fft_filter.cpp:24:        fft_inv_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * d_fftsize);
+src-core/common/dsp/filter/fft_filter.cpp:26:        fft_fwd = fftwf_plan_dft_1d(d_fftsize, fft_fwd_in, fft_fwd_out, FFTW_FORWARD, FFTW_ESTIMATE);
+src-core/common/dsp/filter/fft_filter.cpp:27:        fft_inv = fftwf_plan_dft_1d(d_fftsize, fft_inv_in, fft_inv_out, FFTW_BACKWARD, FFTW_ESTIMATE);
+src-core/common/dsp/filter/fft_filter.cpp:38:        fftwf_execute(fft_fwd);
+src-core/common/dsp/filter/fft_filter.cpp:82:                fftwf_execute(fft_fwd);
+src-core/common/dsp/filter/fft_filter.cpp:84:                fftwf_execute(fft_inv);
+plugins/lora_support/LoRa/module_lora_demod.cpp:146:            fftwf_plan plan = fftwf_plan_dft_1d(
+plugins/lora_support/LoRa/module_lora_demod.cpp:189:                    fftwf_execute(plan);
+plugins/analog_support/noaa_apt/noise_reduction.cpp:11:            forwFFTIn = (complex_t *)fftwf_malloc(_bins * sizeof(complex_t));
+plugins/analog_support/noaa_apt/noise_reduction.cpp:12:            forwFFTOut = (complex_t *)fftwf_malloc(_bins * sizeof(complex_t));
+plugins/analog_support/noaa_apt/noise_reduction.cpp:13:            backFFTIn = (complex_t *)fftwf_malloc(_bins * sizeof(complex_t));
+plugins/analog_support/noaa_apt/noise_reduction.cpp:14:            backFFTOut = (complex_t *)fftwf_malloc(_bins * sizeof(complex_t));
+plugins/analog_support/noaa_apt/noise_reduction.cpp:33:            forwardPlan = fftwf_plan_dft_1d(_bins, (fftwf_complex *)forwFFTIn, (fftwf_complex *)forwFFTOut, FFTW_FORWARD, FFTW_ESTIMATE);
+plugins/analog_support/noaa_apt/noise_reduction.cpp:34:            backwardPlan = fftwf_plan_dft_1d(_bins, (fftwf_complex *)backFFTIn, (fftwf_complex *)backFFTOut, FFTW_BACKWARD, FFTW_ESTIMATE);
+plugins/analog_support/noaa_apt/noise_reduction.cpp:81:            fftwf_execute(forwardPlan);
+plugins/analog_support/noaa_apt/noise_reduction.cpp:92:            fftwf_execute(backwardPlan);
+plugins/others_support/cryosat/instruments/siral/module_cryosat_siral.cpp:55:            fftwf_plan p = fftwf_plan_dft_1d(243, (fftwf_complex *)fft_input, (fftwf_complex *)fft_output, FFTW_FORWARD, FFTW_MEASURE);
+plugins/others_support/cryosat/instruments/siral/module_cryosat_siral.cpp:91:                                fftwf_execute(p);
+plugins/others_support/scisat1/instruments/fts/fts_reader.cpp:16:            fftw_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * num_samples);
+plugins/others_support/scisat1/instruments/fts/fts_reader.cpp:17:            fftw_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * num_samples);
+plugins/others_support/scisat1/instruments/fts/fts_reader.cpp:18:            fftw_plan = fftwf_plan_dft_1d(num_samples, fftw_in, fftw_out, FFTW_FORWARD, FFTW_ESTIMATE);
+plugins/others_support/scisat1/instruments/fts/fts_reader.cpp:40:                fftwf_execute(fftw_plan);                                                                         // Run FFT
+plugins/sdr_sources/sddc_sdr_support/lib/Core/conv_r2iq.cpp:125:		//   just before the forward fft "fftwf_execute_dft_r2c" is called
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:147:		pfilterht = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*halfFft);     // halfFft
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:148:		filterHw = (fftwf_complex**)fftwf_malloc(sizeof(fftwf_complex*)*NDECIDX);
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:151:			filterHw[d] = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*halfFft);     // halfFft
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:154:		filterplan_t2f_c2c = fftwf_plan_dft_1d(halfFft, pfilterht, filterHw[0], FFTW_FORWARD, FFTW_MEASURE);
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:179:			fftwf_execute_dft(filterplan_t2f_c2c, pfilterht, filterHw[d]);
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:189:			th->ADCinTime = (float*)fftwf_malloc(sizeof(float) * (halfFft + transferSize / 2));                 // 2048
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:191:			th->ADCinFreq = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*(halfFft + 1)); // 1024+1
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:192:			th->inFreqTmp = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*(halfFft));    // 1024
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq.cpp:198:			plans_f2t_c2c[d] = fftwf_plan_dft_1d(mfftdim[d], threadArgs[0]->inFreqTmp, threadArgs[0]->inFreqTmp, FFTW_BACKWARD, FFTW_MEASURE);
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq_impl.hpp:35:		//   just before the forward fft "fftwf_execute_dft_r2c" is called
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq_impl.hpp:97:				fftwf_execute_dft_r2c(plan_t2f_r2c, th->ADCinTime + (3 * halfFft / 2) * k, th->ADCinFreq);
+plugins/sdr_sources/sddc_sdr_support/lib/Core/fft_mt_r2iq_impl.hpp:116:				fftwf_execute_dft(*plan_f2t_c2c, th->inFreqTmp, th->inFreqTmp);     //  c2c decimation
+
+
+========== RESAMPLER USAGE REFERENCES ==========
+
+
+========== RESAMPLER USAGE ==========
+src-core/common/dsp/clock_recovery/clock_recovery_gardner.h:35:        PolyphaseBank pfb;
+src-core/common/dsp/clock_recovery/clock_recovery_mm.h:37:        PolyphaseBank pfb;
+src-core/common/dsp/hier/gfsk_mod.cpp:8:        fir_shaping = std::make_shared<dsp::RationalResamplerBlock<float>>(input_stream, 2, 1, dsp::firdes::convolve(dsp::firdes::gaussian(1, 2, alpha, taps), {1, 1}));
+src-core/common/dsp/hier/gfsk_mod.h:21:        std::shared_ptr<dsp::RationalResamplerBlock<float>> fir_shaping;
+src-core/common/dsp/resamp/polyphase_bank.cpp:6:    void PolyphaseBank::init(std::vector<float> rtaps, int nfilt2)
+src-core/common/dsp/resamp/polyphase_bank.cpp:41:    PolyphaseBank::PolyphaseBank() {}
+src-core/common/dsp/resamp/polyphase_bank.cpp:43:    PolyphaseBank::~PolyphaseBank()
+src-core/common/dsp/resamp/polyphase_bank.h:8:    class PolyphaseBank
+src-core/common/dsp/resamp/polyphase_bank.h:19:        PolyphaseBank();
+src-core/common/dsp/resamp/polyphase_bank.h:21:        ~PolyphaseBank();
+src-core/common/dsp/resamp/polyphase_bank.h:22:        PolyphaseBank(const PolyphaseBank &) = delete;
+src-core/common/dsp/resamp/rational_resampler.cpp:8:    RationalResamplerBlock<T>::RationalResamplerBlock(std::shared_ptr<dsp::stream<T>> input, unsigned interpolation, unsigned decimation, std::vector<float> custom_taps)
+src-core/common/dsp/resamp/rational_resampler.cpp:17:        set_ratio(interpolation, decimation, custom_taps);
+src-core/common/dsp/resamp/rational_resampler.cpp:21:    RationalResamplerBlock<T>::~RationalResamplerBlock()
+src-core/common/dsp/resamp/rational_resampler.cpp:27:    void RationalResamplerBlock<T>::set_ratio(unsigned interpolation, unsigned decimation, std::vector<float> custom_taps)
+src-core/common/dsp/resamp/rational_resampler.cpp:43:    int RationalResamplerBlock<T>::process(T *input, int nsamples, T *output)
+src-core/common/dsp/resamp/rational_resampler.cpp:67:    void RationalResamplerBlock<T>::work()
+src-core/common/dsp/resamp/rational_resampler.cpp:82:    template class RationalResamplerBlock<complex_t>;
+src-core/common/dsp/resamp/rational_resampler.cpp:83:    template class RationalResamplerBlock<float>;
+src-core/common/dsp/resamp/rational_resampler.h:10:    class RationalResamplerBlock : public Block<T, T>
+src-core/common/dsp/resamp/rational_resampler.h:24:        PolyphaseBank pfb;
+src-core/common/dsp/resamp/rational_resampler.h:29:        RationalResamplerBlock(std::shared_ptr<dsp::stream<T>> input, unsigned interpolation, unsigned decimation, std::vector<float> custom_taps = std::vector<float>());
+src-core/common/dsp/resamp/rational_resampler.h:30:        ~RationalResamplerBlock();
+src-core/common/dsp/resamp/rational_resampler.h:34:        void set_ratio(unsigned interpolation, unsigned decimation, std::vector<float> custom_taps = std::vector<float>());
+src-core/common/dsp/resamp/smart_resampler.cpp:42:                rresamp = std::make_unique<RationalResamplerBlock<T>>(nullptr, fout, rsamp_in);
+src-core/common/dsp/resamp/smart_resampler.cpp:52:            rresamp = std::make_unique<RationalResamplerBlock<T>>(nullptr, interpolation, decimation);
+src-core/common/dsp/resamp/smart_resampler.h:21:        std::unique_ptr<RationalResamplerBlock<T>> rresamp;
+plugins/lora_support/LoRa/module_lora_demod.h:25:            std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> active_rsp;
+plugins/lora_support/LoRa/module_lora_demod.cpp:79:            std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> rsp;
+plugins/lora_support/LoRa/module_lora_demod.cpp:119:            auto rsp = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(
+plugins/analog_support/generic/analog_am_demod.cpp:20:		res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, samplerate, final_samplerate);
+plugins/analog_support/generic/analog_am_demod.h:20:			std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> res;
+plugins/analog_support/generic/analog_nfm_demod.cpp:20:		res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, samplerate, final_samplerate);
+plugins/analog_support/generic/analog_nfm_demod.h:19:			std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> res;
+plugins/analog_support/generic/analog_ssb_demod.cpp:16:		res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, samplerate, final_samplerate);
+plugins/analog_support/generic/analog_ssb_demod.h:17:			std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> res;
+plugins/analog_support/generic/module_generic_analog_demod.cpp:55:        //    res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, d_symbolrate, final_samplerate);
+plugins/analog_support/generic/module_generic_analog_demod.cpp:143:        dsp::RationalResamplerBlock<complex_t> input_resamp(nullptr, d_symbolrate, final_samplerate);
+plugins/analog_support/generic/module_generic_analog_demod.cpp:167:                    input_resamp.set_ratio(d_symbolrate, final_samplerate);
+plugins/analog_support/generic/module_generic_analog_demod.h:17:        std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> res;
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:82:        rsp = std::make_shared<dsp::RationalResamplerBlock<float>>(
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.h:23:        std::shared_ptr<dsp::RationalResamplerBlock<float>> rsp;
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:206:        rsp = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(frs->output_stream, filter_srate, d_audio_samplerate);
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.h:60:        std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> rsp;
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:36:        res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, d_symbolrate, final_samplerate);
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.h:14:        std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> res;
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_sink.cpp:138:    bladerf_set_rational_sample_rate(bladerf_dev_obj, BLADERF_CHANNEL_TX(channel_id), &rational_rate, &actual);
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_source.cpp:174:        bladerf_set_rational_sample_rate(bladerf_dev_obj, BLADERF_CHANNEL_RX(channel_id), &rational_rate, &actual);
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.cpp:111:        decimator = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(output_stream, current_samplerate, 50e6);
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.h:24:    std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> decimator;
+plugins/sdr_sources/sddc_sdr_support/sddc_sdr.cpp:106:    resampler = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(sddc_stream, 1, 2);
+plugins/sdr_sources/sddc_sdr_support/sddc_sdr.h:24:    std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> resampler; // We need to decimate by 2!
+plugins/sdr_sources/sddc_sdr_support/sddc_sdr.h:38:        resampler = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(sddc_stream, 1, 2);
+
+
+========== MODULE OUTPUT STREAM REFERENCES ==========
+
+
+========== MODULE OUTPUT REFERENCES ==========
+plugins/lora_support/LoRa/module_lora_demod.cpp:84:            if (rsp && rsp->output_stream)
+plugins/lora_support/LoRa/module_lora_demod.cpp:85:                rsp->output_stream->stopReader();
+plugins/lora_support/LoRa/module_lora_demod.cpp:120:                agc->output_stream,
+plugins/lora_support/LoRa/module_lora_demod.cpp:173:                int n = rsp->output_stream->read();
+plugins/lora_support/LoRa/module_lora_demod.cpp:176:                if (n > 0 && rsp->output_stream->readBuf != nullptr)
+plugins/lora_support/LoRa/module_lora_demod.cpp:178:                    complex_t *buf = rsp->output_stream->readBuf;
+plugins/lora_support/LoRa/module_lora_demod.cpp:182:                rsp->output_stream->flush();
+plugins/analog_support/generic/analog_am_demod.cpp:20:		res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, samplerate, final_samplerate);
+plugins/analog_support/generic/analog_am_demod.cpp:23:		pll = std::make_shared<dsp::PLLCarrierTrackingBlock>(res->output_stream, d_pll_bw, d_pll_max_offset, -d_pll_max_offset);
+plugins/analog_support/generic/analog_am_demod.cpp:26:		ctm = std::make_shared<dsp::ComplexToMagBlock>(pll->output_stream);
+plugins/analog_support/generic/analog_am_demod.cpp:43:		ctm->output_stream->stopReader();
+plugins/analog_support/generic/analog_nfm_demod.cpp:20:		res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, samplerate, final_samplerate);
+plugins/analog_support/generic/analog_nfm_demod.cpp:23:		qua = std::make_shared<dsp::QuadratureDemodBlock>(res->output_stream, dsp::hz_to_rad(final_samplerate / 2, final_samplerate));
+plugins/analog_support/generic/analog_nfm_demod.cpp:38:		qua->output_stream->stopReader();
+plugins/analog_support/generic/analog_ssb_demod.cpp:16:		res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, samplerate, final_samplerate);
+plugins/analog_support/generic/analog_ssb_demod.cpp:20:			fsb = std::make_shared<dsp::FreqShiftBlock>(res->output_stream, final_samplerate, -final_samplerate / 2);
+plugins/analog_support/generic/analog_ssb_demod.cpp:22:		fsb = std::make_shared<dsp::FreqShiftBlock>(res->output_stream, final_samplerate, final_samplerate / 2);
+plugins/analog_support/generic/analog_ssb_demod.cpp:38:		fsb->output_stream->stopReader();
+plugins/analog_support/generic/analog_ssb_demod.cpp:39:		fsb->output_stream->stopWriter();
+plugins/analog_support/generic/analog_ssb_demod.h:37:				output_stream->swap(dat_size);
+plugins/analog_support/generic/module_generic_analog_demod.cpp:55:        //    res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, d_symbolrate, final_samplerate);
+plugins/analog_support/generic/module_generic_analog_demod.cpp:58:        //  qua = std::make_shared<dsp::QuadratureDemodBlock>(res->output_stream, dsp::hz_to_rad(d_symbolrate / 2, d_symbolrate));
+plugins/analog_support/generic/module_generic_analog_demod.cpp:151:            dat_size = agc->output_stream->read();
+plugins/analog_support/generic/module_generic_analog_demod.cpp:155:                agc->output_stream->flush();
+plugins/analog_support/generic/module_generic_analog_demod.cpp:174:            int nout = input_resamp.process(agc->output_stream->readBuf, dat_size, work_buffer_complex);
+plugins/analog_support/generic/module_generic_analog_demod.cpp:210:            constellation.pushFloatAndGaussian(qua->output_stream->readBuf, qua->output_stream->getDataSize());
+plugins/analog_support/generic/module_generic_analog_demod.cpp:214:                if (qua->output_stream->readBuf[i] > 1.0f)
+plugins/analog_support/generic/module_generic_analog_demod.cpp:215:                    qua->output_stream->readBuf[i] = 1.0f;
+plugins/analog_support/generic/module_generic_analog_demod.cpp:216:                if (qua->output_stream->readBuf[i] < -1.0f)
+plugins/analog_support/generic/module_generic_analog_demod.cpp:217:                    qua->output_stream->readBuf[i] = -1.0f;
+plugins/analog_support/generic/module_generic_analog_demod.cpp:220:            volk_32f_s32f_convert_16i(output_wav_buffer, (float *)qua->output_stream->readBuf, 32767, dat_size);
+plugins/analog_support/generic/module_generic_analog_demod.cpp:236:            agc->output_stream->flush();
+plugins/analog_support/generic/module_generic_analog_demod.cpp:273:        agc->output_stream->stopReader();
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:49:        // agc->output_stream 采样率 = d_samplerate（原始输入采样率）
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:57:            agc->output_stream,
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:64:        fm1 = std::make_shared<dsp::QuadratureDemodBlock>(filt1->output_stream, 2.0f / float(M_PI));
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:67:        rtc = std::make_shared<dsp::RealToComplexBlock>(fm1->output_stream);
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:70:        fsh = std::make_shared<dsp::FreqShiftBlock>(rtc->output_stream, (double)d_samplerate, -subcarrier);
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:74:            fsh->output_stream,
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:78:        fm2 = std::make_shared<dsp::QuadratureDemodBlock>(filt_lp->output_stream, 2.0f / float(M_PI));
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:83:            fm2->output_stream,
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:140:            int dat_size = rsp->output_stream->read();
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:143:                rsp->output_stream->flush();
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:147:            constellation.pushFloatAndGaussian(rsp->output_stream->readBuf, dat_size);
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:151:                if (rsp->output_stream->readBuf[i] > 1.0f)
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:152:                    rsp->output_stream->readBuf[i] = 1.0f;
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:153:                if (rsp->output_stream->readBuf[i] < -1.0f)
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:154:                    rsp->output_stream->readBuf[i] = -1.0f;
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:157:            volk_32f_s32f_convert_16i(output_wav_buffer, (float *)rsp->output_stream->readBuf, 32767, dat_size);
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:193:            rsp->output_stream->flush();
+plugins/analog_support/noaa2_hrpt/module_noaa2_hrpt_demod.cpp:234:        rsp->output_stream->stopReader();
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:204:        frs = std::make_shared<dsp::FreqShiftBlock>(rtc->output_stream, d_audio_samplerate, -2.4e3);
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:206:        rsp = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(frs->output_stream, filter_srate, d_audio_samplerate);
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:211:        lpf = std::make_shared<dsp::FIRBlock<complex_t>>(rsp->output_stream, dsp::firdes::low_pass(1, filter_srate, tofilter_freq, 0.5));
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:212:        ctm = std::make_shared<dsp::ComplexToMagBlock>(lpf->output_stream);
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:227:            int nsamp = ctm->output_stream->read();
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:231:                float v = ctm->output_stream->readBuf[i];
+plugins/analog_support/noaa_apt/module_noaa_apt_decoder.cpp:239:            ctm->output_stream->flush();
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:36:        res = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(agc->output_stream, d_symbolrate, final_samplerate);
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:40:            nr = std::make_shared<dsp::AptNoiseReductionBlock>(res->output_stream, 9);
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:43:        qua = std::make_shared<dsp::QuadratureDemodBlock>(sdrpp_noise_reduction ? nr->output_stream : res->output_stream, dsp::hz_to_rad(d_symbolrate / 2, d_symbolrate));
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:95:            dat_size = qua->output_stream->read();
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:99:                qua->output_stream->flush();
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:104:            constellation.pushFloatAndGaussian(qua->output_stream->readBuf, qua->output_stream->getDataSize());
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:108:                if (qua->output_stream->readBuf[i] > 1.0f)
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:109:                    qua->output_stream->readBuf[i] = 1.0f;
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:110:                if (qua->output_stream->readBuf[i] < -1.0f)
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:111:                    qua->output_stream->readBuf[i] = -1.0f;
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:114:            volk_32f_s32f_convert_16i(output_wav_buffer, (float *)qua->output_stream->readBuf, 32767, dat_size);
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:129:            qua->output_stream->flush();
+plugins/analog_support/noaa_apt/module_noaa_apt_demod.cpp:166:        qua->output_stream->stopReader();
+plugins/analog_support/noaa_apt/noise_reduction.cpp:63:        process(nsamples, input_stream->readBuf, output_stream->writeBuf);
+plugins/analog_support/noaa_apt/noise_reduction.cpp:66:        output_stream->swap(nsamples);
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:29:        qua = std::make_shared<dsp::QuadratureDemodBlock>(agc->output_stream, 1.0f);
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:32:        dcb2 = std::make_shared<dsp::CorrectIQBlock<float>>(qua->output_stream);
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:38:        fil = std::make_shared<dsp::FIRBlock<float>>(dcb2->output_stream, taps);
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:141:            dat_size = fil->output_stream->read();
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:145:                fil->output_stream->flush();
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:150:            constellation.pushFloatAndGaussian(fil->output_stream->readBuf, fil->output_stream->getDataSize());
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:153:                process_sample(fil->output_stream->readBuf[i]);
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:155:            fil->output_stream->flush();
+plugins/cubesat_support/lucky7/module_lucky7_demod.cpp:184:        fil->output_stream->stopReader();
+plugins/dvb_support/dvbs/dvbs_defra.cpp:47:                        memcpy(&output_stream->writeBuf[frm_cnt * (TS_SIZE / 8)], curr_ts_buffer, TS_SIZE / 8);
+plugins/dvb_support/dvbs/dvbs_defra.cpp:55:                                    output_stream->writeBuf[i] ^= 0xFF;
+plugins/dvb_support/dvbs/dvbs_defra.cpp:58:                            output_stream->swap(frm_cnt * 204);
+plugins/dvb_support/dvbs/dvbs_defra.cpp:141:            int frm_cnt = ts_deframer->work(input_stream->readBuf, nsamples, output_stream->writeBuf);
+plugins/dvb_support/dvbs/dvbs_defra.cpp:146:            output_stream->swap(frm_cnt * 204 * 8);
+plugins/dvb_support/dvbs/dvbs_syms_to_soft.cpp:42:            memcpy(output_stream->writeBuf, &sym_buffer[0], VIT_BUF_SIZE);
+plugins/dvb_support/dvbs/dvbs_syms_to_soft.cpp:43:            output_stream->swap(VIT_BUF_SIZE); // Swap buffers ready to use for the viterbi
+plugins/dvb_support/dvbs/dvbs_vit.cpp:24:        int size = viterbi->work(input_stream->readBuf, VIT_BUF_SIZE, output_stream->writeBuf);
+plugins/dvb_support/dvbs/dvbs_vit.cpp:27:        output_stream->swap(size);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:59:        rrc = std::make_shared<dsp::FIRBlock<complex_t>>(agc->output_stream, dsp::firdes::root_raised_cosine(1, final_samplerate, d_symbolrate, d_rrc_alpha, d_rrc_taps));
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:62:        pll = std::make_shared<dsp::CostasLoopBlock>(rrc->output_stream, d_loop_bw, 4);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:65:        rec = std::make_shared<dsp::MMClockRecoveryBlock<complex_t>>(pll->output_stream, final_sps, d_clock_gain_omega, d_clock_mu, d_clock_gain_mu, d_clock_omega_relative_limit);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:68:        sts = std::make_shared<dvbs::DVBSymToSoftBlock>(rec->output_stream, d_buffer_size);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:86:        vit = std::make_shared<dvbs::DVBSVitBlock>(sts->output_stream);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:90:        def = std::make_shared<dvbs::DVBSDefra>(vit->output_stream);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:176:            dat_size = def->output_stream->read();
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:180:                def->output_stream->flush();
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:189:                uint8_t *current_frame = &def->output_stream->readBuf[i * 204 * 8];
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:226:                data_out.write((char *)def->output_stream->readBuf, dat_size);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:228:                output_fifo->write((uint8_t *)def->output_stream->readBuf, dat_size);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:230:            def->output_stream->flush();
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:261:        def->output_stream->stopReader();
+plugins/dvb_support/dvbs2/dvbs2_bb_to_soft.cpp:66:        deinterleaver->deinterleave(soft_slots_buffer, output_stream->writeBuf);
+plugins/dvb_support/dvbs2/dvbs2_bb_to_soft.cpp:69:        output_stream->swap(frame_slot_count * 90 * constellation->getBitsCnt());
+plugins/dvb_support/dvbs2/dvbs2_pl_sync.cpp:121:        memcpy(output_stream->writeBuf, correlation_buffer, raw_frame_size * sizeof(complex_t));
+plugins/dvb_support/dvbs2/dvbs2_pl_sync.cpp:122:        output_stream->swap(raw_frame_size);
+plugins/dvb_support/dvbs2/dvbs2_pll.cpp:36:                output_stream->writeBuf[i] = tmp_val;
+plugins/dvb_support/dvbs2/dvbs2_pll.cpp:46:                output_stream->writeBuf[i] = (i & 1) ? complex_t(-tmp_val.real, tmp_val.imag) : complex_t(tmp_val.imag, tmp_val.real);
+plugins/dvb_support/dvbs2/dvbs2_pll.cpp:67:        output_stream->swap(nsamples);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:95:        rrc = std::make_shared<dsp::FIRBlock<complex_t>>(agc->output_stream, dsp::firdes::root_raised_cosine(1, final_samplerate, d_symbolrate, d_rrc_alpha, d_rrc_taps));
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:98:        rec = std::make_shared<dsp::MMClockRecoveryBlock<complex_t>>(rrc->output_stream, final_sps, d_clock_gain_omega, d_clock_mu, d_clock_gain_mu, d_clock_omega_relative_limit);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:101:        freq_sh = std::make_shared<dsp::FreqShiftBlock>(rec->output_stream, 1, 0);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:104:        pl_sync = std::make_shared<dvbs2::S2PLSyncBlock>(freq_sh->output_stream, frame_slot_count, d_pilots);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:108:        s2_pll = std::make_shared<dvbs2::S2PLLBlock>(pl_sync->output_stream, d_loop_bw);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:117:        s2_bb_to_soft = std::make_shared<dvbs2::S2BBToSoft>(s2_pll->output_stream);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:177:            dat_size = s2_bb_to_soft->output_stream->read();
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:181:                s2_bb_to_soft->output_stream->flush();
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:186:            constellation_s2.pushComplexPL(&s2_pll->output_stream->readBuf[0], 90);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:187:            constellation_s2.pushComplexSlots(&s2_pll->output_stream->readBuf[90], frame_slot_count * 90);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:190:            snr_estimator.update(&s2_pll->output_stream->readBuf[90], frame_slot_count * 90);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:203:            ring_buffer->write(s2_bb_to_soft->output_stream->readBuf, d_shortframes ? 16200 : 64800);
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:205:            s2_bb_to_soft->output_stream->flush();
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:331:        s2_bb_to_soft->output_stream->stopReader();
+plugins/eos_support/terra/module_terra_db_demod.cpp:26:        rrc = std::make_shared<dsp::FIRBlock<complex_t>>(agc->output_stream, dsp::firdes::root_raised_cosine(1, final_samplerate, d_symbolrate * 2, 0.5f, 31));
+plugins/eos_support/terra/module_terra_db_demod.cpp:28:        pll = std::make_shared<dsp::CostasLoopBlock>(rrc->output_stream, 0.004, 2, max_offset);
+plugins/eos_support/terra/module_terra_db_demod.cpp:29:        rec = std::make_shared<dsp::MMClockRecoveryBlock<complex_t>>(pll->output_stream, ((float)final_samplerate / (float)d_symbolrate) / 2.0f, pow(0.001, 2) / 4.0, 0.5f, 0.001, 0.0001f);
+plugins/eos_support/terra/module_terra_db_demod.cpp:65:            dat_size = rec->output_stream->read();
+plugins/eos_support/terra/module_terra_db_demod.cpp:69:                rec->output_stream->flush();
+plugins/eos_support/terra/module_terra_db_demod.cpp:74:            constellation.pushComplexScaled(rec->output_stream->readBuf, dat_size, 0.5);
+plugins/eos_support/terra/module_terra_db_demod.cpp:77:            snr_estimator.update(rec->output_stream->readBuf, dat_size);
+plugins/eos_support/terra/module_terra_db_demod.cpp:87:                sym_buffer[i] = clamp(rec->output_stream->readBuf[i].real * 50);
+plugins/eos_support/terra/module_terra_db_demod.cpp:89:            rec->output_stream->flush();
+plugins/eos_support/terra/module_terra_db_demod.cpp:119:        rec->output_stream->stopReader();
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_auto_demod.cpp:49:        splitter = std::make_shared<dsp::SplitterBlock>(agc->output_stream);
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:27:        qua = std::make_shared<dsp::QuadratureDemodBlock>(agc->output_stream, 1);
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:30:        iqc = std::make_shared<dsp::CorrectIQBlock<float>>(qua->output_stream);
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:33:        rrc = std::make_shared<dsp::FIRBlock<float>>(iqc->output_stream, dsp::firdes::root_raised_cosine(1.0, final_samplerate, d_symbolrate, 0.4, 31));
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:40:        rec = std::make_shared<dsp::MMClockRecoveryBlock<float>>(rrc->output_stream, final_sps, d_clock_gain_omega, d_clock_mu, d_clock_gain_mu, d_clock_omega_relative_limit);
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:87:            dat_size = rec->output_stream->read();
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:91:                rec->output_stream->flush();
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:96:            constellation.pushFloatAndGaussian(rec->output_stream->readBuf, rec->output_stream->getDataSize());
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:99:            snr_estimator.update((complex_t *)rec->output_stream->readBuf, dat_size / 2);
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:106:                bits_buf[i] = rec->output_stream->readBuf[i] > 0;
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:108:            rec->output_stream->flush();
+plugins/orbcomm_support/orbcomm/module_orbcomm_stx_demod.cpp:151:        rec->output_stream->stopReader();
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:17:        agc = std::make_shared<dsp::AGCBlock<complex_t>>(resamp ? res->output_stream : input, 1e-2, 1.0f, 1.0f, 65536);
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:20:        qua = std::make_shared<dsp::QuadratureDemodBlock>(agc->output_stream, 1);
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:23:        iqc = std::make_shared<dsp::CorrectIQBlock<float>>(qua->output_stream);
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:26:        rrc = std::make_shared<dsp::FIRBlock<float>>(iqc->output_stream, dsp::firdes::root_raised_cosine(1.0, target_samp, symrate, 0.4, 31));
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:33:        rec = std::make_shared<dsp::MMClockRecoveryBlock<float>>(rrc->output_stream, target_samp / symrate, d_clock_gain_omega, d_clock_mu, d_clock_gain_mu, d_clock_omega_relative_limit);
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:36:        def = std::make_shared<STXDeframerBlock>(rec->output_stream);
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:62:        def->output_stream->stopReader();
+plugins/orbcomm_support/orbcomm/stx_demod_hier.cpp:63:        def->output_stream->stopWriter();
+plugins/sdr_sources/aaronia_sdr_support/aaronia_sdr.cpp:335:        output_stream->stopWriter();
+plugins/sdr_sources/aaronia_sdr_support/aaronia_sdr.h:82:                    volk_32fc_s32fc_multiply_32fc((lv_32fc_t *)output_stream->writeBuf, (lv_32fc_t *)packet.fp32, 1000, cnt);
+plugins/sdr_sources/aaronia_sdr_support/aaronia_sdr.h:84:                    memcpy(output_stream->writeBuf, (complex_t *)packet.fp32, cnt * sizeof(complex_t));
+plugins/sdr_sources/aaronia_sdr_support/aaronia_sdr.h:86:                output_stream->swap(cnt);
+plugins/sdr_sources/airspy_sdr_support/airspy_sdr.cpp:147:    airspy_start_rx(airspy_dev_obj, &_rx_callback, &output_stream);
+plugins/sdr_sources/airspyhf_sdr_support/airspyhf_sdr.cpp:109:    airspyhf_start(airspyhf_dev_obj, &_rx_callback, &output_stream);
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_source.cpp:219:            output_stream->stopWriter();
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_source.h:62:                volk_8i_s32f_convert_32f((float *)output_stream->writeBuf, sample_buffer_8, 127.0f, sample_buffer_size * 2);
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_source.h:63:                output_stream->swap(sample_buffer_size);
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_source.h:76:                volk_16i_s32f_convert_32f((float *)output_stream->writeBuf, sample_buffer, 4096.0f, sample_buffer_size * 2);
+plugins/sdr_sources/bladerf_sdr_support/bladerf_sdr_source.h:77:                output_stream->swap(sample_buffer_size);
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.cpp:110:        output_stream_local = output_stream;
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.cpp:111:        decimator = std::make_shared<dsp::RationalResamplerBlock<complex_t>>(output_stream, current_samplerate, 50e6);
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.cpp:112:        output_stream = decimator->output_stream;
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.cpp:132:        output_stream->stopWriter();
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.h:23:    std::shared_ptr<dsp::stream<complex_t>> output_stream_local;
+plugins/sdr_sources/fobos_sdr_support/fobos_sdr.h:39:        auto &ostream = decimator ? decimator->input_stream : output_stream;
+plugins/sdr_sources/hackrf_sdr_support/hackrf_sdr_source.cpp:133:    hackrf_start_rx(hackrf_dev_obj, &_rx_callback, &output_stream);
+plugins/sdr_sources/harogic_sdr_support/harogic_sdr.cpp:126:    output_stream->stopWriter();
+plugins/sdr_sources/harogic_sdr_support/harogic_sdr.cpp:269:        complex_t* out_buf = (complex_t*)output_stream->writeBuf;
+plugins/sdr_sources/harogic_sdr_support/harogic_sdr.cpp:283:        output_stream->swap(samples_in_packet);
+plugins/sdr_sources/hydrasdr_sdr_support/hydrasdr_sdr.cpp:147:    hydrasdr_start_rx(hydrasdr_dev_obj, &_rx_callback, &output_stream);
+plugins/sdr_sources/limesdr_sdr_support/lime_sdr.cpp:154:        output_stream->stopWriter();
+plugins/sdr_sources/limesdr_sdr_support/lime_sdr.h:52:            int cnt = LMS_RecvStream(&limeStream, output_stream->writeBuf, buffer_size, &md, 2000);
+plugins/sdr_sources/limesdr_sdr_support/lime_sdr.h:55:                output_stream->swap(cnt);
+plugins/sdr_sources/mirisdr_sdr_support/mirisdr_sdr.cpp:137:            output_stream->stopWriter();
+plugins/sdr_sources/mirisdr_sdr_support/mirisdr_sdr.h:47:                mirisdr_read_async(mirisdr_dev_obj, _rx_callback_8, &output_stream, 15, buffer_size);
+plugins/sdr_sources/mirisdr_sdr_support/mirisdr_sdr.h:49:                mirisdr_read_async(mirisdr_dev_obj, _rx_callback_16, &output_stream, 15, buffer_size);
+plugins/sdr_sources/net_source_support/net_source.cpp:56:                int bytes = udp_server->recv((uint8_t *)output_stream->writeBuf, 8192 * sizeof(complex_t));
+plugins/sdr_sources/net_source_support/net_source.cpp:57:                output_stream->swap(bytes / sizeof(complex_t));
+plugins/sdr_sources/net_source_support/net_source.cpp:62:                nng_recv(n_sock, output_stream->writeBuf, &lpkt_size, (int)0);
+plugins/sdr_sources/net_source_support/net_source.cpp:63:                output_stream->swap(lpkt_size / sizeof(complex_t));
+plugins/sdr_sources/net_source_support/net_source.cpp:111:    output_stream->flush();
+plugins/sdr_sources/plutosdr_sdr_support/plutosdr_sdr.h:98:                volk_16i_s32f_convert_32f((float *)output_stream->writeBuf, buf, 2048.0f, blockSize * 2);
+plugins/sdr_sources/plutosdr_sdr_support/plutosdr_sdr.h:103:                volk_8i_s32f_convert_32f((float *)output_stream->writeBuf, buf, 128.0f, blockSize * 2);
+plugins/sdr_sources/plutosdr_sdr_support/plutosdr_sdr.h:105:            output_stream->swap(blockSize);
+plugins/sdr_sources/plutosdr_sdr_support/plutosdr_sdr.h:149:            output_stream->stopWriter();
+plugins/sdr_sources/remote_sdr_support/plugin/remote_source.cpp:75:        output_stream->stopReader();
+plugins/sdr_sources/remote_sdr_support/plugin/remote_source.cpp:76:        output_stream->stopWriter();
+plugins/sdr_sources/remote_sdr_support/plugin/remote_source.h:96:            remote_sdr::decode_iq_pkt(&buffer[1], output_stream->writeBuf, &nsamples);
+plugins/sdr_sources/remote_sdr_support/plugin/remote_source.h:97:            // memcpy(output_stream->writeBuf, &buffer[3], nsamples * sizeof(complex_t));
+plugins/sdr_sources/remote_sdr_support/plugin/remote_source.h:99:            output_stream->swap(nsamples);
+plugins/sdr_sources/remote_sdr_support/server/actions.cpp:13:        current_sample_source->output_stream->stopReader();
+plugins/sdr_sources/remote_sdr_support/server/actions.cpp:14:        current_sample_source->output_stream->stopWriter();
+plugins/sdr_sources/remote_sdr_support/server/streaming.cpp:20:            int nsamples = current_sample_source->output_stream->read();
+plugins/sdr_sources/remote_sdr_support/server/streaming.cpp:31:            pktlen += remote_sdr::encode_iq_pkt(&buffer_tx[1], current_sample_source->output_stream->readBuf, mag_buffer, nsamples, streaming_bit_depth);
+plugins/sdr_sources/remote_sdr_support/server/streaming.cpp:35:            current_sample_source->output_stream->flush();
+plugins/sdr_sources/rfnm_sdr_support/rfnm_sdr.cpp:145:        output_stream->stopWriter();
+plugins/sdr_sources/rfnm_sdr_support/rfnm_sdr.h:60:            volk_16i_s32f_convert_32f((float *)output_stream->writeBuf, (int16_t *)rx_buf->buf, 32768.0f, (buffer_size / 4) * 2);
+plugins/sdr_sources/rfnm_sdr_support/rfnm_sdr.h:71:                    v = output_stream->writeBuf[i];
+plugins/sdr_sources/rfnm_sdr_support/rfnm_sdr.h:72:                    output_stream->writeBuf[i].real = v.real * mag_p1;
+plugins/sdr_sources/rfnm_sdr_support/rfnm_sdr.h:73:                    output_stream->writeBuf[i].imag = v.imag + phase * v.real;
+plugins/sdr_sources/rfnm_sdr_support/rfnm_sdr.h:77:            output_stream->swap(buffer_size / 4);
+plugins/sdr_sources/rtaudio_sdr_support/rtaudio_sdr.cpp:76:        adc_dev.openStream(NULL, &adc_prm, RTAUDIO_SINT16, sampleRate, &bufferFrames, &RtAudioSource::callback_mono, &output_stream);
+plugins/sdr_sources/rtaudio_sdr_support/rtaudio_sdr.cpp:78:        adc_dev.openStream(NULL, &adc_prm, RTAUDIO_SINT16, sampleRate, &bufferFrames, &RtAudioSource::callback_stereo, &output_stream);
+plugins/sdr_sources/rtlsdr_sdr_support/rtlsdr_sdr.cpp:215:            output_stream->stopWriter();
+plugins/sdr_sources/rtlsdr_sdr_support/rtlsdr_sdr.h:50:            rtlsdr_read_async(rtlsdr_dev_obj, _rx_callback, &output_stream, 0, buffer_size);
+plugins/sdr_sources/rtltcp_support/rtltcp.cpp:136:            output_stream->stopWriter();
+plugins/sdr_sources/rtltcp_support/rtltcp.h:42:                output_stream->writeBuf[i] = complex_t((in_buf[i * 2 + 0] - 127.4f) / 128.0f, (in_buf[i * 2 + 1] - 127.4f) / 128.0f);
+plugins/sdr_sources/rtltcp_support/rtltcp.h:43:            output_stream->swap(8192 / 2);
+plugins/sdr_sources/sddc_sdr_support/sddc_sdr.cpp:107:    output_stream = resampler->output_stream;
+plugins/sdr_sources/sdrplay_sdr_support/sdrplay_sdr.cpp:250:    if (api.sdrplay_api_Init(sdrplay_dev.dev, &callback_funcs, &output_stream) != sdrplay_api_Success)
+plugins/sdr_sources/sdrplay_sdr_support/sdrplay_sdr.cpp:307:        output_stream->stopWriter();
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:25:    std::shared_ptr<dsp::stream<uint8_t>> client_output_stream;
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:29:        if (!client_output_stream)
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:30:            client_output_stream = std::make_shared<dsp::stream<uint8_t>>();
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:31:        client = server::connect(ip_address, port, client_output_stream.get());
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:86:            int count = client_output_stream->read();
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:87:            int outCount = process(count, client_output_stream->readBuf, output_stream->writeBuf);
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:88:            client_output_stream->flush();
+plugins/sdr_sources/sdrpp_server_support/sdrpp_server.h:89:            output_stream->swap(outCount);
+plugins/sdr_sources/soapy_sdr_support/soapysdr_sdr.cpp:182:            output_stream->stopWriter();
+plugins/sdr_sources/soapy_sdr_support/soapysdr_sdr.h:62:            int samples = soapy_dev->readStream(soapy_dev_stream, (void **)&output_stream->writeBuf, buffer_size, flags, time_ms);
+plugins/sdr_sources/soapy_sdr_support/soapysdr_sdr.h:64:                output_stream->swap(samples);
+plugins/sdr_sources/spyserver_support/spyserver.h:41:        output_stream = std::make_shared<dsp::stream<complex_t>>();
+plugins/sdr_sources/spyserver_support/spyserver.h:42:        client = spyserver::connect(ip_address, port, output_stream.get());
+plugins/sdr_sources/usrp_sdr_support/usrp_sdr.cpp:190:        output_stream->stopWriter();
+plugins/sdr_sources/usrp_sdr_support/usrp_sdr.h:50:            int cnt = usrp_streamer->recv(output_stream->writeBuf, buffer_size, meta, 1.0);
+plugins/sdr_sources/usrp_sdr_support/usrp_sdr.h:52:                output_stream->swap(cnt);
+src-core/modules/demod/module_demod_base.cpp:101:            dc_blocker = std::make_shared<dsp::CorrectIQBlock<complex_t>>(input_data_type == DATA_DSP_STREAM ? input_stream : file_source->output_stream);
+src-core/modules/demod/module_demod_base.cpp:104:        std::shared_ptr<dsp::stream<complex_t>> input_data = d_dc_block ? dc_blocker->output_stream : (input_data_type == DATA_DSP_STREAM ? input_stream : file_source->output_stream);
+src-core/modules/demod/module_demod_base.cpp:145:            doppler_shift = std::make_shared<dsp::DopplerCorrectBlock>(d_frequency_shift != 0 ? freq_shift->output_stream : input_data,
+src-core/modules/demod/module_demod_base.cpp:161:        std::shared_ptr<dsp::stream<complex_t>> input_data_final = d_doppler_enable ? doppler_shift->output_stream
+src-core/modules/demod/module_demod_base.cpp:162:                                                                                    : (d_frequency_shift != 0 ? freq_shift->output_stream : input_data);
+src-core/modules/demod/module_demod_base.cpp:180:            fft_plot = std::make_shared<widgets::FFTPlot>(fft_proc->output_stream->writeBuf, 8192, -10, 20, 10);
+src-core/modules/demod/module_demod_base.cpp:187:        std::shared_ptr<dsp::stream<complex_t>> input_data_final_fft = input_data_type == DATA_FILE ? fft_splitter->output_stream : input_data_final;
+src-core/modules/demod/module_demod_base.cpp:194:        agc = std::make_shared<dsp::AGCBlock<complex_t>>((resample && resample_here) ? resampler->output_stream : input_data_final_fft, d_agc_rate, 1.0f, 1.0f, 65536);
+src-core/modules/demod/module_demod_base.cpp:320:                    if (fft_proc->output_stream->writeBuf[pos] < min)
+src-core/modules/demod/module_demod_base.cpp:321:                        min = fft_proc->output_stream->writeBuf[pos];
+src-core/modules/demod/module_demod_base.cpp:322:                    if (fft_proc->output_stream->writeBuf[pos] > max)
+src-core/modules/demod/module_demod_base.cpp:323:                        max = fft_proc->output_stream->writeBuf[pos];
+src-core/modules/demod/module_fsk_demod.cpp:60:        qua = std::make_shared<dsp::QuadratureDemodBlock>(agc->output_stream, 1.0f);
+src-core/modules/demod/module_fsk_demod.cpp:63:        dcb2 = std::make_shared<dsp::CorrectIQBlock<float>>(qua->output_stream);
+src-core/modules/demod/module_fsk_demod.cpp:66:        agc2 = std::make_shared<dsp::AGCBlock<float>>(dcb2->output_stream, 0.1f, 0.5f, 1.0f, 65535.0f);
+src-core/modules/demod/module_fsk_demod.cpp:76:        rrc = std::make_shared<dsp::FIRBlock<float>>(agc2->output_stream, taps);
+
+
+========== LOOP AND MODULE STOP REFERENCES ==========
+
+
+========== MODULE PROCESS AND STOP REFERENCES ==========
+
+
+========== LORA ALGORITHM SOURCE SEARCH ==========
+
+
+========== LORA RELATED SOURCE REFERENCES ==========
+plugins/dvb_support/codings/dvb-s2/s2_deinterleaver.cpp:1:#include "s2_deinterleaver.h"
+plugins/dvb_support/codings/dvb-s2/s2_deinterleaver.cpp:71:    void S2Deinterleaver::deinterleave(int8_t *input, int8_t *output)
+plugins/dvb_support/codings/dvb-s2/s2_deinterleaver.h:25:        void deinterleave(int8_t *input, int8_t *output);
+plugins/dvb_support/dvbs/dvbs_interleaving.h:25:        std::vector<std::deque<unsigned char>> d_shift_deinterleave;
+plugins/dvb_support/dvbs/dvbs_interleaving.h:42:            d_shift_deinterleave.reserve(d_I);
+plugins/dvb_support/dvbs/dvbs_interleaving.h:44:                d_shift_deinterleave.emplace_back(d_M * i, 0);
+plugins/dvb_support/dvbs/dvbs_interleaving.h:61:        void deinterleave(uint8_t *in, uint8_t *out)
+plugins/dvb_support/dvbs/dvbs_interleaving.h:66:                // This is actually the deinterleaver
+plugins/dvb_support/dvbs/dvbs_interleaving.h:69:                    d_shift_deinterleave[k % d_I].push_back(in[count]);
+plugins/dvb_support/dvbs/dvbs_interleaving.h:70:                    out[count++] = d_shift_deinterleave[k % d_I].front();
+plugins/dvb_support/dvbs/dvbs_interleaving.h:71:                    d_shift_deinterleave[k % d_I].pop_front();
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:128:        uint8_t deinterleaved_frame[204 * 8];
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:191:                dvb_interleaving.deinterleave(current_frame, deinterleaved_frame);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:194:                    errors[ii] = reed_solomon.decode(&deinterleaved_frame[204 * ii]);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:196:                scrambler.descramble(deinterleaved_frame);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:202:                        deinterleaved_frame[204 * ii + 1] |= 0b10000000;
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:207:                        data_out.write((char *)&deinterleaved_frame[204 * ii], 188);
+plugins/dvb_support/dvbs/module_dvbs_demod.cpp:209:                        output_fifo->write((uint8_t *)&deinterleaved_frame[204 * ii], 188);
+plugins/dvb_support/dvbs2/dvbs2_bb_to_soft.cpp:66:        deinterleaver->deinterleave(soft_slots_buffer, output_stream->writeBuf);
+plugins/dvb_support/dvbs2/dvbs2_bb_to_soft.h:7:#include "codings/dvb-s2/s2_deinterleaver.h"
+plugins/dvb_support/dvbs2/dvbs2_bb_to_soft.h:49:        std::shared_ptr<dvbs2::S2Deinterleaver> deinterleaver;
+plugins/dvb_support/dvbs2/module_dvbs2_demod.cpp:122:        s2_bb_to_soft->deinterleaver = std::make_shared<dvbs2::S2Deinterleaver>(s2_constellation, s2_framesize, s2_coderate);
+plugins/inmarsat_support/aero/decode_utils.cpp:9:        void deinterleave(int8_t *input, int8_t *output, int cols)
+plugins/inmarsat_support/aero/decode_utils.h:16:        void deinterleave(int8_t *input, int8_t *output, int cols);
+plugins/inmarsat_support/aero/module_aero_decoder.cpp:95:            buffer_deinterleaved = new int8_t[d_aero_info_size];
+plugins/inmarsat_support/aero/module_aero_decoder.cpp:112:            delete[] buffer_deinterleaved;
+plugins/inmarsat_support/aero/module_aero_decoder.cpp:191:                    deinterleave(&soft_buffer[d_aero_sync_size + d_aero_hdr_size + d_aero_interleaver_block_size * i],
+plugins/inmarsat_support/aero/module_aero_decoder.cpp:192:                                 &buffer_deinterleaved[d_aero_interleaver_block_size * i],
+plugins/inmarsat_support/aero/module_aero_decoder.cpp:197:                    depuncture(buffer_deinterleaved, depunc_out, 2, d_aero_interleaver_block_size * d_aero_interleaver_blocks - 1);
+plugins/inmarsat_support/aero/module_aero_decoder.cpp:221:                    viterbi->work(buffer_deinterleaved, buffer_vitdecoded);
+plugins/inmarsat_support/aero/module_aero_decoder.h:32:            int8_t *buffer_deinterleaved;
+plugins/inmarsat_support/stdc/decode_utils.cpp:48:        void deinterleave(int8_t *in, int8_t *out)
+plugins/inmarsat_support/stdc/decode_utils.h:16:        void deinterleave(int8_t *in, int8_t *out);
+plugins/inmarsat_support/stdc/module_stdc_decoder.cpp:91:                        deinterleave(buffer_depermuted, buffer_synchronized);
+plugins/meteor_support/meteor/deint.cpp:96:    void DeinterleaverReader::deinterleave(int8_t *dst, const int8_t *src, size_t len)
+plugins/meteor_support/meteor/deint.cpp:104:        /* Write bits to the deinterleaver */
+plugins/meteor_support/meteor/deint.cpp:121:        /* Read bits from the deinterleaver */
+plugins/meteor_support/meteor/deint.cpp:129:    size_t DeinterleaverReader::deinterleave_num_samples(size_t output_count)
+plugins/meteor_support/meteor/deint.cpp:141:    int DeinterleaverReader::deinterleave_expected_sync_offset()
+plugins/meteor_support/meteor/deint.cpp:179:        /* Retrieve enough samples so that the deinterleaver will output
+plugins/meteor_support/meteor/deint.cpp:181:        int num_samples = deinterleave_num_samples(len);
+plugins/meteor_support/meteor/deint.cpp:197:             * offset is correct, and just derotate and deinterleave what we read */
+plugins/meteor_support/meteor/deint.cpp:200:            deinterleave(dst, dst, len);
+plugins/meteor_support/meteor/deint.cpp:208:            /* Get where the deinterleaver expects the next marker to be */
+plugins/meteor_support/meteor/deint.cpp:209:            int deint_offset = deinterleave_expected_sync_offset();
+plugins/meteor_support/meteor/deint.cpp:237:            deinterleave(dst, dst + offset, len);
+plugins/meteor_support/meteor/deint.h:36:        void deinterleave(int8_t *dst, const int8_t *src, size_t len);
+plugins/meteor_support/meteor/deint.h:37:        size_t deinterleave_num_samples(size_t output_count);
+plugins/meteor_support/meteor/deint.h:38:        int deinterleave_expected_sync_offset();
+plugins/umka_support/umka/module_umka1_decoder.cpp:16:    uint32_t calc_crc(uint8_t *data, int size)
+plugins/umka_support/umka/module_umka1_decoder.cpp:112:            uint32_t crc1 = calc_crc(&cadu[9], 1008);
+src-core/common/codings/reedsolomon/reedsolomon.cpp:57:            deinterleave(data, buff, b, i);
+src-core/common/codings/reedsolomon/reedsolomon.cpp:122:            deinterleave(data, buff, b, i);
+src-core/common/codings/reedsolomon/reedsolomon.cpp:145:    void ReedSolomon::deinterleave(uint8_t *data, uint8_t *output, uint8_t pos, uint8_t i)
+src-core/common/codings/reedsolomon/reedsolomon.h:38:        void deinterleave(uint8_t *data, uint8_t *output, uint8_t pos, uint8_t i);
+src-core/libs/deepspace-turbo/libturbocodes.h:20:int *turbo_deinterleave(int *packet, t_turbocode code);
+src-core/libs/deepspace-turbo/libturbocodes.h:22:void message_deinterleave(double ***messages, t_turbocode code);
+src-core/libs/deepspace-turbo/libturbocodes.h:29://void turbo_decode(double *received, int iterations, double noise_variance, t_turbocode code, int *decoded_deinterleaved);
+
+
+========== COMPILER AND BUILD SETTINGS ==========
+
+
+========== FILE: CMakeLists.txt ==========
+cmake_minimum_required(VERSION 3.12)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+include(CheckCXXSourceCompiles)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+if(MSVC OR BUILD_MSVC)
+    set(VCPKG_APPLOCAL_DEPS CACHE BOOL FALSE)
+endif()
+
+project(SatDump)
+
+option(BUILD_GUI "Build the GUI" ON)
+option(BUILD_TESTING "Build the testing program" OFF)
+option(BUILD_TOOLS "Build the tools programs" OFF)
+option(BUILD_ZIQ "Build support for the custom ZIQ format" ON)
+option(BUILD_ZIQ2 "Build support for the custom ZIQ2 format (Very WIP)" OFF)
+option(BUILD_MSVC "Build for Windows with MSVC" OFF) # Seems like "MSVC" as a macro messed up below for some reason...
+option(BUILD_OPENCL "Build with OpenCL GPU Accelerations" ON)
+option(BUILD_OPENMP "Build with OpenMP Optimizations" ON)
+option(BUILD_DOCS "Build with Doxygen Documentation" OFF)
+option(ENABLE_INSTALL "Enable INSTALL TARGET" ON)
+
+if(ANDROID)
+    # Build settings
+    set(BUILD_OPENMP OFF)
+    set(OPENCL_FOUND 1)
+endif()
+
+# Set default install prefix
+include(GNUInstallDirs) #Retruns good defaults on non-GNU systems as well
+if(UNIX)
+    if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+        if(APPLE)
+            set(CMAKE_INSTALL_PREFIX /usr/local CACHE PATH "Set CMAKE Default to /usr/local" FORCE)
+        else()
+            set(CMAKE_INSTALL_PREFIX /usr CACHE PATH "Set CMAKE Default to /usr" FORCE)
+        endif()
+    endif(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+endif()
+
+if(APPLE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
+    link_directories(vcpkg/installed/osx-satdump/lib)
+
+    # Jemalloc
+    find_package(Jemalloc REQUIRED)
+    include_directories(${JEMALLOC_INCLUDE_DIR})
+    link_libraries(${JEMALLOC_LIBRARY})
+
+endif()
+
+if(UNIX)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-psabi")
+    endif()
+
+    if(BUILD_OPENMP)
+        message("Compiling with OpenMP support!")
+        if(APPLE)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-command-line-argument -Xpreprocessor")
+        endif()
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fopenmp")
+    endif()
+
+    find_package(ZSTD)
+
+    if((NOT ZSTD_FOUND) AND BUILD_ZIQ AND (NOT ANDROID))
+        message("ZIQ Was enabled but libzstd was not found!")
+        set(BUILD_ZIQ OFF)
+    endif()
+else()
+    # set(CMAKE_CXX_FLAGS "-Wall")
+    # set(CMAKE_CXX_FLAGS_DEBUG "-g")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+endif()
+
+if(MSVC OR BUILD_MSVC)
+    add_compile_definitions(
+        _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
+        _USE_MATH_DEFINES
+        _CRT_SECURE_NO_WARNINGS
+        _WINSOCK_DEPRECATED_NO_WARNINGS
+        _CRT_NONSTDC_NO_WARNINGS
+    )
+
+    if(BUILD_OPENMP)
+        message("Compiling with OpenMP support!")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /openmp")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /openmp")
+    endif()
+
+    # This should be the default, but sometimes it isn't apparently
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD")
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /MD")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MDd")
+    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /MDd")
+
+    # Speed up this to object-level, Suppress type conversion warnings, suppress
+    # POSIX function warnings, suppress warnings about DLL-exported functions, and
+    # Suppress warnings about template methods defined in another C++ file
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP8 /EHsc /wd4305 /wd4267 /wd4244 /wd4273 /wd4661")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP8 /EHsc /wd4305 /wd4267 /wd4244 /wd4273 /wd4661")
+
+    #Suppress pointless (to us) warnings about DLL-exported functions
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /ignore:4286,4217")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /ignore:4286,4217")
+    set(CMAKE_STATIC_LINKER_FLAGS "${CMAKE_STATIC_LINKER_FLAGS} /ignore:4286,4217")
+
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    include_directories(vcpkg/installed/${VCPKG_TARGET_TRIPLET}/include)
+    link_directories(vcpkg/installed/${VCPKG_TARGET_TRIPLET}/lib)
+endif()
+
+project(SatDump VERSION "1.2.3")
+
+# Check if the current commit has a tag
+execute_process(
+    COMMAND git name-rev --name-only --tags HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    OUTPUT_VARIABLE GIT_HAS_TAG
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# Get the latest abbreviated commit hash of current branch
+execute_process(
+    COMMAND git log -1 --format=%h
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    OUTPUT_VARIABLE GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# Set version
+if(GIT_HAS_TAG STREQUAL "undefined" OR GIT_HAS_TAG STREQUAL "nightly")
+    message("-- Commit has no tag/nightly tag (${GIT_HAS_TAG}). Assume dev build")
+    set(SATDUMP_VERSION "${PROJECT_VERSION}-${GIT_HASH}")
+else()
+    message("-- Commit has tag (${GIT_HAS_TAG}). Assume release build")
+    set(SATDUMP_VERSION "${PROJECT_VERSION}")
+endif()
+add_compile_definitions(SATDUMP_VERSION="${SATDUMP_VERSION}")
+
+# Used for error messages
+string(LENGTH "${CMAKE_SOURCE_DIR}/" SOURCE_PATH_SIZE)
+add_compile_definitions(SOURCE_PATH_SIZE=${SOURCE_PATH_SIZE})
+
+if(ANDROID)
+    add_compile_definitions(ANDROID_ABI_LIB="${ANDROID_ABI}")
+endif()
+
+# Check we have OpenCL
+if(NOT ANDROID)
+    find_package(OpenCL)
+endif()
+
+if(OPENCL_FOUND AND BUILD_OPENCL)
+    message("OpenCL Found! SatDump will support accelerated GPU computing.")
+else()
+    message("OpenCL NOT found or disabled!")
+    set(BUILD_OPENCL OFF)
+endif()
+
+# For good measure
+if(BUILD_ZIQ)
+    message("Building with ZIQ Support")
+endif()
+
+if(BUILD_ZIQ2)
+    message("Building with ZIQ2 Support")
+endif()
+
+# If in debug, set the macro
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_definitions(BUILD_IS_DEBUG=1)
+    message("")
+    message("██████╗  █████╗ ███╗   ██╗ ██████╗ ███████╗██████╗ ")
+    message("██╔══██╗██╔══██╗████╗  ██║██╔════╝ ██╔════╝██╔══██╗")
+    message("██║  ██║███████║██╔██╗ ██║██║  ███╗█████╗  ██████╔╝")
+    message("██║  ██║██╔══██║██║╚██╗██║██║   ██║██╔══╝  ██╔══██╗")
+    message("██████╔╝██║  ██║██║ ╚████║╚██████╔╝███████╗██║  ██║")
+    message("╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝")
+    message("Building SatDump in Debug mode!")
+    message("")
+endif()
+
+# Check system has <filesystem>
+check_cxx_source_compiles("#include <filesystem>\n int main() { return 0; }" STD_HAS_FILESYSTEM)
+
+if(NOT STD_HAS_FILESYSTEM)
+    include_directories(std_filesystem)
+endif()
+
+add_subdirectory(src-core)
+add_subdirectory(src-cli)
+
+if(BUILD_GUI)
+    message("Building the GUI")
+    add_subdirectory(src-interface)
+
+    if(NOT ANDROID)
+        add_subdirectory(src-ui)
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_subdirectory(src-testing)
+endif()
+
+if(BUILD_TOOLS)
+    add_subdirectory(tools)
+endif()
+
+add_subdirectory(plugins)
+
+# Install configuration
+if((NOT ANDROID) AND ENABLE_INSTALL)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/pipelines DESTINATION share/satdump)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/resources DESTINATION share/satdump)
+    install(FILES ${CMAKE_SOURCE_DIR}/satdump_cfg.json DESTINATION share/satdump)
+    install(FILES ${CMAKE_SOURCE_DIR}/icon.png DESTINATION share/satdump)
+    configure_file(${CMAKE_SOURCE_DIR}/satdump.desktop ${CMAKE_CURRENT_BINARY_DIR}/satdump.desktop @ONLY)
+
+    if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/satdump.desktop DESTINATION share/applications)
+    endif()
+
+    # Create uninstall target
+    configure_file(${CMAKE_SOURCE_DIR}/cmake/cmake_uninstall.cmake ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake @ONLY)
+    add_custom_target(uninstall ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
+
+    # CPack Configuration
+    set(CPACK_PACKAGE_NAME ${PROJECT_NAME} CACHE STRING "satdump-${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "A satellite data processing software" CACHE STRING "")
+    set(CPACK_PACKAGE_VENDOR "SatDump")
+    set(CPACK_PACKAGE_CONTACT "Aang23")
+
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libfftw3-bin, libvolk-bin | libvolk2-bin, libpng16-16, libnng1, librtlsdr0 | librtlsdr2, libhackrf0, libairspy0, libairspyhf1, libglfw3 | libglfw3-wayland, libzstd1, libjemalloc2 | libjemalloc1, libportaudiocpp0, libhdf5-hl-100t64 | libhdf5-hl-100 | libhdf5-103 | libhdf5-100")
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "libomp5-14, ocl-icd-libopencl1, intel-opencl-icd, mesa-opencl-icd")
+
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+
+    if(MSVC OR BUILD_MSVC)
+        set(CPACK_PACKAGING_INSTALL_PREFIX "/")
+    else()
+        set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+    endif()
+
+    #set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+    #set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+    #set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+    set(CPACK_PACKAGE_VERSION ${SATDUMP_VERSION})
+
+    if(MSVC OR BUILD_MSVC)
+        # Customize NSIS template
+        file(READ "${CMAKE_ROOT}/Modules/Internal/CPack/NSIS.template.in" NSIS_template)
+        set(CREATE_ICONS_REPLACE "  SetOutPath \"$INSTDIR\\bin\"\n@CPACK_NSIS_CREATE_ICONS@\n@CPACK_NSIS_CREATE_ICONS_EXTRA@\n  SetOutPath \"$INSTDIR\"")
+        string(CONCAT INSTALLDIR_REPLACE "  InstallDir \"@CPACK_NSIS_INSTALL_ROOT@\\@CPACK_PACKAGE_INSTALL_DIRECTORY@\""
+            "\n  InstallDirRegKey HKLM Software\\@CPACK_PACKAGE_VENDOR@\\@CPACK_PACKAGE_INSTALL_REGISTRY_KEY@ \"\"")
+        string(REPLACE "@CPACK_NSIS_CREATE_ICONS@\n@CPACK_NSIS_CREATE_ICONS_EXTRA@" "${CREATE_ICONS_REPLACE}" NSIS_template "${NSIS_template}")
+        string(REPLACE "  InstallDir \"@CPACK_NSIS_INSTALL_ROOT@\\@CPACK_PACKAGE_INSTALL_DIRECTORY@\"" "${INSTALLDIR_REPLACE}" NSIS_template "${NSIS_template}")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/NSIS.template.in" "${NSIS_template}")
+        set(CPACK_MODULE_PATH "${CMAKE_CURRENT_BINARY_DIR}")
+
+        # Generate Installer
+        set(CPACK_GENERATOR NSIS)
+        set(CPACK_PACKAGE_INSTALL_DIRECTORY SatDump)
+        set(CPACK_NSIS_MANIFEST_DPI_AWARE ON)
+        set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+        set(CPACK_NSIS_MODIFY_PATH ON)
+        set(CPACK_NSIS_BRANDING_TEXT "SatDump - General Purpose Satellite Data Processor")
+        set(CPACK_NSIS_MUI_HEADERIMAGE "${PROJECT_SOURCE_DIR}\\\\windows\\\\installer-header.bmp")
+        set(CPACK_NSIS_MUI_ICON "${PROJECT_SOURCE_DIR}\\\\windows\\\\icon.ico")
+        if(BUILD_GUI)
+            set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\satdump-ui.exe")
+            set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} "satdump-ui" "SatDump")
+            list(APPEND CPACK_NSIS_CREATE_ICONS_EXTRA "CreateShortCut \\\"$DESKTOP\\\\SatDump.lnk\\\" \\\"$INSTDIR\\\\bin\\\\satdump-ui.exe\\\"")
+            list(APPEND CPACK_NSIS_DELETE_ICONS_EXTRA "Delete \\\"$DESKTOP\\\\SatDump.lnk\\\"")
+        endif()
+        if(PLUGIN_REMOTE_SDR_SUPPORT)
+            set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} "satdump_sdr_server" "SatDump SDR Server")
+        endif()
+
+        install(RUNTIME_DEPENDENCY_SET satdump_deps
+            PRE_EXCLUDE_REGEXES
+                "api-ms-.*"
+                "ext-ms-.*"
+                "^hvsifiletrust\\.dll$"
+                "^pdmutilities\\.dll$"
+                "^vc.*"
+                "^msvcp.*"
+                "^concrt.*"
+                "satdump_core.dll"
+                "satdump_interface.dll"
+            POST_EXCLUDE_REGEXES
+            ".*system32/.*\\.dll"
+            DIRECTORIES
+            "${PROJECT_SOURCE_DIR}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/bin"
+        )
+    else()
+        set(CPACK_GENERATOR DEB)
+        #set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+        set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+        set(CPACK_DEB_COMPONENT_INSTALL ON)
+    endif()
+
+    set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+
+    include(CPack)
+endif()
+
+# Doxygen configuration
+if((CMAKE_BUILD_TYPE MATCHES "^[Rr]elease") AND BUILD_DOCS)
+    find_package(Doxygen)
+    if(DOXYGEN_FOUND)
+        set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in)
+        set(DOXYGEN_OUT ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
+
+        configure_file(${DOXYGEN_IN} ${DOXYGEN_OUT} @ONLY)
+        message("-- Doxygen build enabled!")
+
+        add_custom_target(docs_doxygen ALL
+            COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_OUT}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            COMMENT "Generating API documentation with Doxygen"
+            VERBATIM)
+    else(DOXYGEN_FOUND)
+        message("Doxygen need to be installed to generate the doxygen documentation")
+    endif(DOXYGEN_FOUND)
+endif()
+
+
+========== FILE SIZE SUMMARY ==========
+172K	/data/data/com.termux/files/home/Satdump-1.2.3/lora_context_bundle.txt
+3530 /data/data/com.termux/files/home/Satdump-1.2.3/lora_context_bundle.txt

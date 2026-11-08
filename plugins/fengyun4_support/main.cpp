@@ -3,8 +3,6 @@
 #include "core/module.h"
 
 #include "fy4/module_fy4_lrit_data_decoder.h"
-#include "LoRa/module_lora_demod.h"
-#include "LoRa/module_emwin_cadu_decoder.h"
 #include "LoRa/module_emwin_text_decoder.h"
 
 class FengYun4Support : public satdump::Plugin
@@ -23,11 +21,6 @@ public:
     static void registerPluginsHandler(const RegisterModulesEvent &evt)
     {
         REGISTER_MODULE_EXTERNAL(evt.modules_registry, fy4::lrit::FY4LRITDataDecoderModule);
-
-        REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::LoRaDemodModule);
-        REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::EmwinCaduDecoderModule);
         REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::EmwinTextDecoderModule);
     }
 };
-
-PLUGIN_LOADER(FengYun4Support)
