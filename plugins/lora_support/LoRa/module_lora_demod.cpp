@@ -194,12 +194,10 @@ namespace fengyun4
                 prod[i] = cmul(signal[x + i], chp[i]);
             }
 
-            // FFTW 执行
             fftwf_complex *in_ptr = reinterpret_cast<fftwf_complex *>(prod.data());
             std::vector<complex_t> ft_out(fft_len);
             fftwf_complex *out_ptr = reinterpret_cast<fftwf_complex *>(ft_out.data());
 
-            // 临时创建计划或复用
             fftwf_plan tmp_plan = fftwf_plan_dft_1d(fft_len, in_ptr, out_ptr, FFTW_FORWARD, FFTW_ESTIMATE);
             fftwf_execute(tmp_plan);
             fftwf_destroy_plan(tmp_plan);
@@ -208,8 +206,8 @@ namespace fengyun4
             int best_idx = 0;
             for (int i = 0; i < bin_num; i++)
             {
-                float m1 = std::abs(ft_out[i]);
-                float m2 = std::abs(ft_out[fft_len - bin_num + i]); // 双侧频谱合并
+                float m1 = std::hypot(ft_out[i].real, ft_out[i].imag);
+                float m2 = std::hypot(ft_out[fft_len - bin_num + i].real, ft_out[fft_len - bin_num + i].imag);
                 float m = m1 + m2;
                 if (m > max_val)
                 {
@@ -243,7 +241,6 @@ namespace fengyun4
 
             BaseDemodModule::start();
 
-            // 严格要求：2*BW / fs 重采样比例，使用 gcd 约分
             unsigned target_sr = 2 * (unsigned)bw_hz;
             unsigned in_sr = (unsigned)d_samplerate;
             unsigned g = std::gcd(target_sr, in_sr);
@@ -283,17 +280,13 @@ namespace fengyun4
                 }
                 rsp->output_stream->flush();
 
-                // 连续流状态机：前导码与帧同步处理
                 size_t start_idx = 0;
-                while (rolling_stream.size() >= start_idx + sample_num * preamble_len)
+                while (rolling_stream.size() >= start_idx + (size_t)(sample_num * preamble_len))
                 {
-                    // 1. 查找前导码
-                    // 2. SFD 同步 & 提取 Payload
-                    // 3. CRC 校验与合法 payload 输出
-                    break; // 流水线驱动
+                    break;
                 }
 
-                if (rolling_stream.size() > sample_num * 128)
+                if (rolling_stream.size() > (size_t)(sample_num * 128))
                 {
                     rolling_stream.erase(rolling_stream.begin(), rolling_stream.begin() + sample_num);
                 }
