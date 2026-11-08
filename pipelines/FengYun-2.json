@@ -55,12 +55,6 @@
                 "name": "Save telemetry data",
                 "description": "Whether to process and save telemetry data to a JSONC file"
             }
-/*            "no_save_img": {
-                "type": "bool",
-                "value": false,
-                "name": "No Save Img",
-                "description": "Only preview and save .svissr data, do not save images.
-            }*/
         },
         "work": {
             "baseband": {},
@@ -78,7 +72,7 @@
             },
             "products": {
                 "fengyun_svissr_image_decoder": {
-                    "satname": "FY-2x"
+                    "satname": "FY-2x",
                     "no_save_img":false
                 }
             }
@@ -119,26 +113,7 @@
             ]
         ],
         "samplerate": 6e6,
-        "parameters": {
-            "apply_correction": {
-                "type": "bool",
-                "value": false,
-                "name": "Apply rudimentary correction",
-                "description": "This applies correction on the basis of a sequential order check."
-            },
-            "save_telemetry": {
-                "type": "bool",
-                "value": false,
-                "name": "Save telemetry data",
-                "description": "Whether to process and save telemetry data to a JSONC file"
-            },
-            "no_save_img": {
-                "type": "bool",
-                "value": false,
-                "name": "No Save Img",
-                "description": "Only preview and save .svissr data, do not save images."
-            }
-        },
+        "parameters": {},
         "work": {
             "baseband": {},
             "soft": {
@@ -152,11 +127,6 @@
             },
             "svissr": {
                 "fengyun_svissr_decoder": {}
-            },
-            "products": {
-                "fengyun_svissr_image_decoder": {
-                    "satname": "FY-2x"
-                }
             }
         }
     }
