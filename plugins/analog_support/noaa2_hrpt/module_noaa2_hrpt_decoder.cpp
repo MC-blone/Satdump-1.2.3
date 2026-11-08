@@ -240,8 +240,8 @@ namespace noaa2_hrpt
             logger->info("Applying percentiles stretch and saving...");
             {
                 std::lock_guard<std::mutex> lock(img_mtx);
-                apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 0.1f, 99.9f, base_name + "_原始动态.png");
-                apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 2.0f, 98.0f, base_name + "_增强对比.png");
+                apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 0.1f, 99.9f, base_name + "_raw.png");
+                apply_stretch_and_save(full_imagebuf, sp_out, line_cnt, 2.0f, 98.0f, base_name + "_Wibt.png");
                 std::vector<uint8_t>().swap(full_imagebuf);
             }
             logger->info("Decode complete and images saved.");
