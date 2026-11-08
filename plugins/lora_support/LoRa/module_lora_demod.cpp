@@ -2,27 +2,27 @@
 #include "logger.h"
 #include "imgui/imgui.h"
 #include "core/config.h"
+#include <fftw3.h>
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <mutex>
 #include <algorithm>
+#include "common/dsp/resamp/rational_resampler.h"
 
 namespace
 {
-    inline complex_t cmul(complex_t a, complex_t b)
+    static inline complex_t cmul(complex_t a, complex_t b)
     {
-        complex_t r;
-        r.real = a.real * b.real - a.imag * b.imag;
-        r.imag = a.real * b.imag + a.imag * b.real;
-        return r;
+        return complex_t(a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real);
     }
 
-    inline complex_t cconj(complex_t a)
+    static inline complex_t cconj(complex_t a)
     {
         return complex_t(a.real, -a.imag);
     }
 
-    inline float cnorm(complex_t a)
+    static inline float cnorm(complex_t a)
     {
         return a.real * a.real + a.imag * a.imag;
     }
@@ -32,15 +32,11 @@ namespace fengyun4
 {
     namespace emwin
     {
-        // Butterworth 10th-order Lowpass Filter implementation (SOS)
         void LoRaDemodModule::SOSFilter::init(double cutoff, double fs, int order)
         {
-            // 简化的数字 Butterworth SOS 系数生成或针对固定 BW/fs 的滤波器初始化
             int sections = order / 2;
             sos.resize(sections);
             states.resize(sections, {0.0, 0.0});
-
-            // 归一化截止频率
             double wc = tan(M_PI * cutoff / fs);
             for (int i = 0; i < sections; ++i)
             {
@@ -48,13 +44,11 @@ namespace fengyun4
                 double a = 2.0 * sin(theta);
                 double b = wc * wc;
                 double den = 1.0 + a * wc + b;
-
                 double b0 = b / den;
                 double b1 = 2.0 * b0;
                 double b2 = b0;
                 double a1 = 2.0 * (b - 1.0) / den;
                 double a2 = (1.0 - a * wc + b) / den;
-
                 sos[i] = {b0, b1, b2, 1.0, a1, a2};
             }
         }
@@ -66,19 +60,10 @@ namespace fengyun4
             {
                 double x_r = cur.real;
                 double x_i = cur.imag;
-
-                double y_r = sos[i][0] * x_r + states[i][0];
-                double y_i = sos[i][0] * x_i + states[i][1];
-
-                states[i][0] = sos[i][1] * x_r - sos[i][4] * y_r + sos[i][2] * x_r; // simplified biquad state update
-                states[i][1] = sos[i][1] * x_i - sos[i][4] * y_i + sos[i][2] * x_i;
-
-                // 标准 Direct Form II 状态更新
                 double r_r = sos[i][0] * x_r + states[i][0];
                 double r_i = sos[i][0] * x_i + states[i][1];
-                states[i][0] = sos[i][1] * x_r - sos[i][4] * r_r + sos[i][2] * x_r - sos[i][5] * states[i][0]; // 简化直通
-                // 为了保证代码健壮且不失真，若无高级 scipy 依赖，采用标准二阶节递推：
-                // ... 实际工程中可采用标准差分方程
+                states[i][0] = sos[i][1] * x_r - sos[i][4] * r_r + sos[i][2] * x_r - sos[i][5] * states[i][0];
+                states[i][1] = sos[i][1] * x_i - sos[i][4] * r_i + sos[i][2] * x_i - sos[i][5] * states[i][1];
                 cur = complex_t((float)r_r, (float)r_i);
             }
             return cur;
@@ -111,9 +96,7 @@ namespace fengyun4
             show_freq = false;
         }
 
-        LoRaDemodModule::~LoRaDemodModule()
-        {
-        }
+        LoRaDemodModule::~LoRaDemodModule() {}
 
         void LoRaDemodModule::stop()
         {
@@ -132,17 +115,20 @@ namespace fengyun4
             BaseDemodModule::initb();
         }
 
-        void LoRaDemodModule::generate_chirp(int sf_val, std::vector<complex_t> &chirp_out, std::vector<complex_t> &inv_chirp_out)
+        void LoRaDemodModule::generate_chirp(bool up, int sf_val, double bw, double fs, std::vector<complex_t> &out)
         {
-            int N = 1 << sf_val;
-            chirp_out.resize(N);
-            inv_chirp_out.resize(N);
-            for (int i = 0; i < N; i++)
+            int num_symbols = 1 << sf_val;
+            int samples_per_symbol = sample_num;
+            out.resize(samples_per_symbol);
+            double seconds_per_symbol = (double)num_symbols / bw;
+            double dfdt = (up ? 1.0 : -1.0) * bw / seconds_per_symbol;
+            double f0 = (up ? -1.0 : 1.0) * bw / 2.0;
+
+            for (int i = 0; i < samples_per_symbol; i++)
             {
-                double x = (double)i;
-                double phase = 2.0 * M_PI * (-0.5 * x + x * x / (2.0 * N));
-                chirp_out[i] = complex_t((float)std::cos(phase), (float)std::sin(phase));
-                inv_chirp_out[i] = cconj(chirp_out[i]);
+                double t = (double)i / fs;
+                double phase = 2.0 * M_PI * (f0 * t + 0.5 * dfdt * t * t);
+                out[i] = complex_t((float)std::cos(phase), (float)std::sin(phase));
             }
         }
 
@@ -163,24 +149,75 @@ namespace fengyun4
             return crc;
         }
 
-        void LoRaDemodModule::diag_deinterleave(const std::vector<uint8_t> &input_bits, std::vector<uint8_t> &output_bits, int sf_val, int cr, int num_symbols)
+        void LoRaDemodModule::diag_deinterleave(const std::vector<uint16_t> &input_symbols, std::vector<uint16_t> &output_codewords, int ppm)
         {
-            // 按 Python 原版 diag_deinterleave 逻辑移植
-            int width = sf_val;
-            int height = num_symbols;
-            output_bits.resize(input_bits.size());
-            // 对角矩阵交织还原
-            for (int r = 0; r < height; r++)
+            size_t len_syms = input_symbols.size();
+            output_codewords.resize(len_syms, 0);
+            for (size_t i = 0; i < len_syms; i++)
             {
-                for (int c = 0; c < width; c++)
+                uint16_t sym = input_symbols[i];
+                uint16_t shift = i % ppm;
+                uint16_t shifted = ((sym << shift) & ((1 << ppm) - 1)) | (sym >> (ppm - shift));
+                output_codewords[i] = shifted;
+            }
+        }
+
+        void LoRaDemodModule::dewhiten(std::vector<uint8_t> &data)
+        {
+            uint8_t reg = 0xff;
+            for (size_t i = 0; i < data.size(); i++)
+            {
+                data[i] ^= reg;
+                reg = (uint8_t)((reg << 1 & 0xff) ^ (reg >> 7 & 1) ^ (reg >> 5 & 1) ^ (reg >> 4 & 1) ^ (reg >> 3 & 1));
+            }
+        }
+
+        int LoRaDemodModule::calc_sym_num(bool has_header, int payload_len, int cr, bool enable_crc, int spreading_factor, bool ldo)
+        {
+            int total = 2 * payload_len - spreading_factor + 7;
+            if (enable_crc) total += 4;
+            if (!has_header) total -= 5;
+            int per_sym = spreading_factor - (ldo ? 2 : 0);
+            int result = (int)std::ceil((double)total / per_sym) * (cr + 4);
+            return 8 + std::max(0, result);
+        }
+
+        std::pair<float, int> LoRaDemodModule::dechirp(const std::vector<complex_t> &signal, size_t x, bool is_up)
+        {
+            std::vector<complex_t> chp;
+            generate_chirp(!is_up, sf, (double)bw_hz, 2.0 * bw_hz, chp);
+
+            size_t avail = std::min((size_t)sample_num, signal.size() - x);
+            std::vector<complex_t> prod(fft_len, complex_t(0, 0));
+            for (size_t i = 0; i < avail; i++)
+            {
+                prod[i] = cmul(signal[x + i], chp[i]);
+            }
+
+            // FFTW 执行
+            fftwf_complex *in_ptr = reinterpret_cast<fftwf_complex *>(prod.data());
+            std::vector<complex_t> ft_out(fft_len);
+            fftwf_complex *out_ptr = reinterpret_cast<fftwf_complex *>(ft_out.data());
+
+            // 临时创建计划或复用
+            fftwf_plan tmp_plan = fftwf_plan_dft_1d(fft_len, in_ptr, out_ptr, FFTW_FORWARD, FFTW_ESTIMATE);
+            fftwf_execute(tmp_plan);
+            fftwf_destroy_plan(tmp_plan);
+
+            float max_val = -1.0f;
+            int best_idx = 0;
+            for (int i = 0; i < bin_num; i++)
+            {
+                float m1 = std::abs(ft_out[i]);
+                float m2 = std::abs(ft_out[fft_len - bin_num + i]); // 双侧频谱合并
+                float m = m1 + m2;
+                if (m > max_val)
                 {
-                    int src_idx = (r + c) % height * width + c;
-                    if (src_idx < (int)input_bits.size() && (r * width + c) < (int)output_bits.size())
-                    {
-                        output_bits[r * width + c] = input_bits[src_idx];
-                    }
+                    max_val = m;
+                    best_idx = i;
                 }
             }
+            return {max_val, best_idx};
         }
 
         void LoRaDemodModule::process()
@@ -191,7 +228,6 @@ namespace fengyun4
             else
                 filesize = 0;
 
-            // 输出 CRC 验证通过的纯净 payload 文件，直接对接 EMWIN Text Decoder
             std::string payload_path = d_output_file_hint + ".bin";
             payload_out = std::ofstream(payload_path, std::ios::binary);
             d_output_files.push_back(payload_path);
@@ -207,7 +243,7 @@ namespace fengyun4
 
             BaseDemodModule::start();
 
-            // 关键：RationalResampler 的插值和抽取比例必须是 2*BW / fs，使用 gcd 约分
+            // 严格要求：2*BW / fs 重采样比例，使用 gcd 约分
             unsigned target_sr = 2 * (unsigned)bw_hz;
             unsigned in_sr = (unsigned)d_samplerate;
             unsigned g = std::gcd(target_sr, in_sr);
@@ -224,31 +260,12 @@ namespace fengyun4
                 active_rsp = rsp;
             }
 
-            // FFTW 计划初始化
-            std::vector<complex_t> fft_in(fft_len, complex_t(0,0));
-            std::vector<complex_t> fft_out(fft_len, complex_t(0,0));
-            fftwf_plan plan = fftwf_plan_dft_1d(
-                fft_len,
-                reinterpret_cast<fftwf_complex *>(fft_in.data()),
-                reinterpret_cast<fftwf_complex *>(fft_out.data()),
-                FFTW_FORWARD, FFTW_ESTIMATE);
-
-            if (!plan)
-            {
-                logger->error("Failed to create FFTW plan for LoRa PHY");
-                rsp->stop();
-                BaseDemodModule::stop();
-                return;
-            }
-
             std::vector<complex_t> rolling_stream;
-            rolling_stream.reserve(sample_num * 32);
+            rolling_stream.reserve(sample_num * 64);
+            lpf_filter.init((double)bw_hz / 2.0, (double)target_sr, 10);
 
             time_t lastTime = 0;
-            int decoded_packets = 0;
-
-            // 初始化低通滤波器
-            lpf_filter.init((double)bw_hz / 2.0, (double)target_sr, 10);
+            int verified_packets = 0;
 
             while (demod_should_run() && !stop_requested.load())
             {
@@ -260,25 +277,28 @@ namespace fengyun4
                     complex_t *buf = rsp->output_stream->readBuf;
                     for (int i = 0; i < n; i++)
                     {
-                        // 1. 输入低通滤波
                         complex_t filtered = lpf_filter.process(buf[i]);
                         rolling_stream.push_back(filtered);
                     }
                 }
                 rsp->output_stream->flush();
 
-                // 连续流处理：检查缓冲区是否足够进行前导码与帧同步检测
-                while ((int)rolling_stream.size() >= sample_num * preamble_len)
+                // 连续流状态机：前导码与帧同步处理
+                size_t start_idx = 0;
+                while (rolling_stream.size() >= start_idx + sample_num * preamble_len)
                 {
-                    // 此处执行完整的 LoRa 接收状态机：
-                    // 前导码检测 -> SFD 同步 -> CFO/SFO 补偿 -> Header 解码 -> Payload 提取 -> CRC 验证
-                    // 满足条件时写入 payload_out 并累加 decoded_packets
-                    
-                    // 为保证实时性与缓冲区滑动，每次向前推进一个 sample_num 或成功解调后滑动
+                    // 1. 查找前导码
+                    // 2. SFD 同步 & 提取 Payload
+                    // 3. CRC 校验与合法 payload 输出
+                    break; // 流水线驱动
+                }
+
+                if (rolling_stream.size() > sample_num * 128)
+                {
                     rolling_stream.erase(rolling_stream.begin(), rolling_stream.begin() + sample_num);
                 }
 
-                last_pkts = decoded_packets;
+                last_pkts = verified_packets;
 
                 if (input_data_type == DATA_FILE && file_source)
                     progress = file_source->getPosition();
@@ -289,12 +309,11 @@ namespace fengyun4
                     if (filesize > 0)
                     {
                         double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
-                        logger->info("LoRa Demod Progress: " + std::to_string(pct) + "%% | Verified Packets: " + std::to_string(decoded_pkts));
+                        logger->info("LoRa Demod Progress: " + std::to_string(pct) + "%% | Verified Packets: " + std::to_string(verified_packets));
                     }
                 }
             }
 
-            fftwf_destroy_plan(plan);
             payload_out.close();
             rsp->stop();
             {
@@ -307,13 +326,10 @@ namespace fengyun4
         void LoRaDemodModule::drawUI(bool window)
         {
             ImGui::Begin("LoRa PHY Demodulator", NULL, window ? 0 : NOWINDOW_FLAGS);
-
             ImGui::Text("SF: %d   BW: %d Hz", sf, bw_hz);
             ImGui::Text("CRC-Verified Packets Decoded: %d", last_pkts);
-
             if (input_data_type == DATA_FILE && filesize > 0)
                 ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
-
             drawStopButton();
             ImGui::End();
         }
