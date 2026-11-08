@@ -23,5 +23,4 @@ public:
         REGISTER_MODULE_EXTERNAL(evt.modules_registry, fengyun4::emwin::LoRaDemodModule);
     }
 };
-
 PLUGIN_LOADER(LoRaSupport)
