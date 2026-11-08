@@ -155,6 +155,8 @@ namespace fengyun4
                     if (!input_fifo)
                         break;
                     input_fifo->read((uint8_t *)rd.data(), buf_size);
+                    if (!input_active.load())
+                        break;
                     n = buf_size;
                 }
 

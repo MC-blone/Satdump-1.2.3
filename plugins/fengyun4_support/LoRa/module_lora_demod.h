@@ -4,6 +4,8 @@
 #include "modules/demod/module_demod_base.h"
 #include "common/dsp/resamp/rational_resampler.h"
 #include <fstream>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 namespace fengyun4
@@ -18,6 +20,9 @@ namespace fengyun4
             int bw_hz = 812500;
             int fft_size = 512;
             int last_syms = 0;
+            std::atomic<bool> stop_requested{false};
+            std::mutex rsp_mtx;
+            std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> active_rsp;
 
             void drawUI(bool window) override;
             void process() override;
@@ -26,6 +31,7 @@ namespace fengyun4
             LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
             ~LoRaDemodModule();
 
+            void stop() override;
             void init() override;
 
             static std::string getID();

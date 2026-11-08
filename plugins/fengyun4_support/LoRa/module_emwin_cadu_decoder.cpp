@@ -107,6 +107,8 @@ namespace fengyun4
                     if (!input_fifo)
                         break;
                     input_fifo->read((uint8_t *)soft.data(), soft_read_size);
+                    if (!input_active.load())
+                        break;
                     syms = syms_per_read;
                 }
 

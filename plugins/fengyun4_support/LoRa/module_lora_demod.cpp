@@ -6,7 +6,8 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
-
+#include <mutex>
+#include "common/dsp/resamp/rational_resampler.h"
 namespace
 {
     static inline complex_t cmul(complex_t a, complex_t b)
@@ -72,6 +73,18 @@ namespace fengyun4
             }
         }
 
+        void LoRaDemodModule::stop()
+        {
+            stop_requested.store(true);
+            std::shared_ptr<dsp::RationalResamplerBlock<complex_t>> rsp;
+            {
+                std::lock_guard<std::mutex> lock(rsp_mtx);
+                rsp = active_rsp;
+            }
+            if (rsp && rsp->output_stream)
+                rsp->output_stream->stopReader();
+        }
+
         void LoRaDemodModule::init()
         {
             BaseDemodModule::initb();
@@ -79,6 +92,7 @@ namespace fengyun4
 
         void LoRaDemodModule::process()
         {
+            stop_requested.store(false);
             if (input_data_type == DATA_FILE && file_source)
                 filesize = file_source->getFilesize();
             else
@@ -120,10 +134,10 @@ namespace fengyun4
             const float pi_f = 3.14159265358979323846f;
             for (int i = 0; i < fft_size; i++)
             {
-                float t = (float)i / (float)bw_hz;
-                float phase = pi_f * (float)bw_hz * t * t;
-                chirp[(size_t)i].real = std::cos(phase);
-                chirp[(size_t)i].imag = std::sin(phase);
+                double x = (double)i;
+                double phase = 2.0 * M_PI * (-0.5 * x + x * x / (2.0 * fft_size));
+                chirp[(size_t)i].real = (float)std::cos(phase);
+                chirp[(size_t)i].imag = (float)std::sin(phase);
             }
 
             std::vector<complex_t> fft_in((size_t)fft_size);
@@ -143,15 +157,22 @@ namespace fengyun4
                 return;
             }
 
+            {
+                std::lock_guard<std::mutex> lock(rsp_mtx);
+                active_rsp = rsp;
+            }
+
             std::vector<complex_t> rolling;
             rolling.reserve((size_t)sym_len * 8);
 
             time_t lastTime = 0;
             int total_syms = 0;
 
-            while (demod_should_run())
+            while (demod_should_run() && !stop_requested.load())
             {
                 int n = rsp->output_stream->read();
+                if (n < 0)
+                    break;
                 if (n > 0 && rsp->output_stream->readBuf != nullptr)
                 {
                     complex_t *buf = rsp->output_stream->readBuf;
@@ -209,6 +230,10 @@ namespace fengyun4
             fftwf_destroy_plan(plan);
             data_out.close();
             rsp->stop();
+            {
+                std::lock_guard<std::mutex> lock(rsp_mtx);
+                active_rsp.reset();
+            }
             BaseDemodModule::stop();
         }
 
