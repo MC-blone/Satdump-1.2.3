@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include "common/dsp/utils/snr_estimator.h"
 
 namespace fengyun4
 {
@@ -23,7 +24,7 @@ namespace fengyun4
             int preamble_len = 6;
             int zero_padding_ratio = 10;
 
-            // ---------- 派生尺寸 (在 init 中根据采样率动态计算) ----------
+            // ---------- 派生尺寸 ----------
             int sample_num = 1291;
             int bin_num = 5120;
             int fft_len = 12910;
@@ -52,7 +53,7 @@ namespace fengyun4
             bool ldro = false;
 
             // 去直流状态
-            complex_t dc_state = complex_t(0, 0);
+            complex_t dc_state;
             const float dc_alpha = 0.999f;
 
             // ---------- 输出文件 ----------
@@ -77,7 +78,7 @@ namespace fengyun4
 
             // ---------- 内部方法 ----------
             void init_chirps(double fs);
-            std::pair<float, int> dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up);
+            std::pair<float, int> dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up = true);
             int peak_idx_to_symbol(int peak_idx, int pre_bin);
             size_t detect(const std::vector<complex_t>& buf, size_t start);
             

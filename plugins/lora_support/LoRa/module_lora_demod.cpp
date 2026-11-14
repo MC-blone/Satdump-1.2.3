@@ -73,8 +73,7 @@ namespace fengyun4
         // ====================================================
 
         LoRaDemodModule::LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
-            : BaseDemodModule(input_file, output_file_hint, parameters),
-              constellation(100.0f / 127.0f, 100.0f / 127.0f, demod_constellation_size)
+            : BaseDemodModule(input_file, output_file_hint, parameters)
         {
             if (parameters.count("sf")) sf = parameters["sf"].get<int>();
             if (parameters.count("bw")) bw_hz = parameters["bw"].get<int>();
@@ -92,6 +91,7 @@ namespace fengyun4
 
             name = "Generic LoRa Demod";
             show_freq = true;
+            dc_state = complex_t(0, 0);
         }
 
         LoRaDemodModule::~LoRaDemodModule()
@@ -103,7 +103,6 @@ namespace fengyun4
 
         void LoRaDemodModule::init()
         {
-            // 初始化基类 DSP 块，这会计算最终的采样率 final_samplerate
             BaseDemodModule::initb();
             
             // 采样率自适应：使用 final_samplerate 动态计算样本点数
@@ -158,10 +157,15 @@ namespace fengyun4
             const auto& chp = is_up ? chirp_down : chirp_up;
             size_t signal_len = std::min((size_t)sample_num, buf.size() - pos);
             
-            std::fill(fft_in, fft_in + fft_len, fftwf_complex{0, 0});
+            // 使用 memset 清空 FFTW 数组
+            memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
             
             for (size_t i = 0; i < signal_len; ++i) {
-                complex_t v = buf[pos + i] * chp[i];
+                // 不能直接用 complex_t 的 * 运算符（因为它不是 const 成员），只能手动算
+                complex_t a = buf[pos + i];
+                complex_t b = chp[i];
+                complex_t v(a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real);
+                
                 fft_in[i][0] = v.real;
                 fft_in[i][1] = v.imag;
             }
@@ -225,7 +229,7 @@ namespace fengyun4
                 auto pu = dechirp(buf, start, true);
                 auto pd = dechirp(buf, start, false);
                 start += sample_num;
-                if (std::abs(pd.first) > std::abs(pu.first)) { found = true; break; }
+                if (pd.first > pu.first) { found = true; break; }
             }
             if (!found) throw std::runtime_error("no sync");
 
@@ -239,7 +243,7 @@ namespace fengyun4
             start = (size_t)st;
 
             size_t p4 = start >= (size_t)(4 * sample_num) ? start - 4 * sample_num : 0;
-            auto rp = dechirp(buf, p4);
+            auto rp = dechirp(buf, p4, true);
             int pre_bin = rp.second;
             double cfo;
             if (pre_bin + 1 > bin_num / 2) cfo = (pre_bin - bin_num) * bw_hz / bin_num;
@@ -249,7 +253,7 @@ namespace fengyun4
             auto pku = dechirp(buf, p1, true);
             auto pkd = dechirp(buf, p1, false);
             size_t new_start;
-            if (std::abs(pku.first) > std::abs(pkd.first)) new_start = start + (size_t)std::round(2.25 * sample_num);
+            if (pku.first > pkd.first) new_start = start + (size_t)std::round(2.25 * sample_num);
             else new_start = start + (size_t)std::round(1.25 * sample_num);
             
             return {new_start, pre_bin, cfo};
@@ -430,10 +434,10 @@ namespace fengyun4
                     avg_snr = (avg_snr * total_snr_samples + current_snr) / (total_snr_samples + 1);
                     total_snr_samples++;
 
-                    // 将原始 IQ 推入星座图
+                    // 将原始 IQ 推入星座图 (必须用 std::hypot)
                     for (int i = 0; i < n; i++) {
                         complex_t s = buf[i];
-                        if (std::abs(s) > 1e-6) {
+                        if (std::hypot(s.real, s.imag) > 1e-6) {
                             constellation.pushComplex(&s, 1);
                         }
                     }
@@ -441,8 +445,11 @@ namespace fengyun4
                     // 去直流并入缓冲
                     for (int i = 0; i < n; i++) {
                         complex_t s = buf[i];
-                        dc_state = s * (1.0f - dc_alpha) + dc_state * dc_alpha;
-                        s -= dc_state;
+                        dc_state.real = s.real * (1.0f - dc_alpha) + dc_state.real * dc_alpha;
+                        dc_state.imag = s.imag * (1.0f - dc_alpha) + dc_state.imag * dc_alpha;
+                        
+                        s.real -= dc_state.real;
+                        s.imag -= dc_state.imag;
                         sample_buffer.push_back(s);
                     }
                 }
@@ -628,12 +635,10 @@ namespace fengyun4
             {
                 ImGui::Button("Signal", {200 * ui_scale, 20 * ui_scale});
                 
-                // 频率
                 ImGui::Text("Freq : ");
                 ImGui::SameLine();
                 ImGui::TextColored(style::theme.orange, "%.1f Hz", display_freq);
 
-                // SNR 文本显示
                 ImGui::Text("SNR : ");
                 ImGui::SameLine();
                 if (std::isnan(current_snr)) {
@@ -651,7 +656,6 @@ namespace fengyun4
                 ImGui::Text("Peak SNR: %.1f dB", peak_snr);
                 ImGui::Text("Avg SNR : %.1f dB", avg_snr);
                 
-                // 绘制曲线
                 snr_plot.draw(current_snr, peak_snr);
             }
             ImGui::EndGroup();
