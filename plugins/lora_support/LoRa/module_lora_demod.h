@@ -100,7 +100,7 @@ namespace fengyun4
 
         public:
             LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-            ~LoRaDemodModule() override; // <-- 添加了 override 以消除警告
+            ~LoRaDemodModule(); // 改回原来的（不加 override）
 
             void stop() override;
             void init() override;
