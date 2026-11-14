@@ -299,7 +299,7 @@ jobs:
             -frames:v 1 -pix_fmt rgba "$APPDIR/icon.png"
           cp "$APPDIR/icon.png" "$APPDIR/satdump.png"
 
-          # desktop 的 Icon= 改相对名，避免引用 /usr/share/...
+          # desktop 的 Icon= 改相对名
           DESKTOP_FILE=$(find "$APPDIR" -maxdepth 1 -name "*.desktop" | head -1)
           if [ -n "$DESKTOP_FILE" ]; then
             sed -i 's|^Icon=.*|Icon=satdump|' "$DESKTOP_FILE"
@@ -308,10 +308,24 @@ jobs:
 
           ln -sf satdump.png "$APPDIR/.DirIcon"
 
+          # 关键：先清空 out/，确保 artifact 只有一个 AppImage
+          rm -rf out
+          mkdir -p out
+
           wget -c https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
-          mkdir -p out
           ./appimagetool "$APPDIR" out/SatDump-x86_64.AppImage
+
+          # 只保留正式产物，防止 pkg2appimage 或其他残留混进 artifact
+          find out -maxdepth 1 -type f -name "*.AppImage" ! -name "SatDump-x86_64.AppImage" -delete
+          echo "===== out/ contents ====="
+          ls -la out/
+
+          if [ "$(find out -maxdepth 1 -name '*.AppImage' -type f | wc -l)" -ne 1 ]; then
+            echo "ERROR: expected exactly one AppImage in out/"
+            ls -la out/
+            exit 1
+          fi
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
@@ -394,14 +408,47 @@ jobs:
           (cd nightly_assets/SatDump-Windows_x64_Portable && zip -qr "$GITHUB_WORKSPACE/satdump_out/SatDump-Windows_x64_Portable.zip" .)
           cp nightly_assets/SatDump-Windows_x64_Installer/*.exe satdump_out/SatDump-Windows_x64_Installer.exe
           cp nightly_assets/satdump-android/SatDump-1.2.3-Android-arm64.apk satdump_out/SatDump-Android.apk
-          cp nightly_assets/SatDump-AppImage/*.AppImage satdump_out/SatDump.AppImage
+
+          APPIMAGE=$(find nightly_assets/SatDump-AppImage -maxdepth 1 -name "*.AppImage" -type f | head -1)
+          if [ -z "$APPIMAGE" ]; then
+            echo "ERROR: no AppImage found"
+            ls -la nightly_assets/SatDump-AppImage || true
+            exit 1
+          fi
+          cp "$APPIMAGE" satdump_out/SatDump.AppImage
+
           (cd nightly_assets/SatDump-Windows_arm64_Portable && zip -qr "$GITHUB_WORKSPACE/satdump_out/SatDump-Windows_arm64_Portable.zip" .)
           cp nightly_assets/SatDump-Windows_arm64_Installer/*.exe satdump_out/SatDump-Windows_arm64_Installer.exe
 
-      - name: Update Nightly
+          echo "===== nightly_out contents ====="
+          ls -lh satdump_out/
+
+      - name: Ensure Night-build release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload nightly satdump_out/* -R ${{github.repository}} --clobber
+          TAG: Night-build
+        shell: bash
+        run: |
+          set -e
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG not found, creating..."
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Night-build" \
+              --notes "自动 nightly 构建，每次 push 到 main 时自动更新。" \
+              --prerelease
+          else
+            echo "Release $TAG already exists."
+          fi
+
+      - name: Update Night-build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: Night-build
+        run: |
+          gh release upload "$TAG" satdump_out/* \
+            --repo "${{github.repository}}" \
+            --clobber
 
   publish_test_release:
     name: Publish Test-1.2.3-v1.0
