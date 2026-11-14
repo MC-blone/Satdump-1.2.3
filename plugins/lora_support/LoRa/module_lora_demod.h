@@ -3,13 +3,13 @@
 #include "core/module.h"
 #include "modules/demod/module_demod_base.h"
 #include <fftw3.h>
+#include <volk/volk.h>
 #include <fstream>
 #include <atomic>
 #include <mutex>
 #include <vector>
 #include <string>
 #include <cstdint>
-#include "common/dsp/utils/snr_estimator.h"
 
 namespace fengyun4
 {
@@ -34,9 +34,10 @@ namespace fengyun4
             fftwf_complex *fft_out = nullptr;
             fftwf_plan fft_plan = nullptr;
 
-            // ---------- Chirp ----------
+            // ---------- VOLK 优化缓存 ----------
             std::vector<complex_t> chirp_up;
             std::vector<complex_t> chirp_down;
+            std::vector<float> mag_buffer; // 用于 volk 求模
 
             // ---------- 连续输入缓冲 ----------
             std::vector<complex_t> sample_buffer;
@@ -63,19 +64,10 @@ namespace fengyun4
             // 停止机制
             std::atomic<bool> stop_requested{false};
 
-            // ---------- 统计与 UI 状态 ----------
+            // ---------- 统计与 UI ----------
             int packets_ok = 0;
             int packets_crc_fail = 0;
-            int last_syms = 0;
-            
-            // SNR 相关
-            M2M4SNREstimator snr_estimator;
-            float current_snr = 0;
-            float peak_snr = 0;
-            float avg_snr = 0;
-            uint64_t total_snr_samples = 0;
             double display_freq = 0.0;
-            int block_count = 0; // 用于降低 UI 刷新频率
 
             // ---------- 内部方法 ----------
             void init_chirps(double fs);
@@ -100,7 +92,7 @@ namespace fengyun4
 
         public:
             LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-            ~LoRaDemodModule(); // 改回原来的（不加 override）
+            ~LoRaDemodModule();
 
             void stop() override;
             void init() override;

@@ -76,9 +76,6 @@
             ]
         ],
         "parameters": {
-            "Frequency Shift" :{
-                "value":"-35 kHz",
-                "description": "Please set your Frequency Shift to apply the fix!"
             },
             "samplerate": {
                 "value": 6e6

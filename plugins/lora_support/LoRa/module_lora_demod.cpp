@@ -15,7 +15,6 @@ namespace fengyun4
 {
     namespace emwin
     {
-        // ================= 核心算法辅助函数 =================
         static uint8_t xorbits16(uint16_t data, uint16_t mask) {
             uint16_t v = data & mask;
             uint8_t r = 0;
@@ -70,7 +69,6 @@ namespace fengyun4
                                 ((reg >> 4) & 1) ^ ((reg >> 3) & 1));
             }
         }
-        // ====================================================
 
         LoRaDemodModule::LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
             : BaseDemodModule(input_file, output_file_hint, parameters)
@@ -105,10 +103,10 @@ namespace fengyun4
         {
             BaseDemodModule::initb();
             
-            // 信任上层传入的采样率，如果是 0 则安全兜底
-            if (d_samplerate <= 0) d_samplerate = 2048000; 
+            // 关键：读取的是 agc 出来的流，所以必须使用 final_samplerate 来计算样本数
+            if (final_samplerate <= 0) final_samplerate = 2048000;
 
-            sample_num = (int)std::round(std::pow(2.0, sf) * (double)d_samplerate / (double)bw_hz);
+            sample_num = (int)std::round(std::pow(2.0, sf) * (double)final_samplerate / (double)bw_hz);
             if (sample_num <= 0) sample_num = 1291;
             
             bin_num = zero_padding_ratio * (1 << sf);
@@ -116,20 +114,20 @@ namespace fengyun4
             
             if (fft_len <= 0) return;
 
-            logger->info("LoRa Demod Init: FS=%d, BW=%d, SF=%d", d_samplerate, bw_hz, sf);
+            logger->info("LoRa Demod Init: FS=%.0f, BW=%d, SF=%d", final_samplerate, bw_hz, sf);
             logger->info("Calculated sample_num=%d, bin_num=%d, fft_len=%d", sample_num, bin_num, fft_len);
 
-            init_chirps((double)d_samplerate);
+            init_chirps((double)final_samplerate);
 
             fft_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_len);
             fft_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_len);
-            
+            mag_buffer.resize(fft_len);
+
             if (!fft_in || !fft_out) {
                 logger->error("Failed to allocate FFTW arrays for LoRa Demod");
                 return;
             }
             
-            // 初始全清空一次，后续不再重复清空
             memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
             
             fft_plan = fftwf_plan_dft_1d(fft_len, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
@@ -165,8 +163,7 @@ namespace fengyun4
         void LoRaDemodModule::stop()
         {
             stop_requested.store(true);
-            if (input_data_type == DATA_FILE && file_source)
-                file_source->output_stream->stopReader();
+            BaseDemodModule::stop();
         }
 
         std::pair<float, int> LoRaDemodModule::dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up)
@@ -175,28 +172,21 @@ namespace fengyun4
             const auto& chp = is_up ? chirp_down : chirp_up;
             size_t signal_len = std::min((size_t)sample_num, buf.size() - pos);
             
-            // 速度优化：不再 memset，因为初始已经清零，且后续只覆盖前 sample_num 个。
-            for (size_t i = 0; i < signal_len; ++i) {
-                complex_t a = buf[pos + i];
-                complex_t b = chp[i];
-                complex_t v(a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real);
-                fft_in[i][0] = v.real;
-                fft_in[i][1] = v.imag;
-            }
+            // VOLK 优化：相乘
+            volk_32fc_x2_multiply_32fc((lv_32fc_t*)fft_in, (const lv_32fc_t*)&buf[pos], (const lv_32fc_t*)chp.data(), signal_len);
             
             fftwf_execute(fft_plan);
 
+            // VOLK 优化：求模
+            volk_32fc_magnitude_32f(mag_buffer.data(), (const lv_32fc_t*)fft_out, fft_len);
+
             float best_mag = 0.0f;
             int best = 0;
-            // 速度优化：去除 std::hypot，直接比较平方和
             for (int i = 0; i < bin_num; ++i) {
-                float m1sq = fft_out[i][0]*fft_out[i][0] + fft_out[i][1]*fft_out[i][1];
-                float m2sq = fft_out[fft_len - bin_num + i][0]*fft_out[fft_len - bin_num + i][0] + 
-                             fft_out[fft_len - bin_num + i][1]*fft_out[fft_len - bin_num + i][1];
-                float msq = m1sq + m2sq;
-                if (msq > best_mag) { best_mag = msq; best = i; }
+                float m = mag_buffer[i] + mag_buffer[fft_len - bin_num + i];
+                if (m > best_mag) { best_mag = m; best = i; }
             }
-            return {std::sqrt(best_mag), best}; // 仅在最后计算一次 sqrt
+            return {best_mag, best};
         }
 
         int LoRaDemodModule::peak_idx_to_symbol(int peak_idx, int pre_bin)
@@ -388,8 +378,7 @@ namespace fengyun4
             if (!payload_out_hex.is_open()) {
                 std::string path = d_output_file_hint + ".hex.txt";
                 payload_out_hex.open(path, std::ios::app);
-                if (payload_out_hex.is_open())
-                    d_output_files.push_back(path);
+                if (payload_out_hex.is_open()) d_output_files.push_back(path);
             }
             if (payload_out_hex.is_open()) {
                 char buf[8];
@@ -404,8 +393,7 @@ namespace fengyun4
             if (!payload_out_bin.is_open()) {
                 std::string path = d_output_file_hint + ".bin";
                 payload_out_bin.open(path, std::ios::binary | std::ios::app);
-                if (payload_out_bin.is_open())
-                    d_output_files.push_back(path);
+                if (payload_out_bin.is_open()) d_output_files.push_back(path);
             }
             if (payload_out_bin.is_open()) {
                 payload_out_bin.write((const char *)data, len);
@@ -426,39 +414,28 @@ namespace fengyun4
 
                 if (input_data_type == DATA_FILE && file_source) {
                     filesize = file_source->getFilesize();
-                    file_source->start();
                 } else {
                     filesize = 0;
                 }
 
-                std::shared_ptr<dsp::stream<complex_t>> in_stream = (input_data_type == DATA_FILE) ? file_source->output_stream : input_stream;
-                if (!in_stream) return;
+                BaseDemodModule::start();
 
                 time_t lastTime = 0;
 
                 while (demod_should_run() && !stop_requested.load()) {
-                    int n = in_stream->read();
+                    int n = agc->output_stream->read();
                     if (n < 0) break;
 
-                    if (n > 0 && in_stream->readBuf) {
-                        complex_t *buf = in_stream->readBuf;
+                    if (n > 0 && agc->output_stream->readBuf) {
+                        complex_t *buf = agc->output_stream->readBuf;
                         
-                        // 降低 SNR 和 UI 刷新率，避免高 CPU 占用
-                        block_count++;
-                        if (block_count % 8 == 0) {
-                            snr_estimator.update(buf, n);
-                            current_snr = snr_estimator.snr();
-                            if (current_snr > peak_snr) peak_snr = current_snr;
-                            avg_snr = (avg_snr * total_snr_samples + current_snr) / (total_snr_samples + 1);
-                            total_snr_samples++;
+                        // 删除了自定义SNR，使用基类的 snr_estimator
+                        snr_estimator.update(buf, n);
+                        snr = snr_estimator.snr();
+                        if (snr > peak_snr) peak_snr = snr;
 
-                            for (int i = 0; i < n; i += 64) { // 每 64 个样本推入一次星座图
-                                complex_t s = buf[i];
-                                if (s.real*s.real + s.imag*s.imag > 1e-12) {
-                                    constellation.pushComplex(&s, 1);
-                                }
-                            }
-                        }
+                        // 星座图：由于 LoRa 是宽带信号，推入时直接按 1/10 抽样即可
+                        constellation.pushComplex(buf, n);
 
                         for (int i = 0; i < n; i++) {
                             complex_t s = buf[i];
@@ -469,7 +446,7 @@ namespace fengyun4
                             sample_buffer.push_back(s);
                         }
                     }
-                    in_stream->flush();
+                    agc->output_stream->flush();
 
                     size_t overlap = (size_t)preamble_len * sample_num + 16 * sample_num;
                     while (true) {
@@ -616,13 +593,12 @@ namespace fengyun4
                             double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
                             logger->info("Progress " + std::to_string(pct) + "%");
                         } else {
-                            logger->info("Live Mode: Packets OK=%d, CRC fail=%d, SNR=%.1f dB", packets_ok, packets_crc_fail, current_snr);
+                            logger->info("Live Mode: Packets OK=%d, CRC fail=%d, SNR=%.1f dB", packets_ok, packets_crc_fail, snr);
                         }
                     }
                 }
 
-                if (input_data_type == DATA_FILE && file_source)
-                    file_source->stop();
+                BaseDemodModule::stop();
 
                 if (payload_out_bin.is_open()) payload_out_bin.close();
                 if (payload_out_hex.is_open()) payload_out_hex.close();
@@ -638,16 +614,15 @@ namespace fengyun4
             read_pos = 0;
             sample_buffer.clear();
             preamble_bins.clear();
-            current_snr = 0;
+            snr = 0;
             peak_snr = 0;
-            avg_snr = 0;
-            total_snr_samples = 0;
         }
 
         void LoRaDemodModule::drawUI(bool window)
         {
             ImGui::Begin("Generic LoRa Demod", NULL, window ? 0 : NOWINDOW_FLAGS);
 
+            // --- 恢复星座图 ---
             ImGui::BeginGroup();
             constellation.draw();
             ImGui::EndGroup();
@@ -664,22 +639,26 @@ namespace fengyun4
 
                 ImGui::Text("SNR : ");
                 ImGui::SameLine();
-                if (std::isnan(current_snr)) {
+                if (std::isnan(snr)) {
                     ImGui::TextColored(style::theme.red, "NaN");
-                } else if (current_snr > 30.0f) {
+                } else if (snr > 30.0f) {
                     ImGui::TextColored(style::theme.green, "inf");
-                } else if (current_snr > 5.0f) {
-                    ImGui::TextColored(style::theme.green, "%.1f dB", current_snr);
-                } else if (current_snr < 2.0f) {
-                    ImGui::TextColored(style::theme.red, "%.1f dB", current_snr);
+                } else if (snr > 5.0f) {
+                    ImGui::TextColored(style::theme.green, "%.1f dB", snr);
+                } else if (snr < 2.0f) {
+                    ImGui::TextColored(style::theme.red, "%.1f dB", snr);
                 } else {
-                    ImGui::TextColored(style::theme.yellow, "%.1f dB", current_snr);
+                    ImGui::TextColored(style::theme.yellow, "%.1f dB", snr);
                 }
 
                 ImGui::Text("Peak SNR: %.1f dB", peak_snr);
-                ImGui::Text("Avg SNR : %.1f dB", avg_snr);
                 
-                snr_plot.draw(current_snr, peak_snr);
+                // --- 恢复内置 FFT 绘制 ---
+                if (!streamingInput)
+                    if (ImGui::Checkbox("Show FFT", &show_fft))
+                        fft_splitter->set_enabled("fft", show_fft);
+
+                snr_plot.draw(snr, peak_snr);
             }
             ImGui::EndGroup();
 
@@ -690,6 +669,9 @@ namespace fengyun4
 
             drawStopButton();
             ImGui::End();
+
+            // --- 绘制内置 FFT ---
+            drawFFT();
         }
 
         std::string LoRaDemodModule::getID() { return "lora_demod"; }
