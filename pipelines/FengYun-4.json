@@ -17,6 +17,7 @@
             "baseband": {},
             "soft": {
                 "lora_demod": {
+                    "samplerate":6e6
                     "symbolrate": 812500,
                     "sf": 9,
                     "bw": 812500,

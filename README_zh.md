@@ -84,7 +84,7 @@ satdump record baseband_name --source airspy --samplerate 6e6 --frequency 1701.3
 # 构建 / 安装
 
 ### Windows
-最快上手的方式是前往 [Releases](https://github.com/altillimity/SatDump/releases) 页面，在那里您可以下载 SatDump 的安装程序或便携版应用——无需编译。
+最快上手的方式是前往 [Actions](https://github.com/MC-blone/Satdump-1.2.3/actions) 页面，在那里您可以下载 SatDump 的安装程序或便携版应用——无需编译。
 
 我们的构建版本使用 Visual Studio 2019 针对 x64 构建，因此需要相应的 Visual C++ 运行库（不过很可能已经安装）。您可以在[此处](https://support.microsoft.com/en-us/topic/the-latest-supported-visual-c-downloads-2647da03-1eea-4433-9aff-95f26a218cc0)获取。下载后，运行 satdump-ui.exe 或 satdump.exe（命令行版）即可开始使用！
 
@@ -100,7 +100,7 @@ satdump record baseband_name --source airspy --samplerate 6e6 --frequency 1701.3
 brew install cmake dylibbundler pkg-config libtool autoconf automake meson
 
 # Clone SatDump
-git clone https://github.com/SatDump/SatDump.git && cd SatDump
+git clone https://github.com/MC-blone/Satdump-1.2.3.git && cd Satdump-1.2.3
 
 # Build dependencies
 ./macOS/Configure-vcpkg.sh
@@ -288,8 +288,8 @@ rm -rf nng
 
 #### 构建 SatDump
 ```bash
-git clone https://github.com/SatDump/SatDump.git
-cd SatDump
+git clone https://github.com/MC-blone/Satdump-1.2.3.git
+cd Satdump-1.2.3
 mkdir build && cd build
 # If you do not want to build the GUI Version, add -DBUILD_GUI=OFF to the command
 # If you want to disable some SDRs, you can add -DPLUGIN_HACKRF_SDR_SUPPORT=OFF or similar
@@ -314,13 +314,9 @@ sudo make install
   
 ### Android
 
-在 Android 上，推荐的首选来源是 F-Droid。
+在 Android 上，来源只有Relasls或Actions中的文件
 
-[<img src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png"
-    alt="Get it on F-Droid"
-    height="80">](https://f-droid.org/packages/org.satdump.SatDump)
-
-如果这对您来说不是可行方案，[Release](https://github.com/altillimity/SatDump/releases) 页面也提供 APK。
+[Release](https://github.com/MC-blone/Satdump-1.2.3/actions) 页面也提供 APK。
 
 请记住，虽然几乎所有的功能在 Android 上都能完美运行，但在某些地方可能会受到限制（可能是由于硬件原因）。例如，并非所有 SDR 设备都可以使用。
 支持的 SDR 设备包括：
@@ -331,46 +327,7 @@ sudo make install
 - HackRF
 
 ### Docker
+目前暂不提供Docker,请自行准备部署
 
-在 Docker 中构建和运行是隔离构建环境、库与主机操作系统的一个好方法。
-构建过程采用多阶段构建，使用两个镜像：一个包含 -dev 包，另一个用于运行时。
-这意味着运行时镜像可以保持较小，尽管完成构建仍需要占用磁盘空间。
 
-为了让共享文件的属主与系统用户匹配，请在构建镜像前在 `.env` 中设置这些值。
-容器内的用户始终命名为 `satdump`，但 uid 和 gid 将与系统用户匹配。
-
-```bash
-# set the current uid and gid 
-printf "HOST_UID: $(id -u)\nHOST_GID: $(id -g)\n" > .env
-
-# create the shared directory
-mkdir -p srv
-
-# Build the images with compose, 8 parallel
-docker compose build --build-arg CMAKE_BUILD_PARALLEL_LEVEL=8
-
-# Launch a shell inside the container/service
-docker compose run --rm -it satdump
-```
-
-容器内启动的命令可以在上述命令行的末尾指定，
-也可以在 `.env` 中设置，例如 `COMMAND: satdump_sdr_server`。如果您想在后台运行 sdr 服务器并在开机时自动启动，只需使用 `docker compose up -d` 启动容器，并用
-`docker compose logs -f` 查看日志。
-
-#### Docker 下的 X11
-
-要在 Docker 下使用 `satdump-ui`，需要进行一些改动。
-也可以在 WSL2 上运行，此时将源改为 `/run/desktop/mnt/host/wslg/.X11-unix`。
-在 [docker-compose.yml](docker-compose.yml) 中，您需要取消注释几行，使其如下所示：
-```yaml
-      - type: 'bind'
-        source: '/tmp/.X11-unix'
-        target: '/tmp/.X11-unix'
-```
-
-如果容器内的用户没有 X11 授权，您可能会看到如下错误信息：
-`Authorization required, ...`
-这是由于控制屏幕访问权限的 ACL 所致。
-有几种方法可以解决这个问题，有些方法非常宽松且不安全，但以下方法在非共享系统上应该是可以接受的。
-
-在主机上运行：`xhost +local:docker`，然后启动 UI：`docker compose run --rm -it satdump satdump-ui`
+-----MC_blone

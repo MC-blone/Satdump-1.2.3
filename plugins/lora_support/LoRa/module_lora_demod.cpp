@@ -15,6 +15,7 @@ namespace fengyun4
 {
     namespace emwin
     {
+        // ================= 核心算法辅助函数 =================
         static uint8_t xorbits16(uint16_t data, uint16_t mask) {
             uint16_t v = data & mask;
             uint8_t r = 0;
@@ -69,6 +70,7 @@ namespace fengyun4
                                 ((reg >> 4) & 1) ^ ((reg >> 3) & 1));
             }
         }
+        // ====================================================
 
         LoRaDemodModule::LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
             : BaseDemodModule(input_file, output_file_hint, parameters)
@@ -103,11 +105,8 @@ namespace fengyun4
         {
             BaseDemodModule::initb();
             
-            // 自动获取采样率：如果底层 file_source 能够识别真实采样率（如 WAV 头），就采用它
-            if (input_data_type == DATA_FILE && file_source) {
-                int fs = (int)file_source->getSamplerate();
-                if (fs > 0) d_samplerate = fs;
-            }
+            // 信任上层传入的采样率，如果是 0 则安全兜底
+            if (d_samplerate <= 0) d_samplerate = 2048000; 
 
             sample_num = (int)std::round(std::pow(2.0, sf) * (double)d_samplerate / (double)bw_hz);
             if (sample_num <= 0) sample_num = 1291;
@@ -130,7 +129,7 @@ namespace fengyun4
                 return;
             }
             
-            // 关键优化：初始全清空一次，后面不再重复清空
+            // 初始全清空一次，后续不再重复清空
             memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
             
             fft_plan = fftwf_plan_dft_1d(fft_len, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
@@ -176,7 +175,7 @@ namespace fengyun4
             const auto& chp = is_up ? chirp_down : chirp_up;
             size_t signal_len = std::min((size_t)sample_num, buf.size() - pos);
             
-            // 极速优化：不再 memset，因为初始已经清零，且后续只覆盖前 sample_num 个。
+            // 速度优化：不再 memset，因为初始已经清零，且后续只覆盖前 sample_num 个。
             for (size_t i = 0; i < signal_len; ++i) {
                 complex_t a = buf[pos + i];
                 complex_t b = chp[i];
@@ -189,7 +188,7 @@ namespace fengyun4
 
             float best_mag = 0.0f;
             int best = 0;
-            // 极速优化：去除 std::hypot，直接比较平方和
+            // 速度优化：去除 std::hypot，直接比较平方和
             for (int i = 0; i < bin_num; ++i) {
                 float m1sq = fft_out[i][0]*fft_out[i][0] + fft_out[i][1]*fft_out[i][1];
                 float m2sq = fft_out[fft_len - bin_num + i][0]*fft_out[fft_len - bin_num + i][0] + 
@@ -444,7 +443,7 @@ namespace fengyun4
                     if (n > 0 && in_stream->readBuf) {
                         complex_t *buf = in_stream->readBuf;
                         
-                        // 优化：降低 SNR 和 UI 刷新率，避免高 CPU 占用
+                        // 降低 SNR 和 UI 刷新率，避免高 CPU 占用
                         block_count++;
                         if (block_count % 8 == 0) {
                             snr_estimator.update(buf, n);

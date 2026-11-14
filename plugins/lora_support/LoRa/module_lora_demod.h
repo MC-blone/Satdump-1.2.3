@@ -18,25 +18,31 @@ namespace fengyun4
         class LoRaDemodModule : public demod::BaseDemodModule
         {
         protected:
+            // ---------- 配置参数 ----------
             int sf = 9;
             int bw_hz = 812500;
             int preamble_len = 6;
             int zero_padding_ratio = 10;
 
+            // ---------- 派生尺寸 ----------
             int sample_num = 1291;
             int bin_num = 5120;
             int fft_len = 12910;
 
+            // ---------- FFTW ----------
             fftwf_complex *fft_in = nullptr;
             fftwf_complex *fft_out = nullptr;
             fftwf_plan fft_plan = nullptr;
 
+            // ---------- Chirp ----------
             std::vector<complex_t> chirp_up;
             std::vector<complex_t> chirp_down;
 
+            // ---------- 连续输入缓冲 ----------
             std::vector<complex_t> sample_buffer;
             size_t read_pos = 0;
 
+            // ---------- 同步与解码状态 ----------
             std::vector<int> preamble_bins;
             int preamble_bin = 0;
             double cfo_hz = 0.0;
@@ -46,18 +52,23 @@ namespace fengyun4
             bool header_has_crc = true;
             bool ldro = false;
 
+            // 去直流状态
             complex_t dc_state;
             const float dc_alpha = 0.999f;
 
+            // ---------- 输出文件 ----------
             std::ofstream payload_out_bin;
             std::ofstream payload_out_hex;
 
+            // 停止机制
             std::atomic<bool> stop_requested{false};
 
+            // ---------- 统计与 UI 状态 ----------
             int packets_ok = 0;
             int packets_crc_fail = 0;
             int last_syms = 0;
             
+            // SNR 相关
             M2M4SNREstimator snr_estimator;
             float current_snr = 0;
             float peak_snr = 0;
@@ -66,6 +77,7 @@ namespace fengyun4
             double display_freq = 0.0;
             int block_count = 0; // 用于降低 UI 刷新频率
 
+            // ---------- 内部方法 ----------
             void init_chirps(double fs);
             std::pair<float, int> dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up = true);
             int peak_idx_to_symbol(int peak_idx, int pre_bin);
@@ -88,7 +100,7 @@ namespace fengyun4
 
         public:
             LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
-            ~LoRaDemodModule();
+            ~LoRaDemodModule() override; // <-- 添加了 override 以消除警告
 
             void stop() override;
             void init() override;

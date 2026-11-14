@@ -1,7 +1,10 @@
+**Language / 语言：** [English](README.md) | [简体中文](README_zh.md)
+
 # SatDump
-[English](README.md) | [简体中文](README_zh.md)
+
+Modified by: *MC_blone*
+
 <img src='/icon.png' width='500px' />
-Modify and edit: *MC_blone*
 
 A generic satellite data processing software.
 *Thanks Crosswalkersam for the icon!*
@@ -10,7 +13,7 @@ There now also is a [Matrix](https://matrix.to/#/#satdump:altillimity.com) room 
 
 # Introduction
 
-*Note : This is a very basic "how-to" skipping details and assuming some knowledge of what you are doing. For more details and advanced use cases, please see the [detailed documentation](https://docs.satdump.org).* 
+*Note : This is a very basic "how-to" skipping details and assuming some knowledge of what you are doing. For more details and advanced use cases, please see the [detailed documentation](https://docs.satdump.org).*
 
 ## GUI Version
 
@@ -44,7 +47,7 @@ Quick-Start :
 
 ### Offline processing
 
-```
+```bash
 Usage : satdump [pipeline_id] [input_level] [input_file] [output_file_or_directory] [additional options as required]
 Extra options (examples. Any parameter used in modules can be used here) :
   --samplerate [baseband_samplerate] --baseband_format [cf32/cs32/cs16/cs8/cu8] --dc_block --iq_swap
@@ -56,7 +59,7 @@ You can find a list of Satellite pipelines and their parameters [Here](https://d
 
 ### Live processing
 
-```
+```bash
 Usage : satdump live [pipeline_id] [output_file_or_directory] [additional options as required]
 Extra options (examples. Any parameter used in modules or sources can be used here) :
   --samplerate [baseband_samplerate] --baseband_format [cf32/cs32/cs16/cs8/w8] --dc_block --iq_swap
@@ -70,7 +73,7 @@ You can find a list of all SDR Options [Here](https://docs.satdump.org/sdr_optio
 
 ### Recording
 
-```
+```bash
 Usage : satdump record [output_baseband (without extension!)] [additional options as required]
 Extra options (examples. Any parameter used in sources can be used here) :
   --samplerate [baseband_samplerate] --baseband_format [cf32/cs32/cs16/cs8/cu8/w16] --dc_block --iq_swap
@@ -83,9 +86,9 @@ satdump record baseband_name --source airspy --samplerate 6e6 --frequency 1701.3
 # Building / Installing
 
 ### Windows
-The fastest way to get started is to head over to the [Releases](https://github.com/altillimity/SatDump/releases) page, where you can download SatDump's installer or portable app - no compilation necessary.
+The fastest way to get started is to head over to the [Actions](https://github.com/MC-blone/Satdump-1.2.3/actions) page, where you can download SatDump's installer or portable app - no compilation necessary.
 
-Our builds are made with Visual Studio 2019 for x64, so the appropriate Visual C++ Runtime will be required (though, likely to be already installed). You can get it [here](https://support.microsoft.com/en-us/topic/the-latest-supported-visual-c-downloads-2647da03-1eea-4433-9aff-95f26a218cc0).   Once downloaded, run either satdump-ui.exe or satdump.exe (CLI) to get started!
+Our builds are made with Visual Studio 2019 for x64, so the appropriate Visual C++ Runtime will be required (though, likely to be already installed). You can get it [here](https://support.microsoft.com/en-us/topic/the-latest-supported-visual-c-downloads-2647da03-1eea-4433-9aff-95f26a218cc0). Once downloaded, run either satdump-ui.exe or satdump.exe (CLI) to get started!
 
 For compilation information, see the dedicated documentation [here](https://docs.satdump.org/build_windows.html). *Note : Mingw builds are NOT supported, VOLK will not work.*
 
@@ -99,7 +102,7 @@ General build instructions (Brew and XCode command line tools required)
 brew install cmake dylibbundler pkg-config libtool autoconf automake meson
 
 # Clone SatDump
-git clone https://github.com/SatDump/SatDump.git && cd SatDump
+git clone https://github.com/MC-blone/Satdump-1.2.3.git && cd Satdump-1.2.3
 
 # Build dependencies
 ./macOS/Configure-vcpkg.sh
@@ -286,9 +289,9 @@ rm -rf nng
 ```
 
 #### Build SatDump
-```
-git clone https://github.com/SatDump/SatDump.git
-cd SatDump
+```bash
+git clone https://github.com/MC-blone/Satdump-1.2.3.git
+cd Satdump-1.2.3
 mkdir build && cd build
 # If you do not want to build the GUI Version, add -DBUILD_GUI=OFF to the command
 # If you want to disable some SDRs, you can add -DPLUGIN_HACKRF_SDR_SUPPORT=OFF or similar
@@ -309,18 +312,13 @@ sudo make install
 
 ### Raspberry Pi
 
-In case you are using RPi3 (any revision) and older. Run ```make -j1 ``` instead of ```make -j`nproc` ``` otherwise the system will crash.
+In case you are using RPi3 (any revision) and older, run `make -j1` instead of `make -j\`nproc\``, otherwise the system will crash.
   
 ### Android
 
-On Android, the preferred source is F-Droid.
+On Android, the only sources are files from Releases or Actions.
 
-[<img src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png"
-    alt="Get it on F-Droid"
-    height="80">](https://f-droid.org/packages/org.satdump.SatDump)
-
-
-If this is not an option for you, APKs are also available on the [Release](https://github.com/altillimity/SatDump/releases) page.
+APKs are also available on the [Actions](https://github.com/MC-blone/Satdump-1.2.3/actions) page.
 
 Do keep in mind that while pretty much all features perfectly function on Android, there may be some limitations (either due to the hardware) in some places. For example, not all SDR Devices can be used.
 Supported SDR devices are :
@@ -330,49 +328,7 @@ Supported SDR devices are :
 - LimeSDR Mini
 - HackRF
 
-
 ### Docker
+Docker is not currently provided. Please prepare and deploy it yourself.
 
-Building and running under docker is a nice way to separate the build environment and libraries from the host OS.
-The build process is a multistage build that uses two images, one with the -dev packages and another for the runtime.
-This means that the runtime image can be kept smaller, although the disk space is still needed to complete the build.
-
-To match the system user for the shared files get the same owner, set these in `.env` before building the image.
-The user inside the container will always be named `satdump`, but the uid and gid will match the system user.
-
-```bash
-# set the current uid and gid 
-printf "HOST_UID: $(id -u)\nHOST_GID: $(id -g)\n" > .env
-
-# create the shared directory
-mkdir -p srv
-
-# Build the images with compose, 8 parallel
-docker compose build --build-arg CMAKE_BUILD_PARALLEL_LEVEL=8
-
-# Launch a shell inside the container/service
-docker compose run --rm -it satdump
-```
-
-The command that is started inside the container can either be specified at the end on the commandline mentioned above, 
-or put in the `.env` with for example `COMMAND: satdump_sdr_server`. If you want to run the sdr server in the background
-and have it start automatically on boot, simply launch the container with `docker compose up -d` and check the logs with
-`docker compose logs -f`
-
-#### X11 under docker
-
-To use the `satdump-ui` under docker you need to make a few changes.
-It is possible to run this on WSL2 as well, change the source to `/run/desktop/mnt/host/wslg/.X11-unix` instead.
-In the [docker-compose.yml](docker-compose.yml) you need to uncomment a few lines and make it looks like this:
-```yaml
-      - type: 'bind'
-        source: '/tmp/.X11-unix'
-        target: '/tmp/.X11-unix'
-```
-
-If the user in the container is not authorized for X11, you will probably get this error message:
-`Authorization required, ...`
-This is due to the ACL controlling access to your screen.
-There's several ways to solve this, a few very broad and insecure, but the following should be acceptable on a non-shared system.
-
-On the host, run: `xhost +local:docker` , then to start the ui: `docker compose run --rm -it satdump satdump-ui`
+-----MC_blone
