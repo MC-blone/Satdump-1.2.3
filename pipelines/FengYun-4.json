@@ -13,23 +13,34 @@
         "frequencies": [
             ["EMWIN", 1697e6]
         ],
+        "parameters": {
+            "sf": {
+                "type": "int",
+                "value": 9,
+                "name": "Spreading Factor",
+                "description": "LoRa SF (7-12)"
+            },
+            "bw": {
+                "type": "int",
+                "value": 812500,
+                "name": "Bandwidth",
+                "description": "LoRa Bandwidth in Hz"
+            }
+        },
         "work": {
             "baseband": {},
             "soft": {
                 "lora_demod": {
                     "symbolrate": 812500,
-                    "sf": 9,
-                    "bw": 812500
-                }
-            },
-            "cadu":{
-                "emwin_cadu_decoder":{
-                    "sf":9
+                    "sf": "${sf}",
+                    "bw": "${bw}",
+                    "preamble_len": 6,
+                    "zero_padding_ratio": 10
                 }
             },
             "products": {
                 "emwin_text_decoder": {
-                    "sf": 9
+                    "sf": "${sf}"
                 }
             }
         }
