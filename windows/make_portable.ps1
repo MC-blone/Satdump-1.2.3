@@ -14,7 +14,23 @@ if (!(Test-Path "$binary_path\satdump.exe")) {
     $binary_path = $build_path
 }
 
-$plugin_path = Join-Path $binary_path "plugins"
+# ---- 探测插件目录：兼容 VS 多配置生成器的两种布局 ----
+$config = "Release"
+$plugin_candidates = @(
+    (Join-Path $binary_path "plugins"),                              # build\Release\plugins
+    (Join-Path $binary_path "plugins\$config"),                      # build\Release\plugins\Release
+    (Join-Path $build_path "plugins\$config"),                       # build\plugins\Release  ← ARM64 命中这里
+    (Join-Path $build_path "$config\plugins"),                       # build\Release\plugins
+    (Join-Path $build_path "plugins")                                # build\plugins
+) | Select-Object -Unique
+
+$plugin_path = $plugin_candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $plugin_path) {
+    throw "Cannot find plugins directory. Tried: $($plugin_candidates -join '; ')"
+}
+Write-Output "Using plugins directory: $plugin_path"
+# ------------------------------------------------------
+
 $vcpkg_bin = Join-Path $source_path "vcpkg\installed\$triplet\bin"
 
 if (!(Test-Path "$binary_path\satdump.exe")) {
@@ -22,9 +38,6 @@ if (!(Test-Path "$binary_path\satdump.exe")) {
 }
 if (!(Test-Path "$binary_path\satdump-ui.exe")) {
     throw "Cannot find satdump-ui.exe"
-}
-if (!(Test-Path $plugin_path)) {
-    throw "Cannot find plugins directory: $plugin_path"
 }
 if (!(Test-Path $vcpkg_bin)) {
     throw "Cannot find vcpkg DLL directory: $vcpkg_bin"
@@ -103,6 +116,9 @@ foreach ($req_dll in $dll_array)
 $available_dlls = @()
 $available_dlls += Get-ChildItem $vcpkg_bin -File -Filter "*.dll"
 $available_dlls += Get-ChildItem $binary_path -File -Filter "*.dll"
+if ($plugin_path -ne $binary_path) {
+    $available_dlls += Get-ChildItem $plugin_path -File -Filter "*.dll"
+}
 
 $available_dlls = @(
     $available_dlls | Sort-Object FullName -Unique

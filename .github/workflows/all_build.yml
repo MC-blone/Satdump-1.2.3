@@ -292,27 +292,20 @@ jobs:
             exit 1
           fi
 
-          # 1. 清理 pkg2appimage 生成的断链 .DirIcon
-          rm -f "$APPDIR/.DirIcon"
-
-          # 2. 用仓库根目录的 icon.png 现场转成 256x256 PNG，放进 AppDir
-          ffmpeg -y -loglevel error -i "$GITHUB_WORKSPACE/icon.png" -vf "scale=256:256" "$APPDIR/icon.png"
+          # 不维护图标：ffmpeg 现场生成 256x256 透明占位 PNG
+          rm -f "$APPDIR/.DirIcon" "$APPDIR/icon.png" "$APPDIR/satdump.png"
+          ffmpeg -y -loglevel error \
+            -f lavfi -i "color=c=black@0.0:s=256x256:d=1" \
+            -frames:v 1 -pix_fmt rgba "$APPDIR/icon.png"
           cp "$APPDIR/icon.png" "$APPDIR/satdump.png"
 
-          # 3. 兼容旧 Icon= 绝对路径，同时铺一份到 hicolor
-          mkdir -p "$APPDIR/usr/share/satdump" \
-                   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-          cp "$APPDIR/icon.png" "$APPDIR/usr/share/satdump/icon.png"
-          cp "$APPDIR/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/satdump.png"
-
-          # 4. 把 desktop 的 Icon= 改成相对名（AppImage 规范）
+          # desktop 的 Icon= 改相对名，避免引用 /usr/share/...
           DESKTOP_FILE=$(find "$APPDIR" -maxdepth 1 -name "*.desktop" | head -1)
           if [ -n "$DESKTOP_FILE" ]; then
             sed -i 's|^Icon=.*|Icon=satdump|' "$DESKTOP_FILE"
             grep '^Icon=' "$DESKTOP_FILE"
           fi
 
-          # 5. .DirIcon 指向 AppDir 内部真实文件
           ln -sf satdump.png "$APPDIR/.DirIcon"
 
           wget -c https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
