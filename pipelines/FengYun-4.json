@@ -17,17 +17,18 @@
             "baseband": {},
             "soft": {
                 "lora_demod": {
-                    "samplerate":6e6
+                    "samplerate":6e6,
                     "symbolrate": 812500,
                     "sf": 9,
                     "bw": 812500,
                     "preamble_len": 6,
                     "zero_padding_ratio": 10
                 }
-            /*"products": {
+            },
+            "products": {
                 "emwin_text_decoder": {
                     "sf": 9
-                }*/
+                }
             }
         }
     },
