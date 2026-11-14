@@ -274,26 +274,51 @@ jobs:
         run: |
           wget https://raw.githubusercontent.com/probonopd/AppImages/master/pkg2appimage
           chmod +x pkg2appimage
-          sudo apt install -y imagemagick desktop-file-utils libfuse2
+          sudo apt install -y imagemagick desktop-file-utils libfuse2 ffmpeg
 
       - name: Make AppImage
         working-directory: ${{runner.workspace}}/build
         shell: bash
         run: |
+          set -e
           cp *.deb /tmp/satdump.deb
           cp $GITHUB_WORKSPACE/SatDump.yml .
           ./pkg2appimage SatDump.yml || true
 
-          if [ -d "SatDump/SatDump.AppDir" ]; then
-            rm -f SatDump/SatDump.AppDir/.DirIcon
-            wget -c https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
-            chmod +x appimagetool
-            mkdir -p out
-            ./appimagetool SatDump/SatDump.AppDir out/SatDump-x86_64.AppImage
-          else
+          APPDIR="SatDump/SatDump.AppDir"
+          if [ ! -d "$APPDIR" ]; then
             echo "AppDir not found, pkg2appimage failed"
+            ls -la
             exit 1
           fi
+
+          # 1. 清理 pkg2appimage 生成的断链 .DirIcon
+          rm -f "$APPDIR/.DirIcon"
+
+          # 2. 用仓库根目录的 icon.png 现场转成 256x256 PNG，放进 AppDir
+          ffmpeg -y -loglevel error -i "$GITHUB_WORKSPACE/icon.png" -vf "scale=256:256" "$APPDIR/icon.png"
+          cp "$APPDIR/icon.png" "$APPDIR/satdump.png"
+
+          # 3. 兼容旧 Icon= 绝对路径，同时铺一份到 hicolor
+          mkdir -p "$APPDIR/usr/share/satdump" \
+                   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp "$APPDIR/icon.png" "$APPDIR/usr/share/satdump/icon.png"
+          cp "$APPDIR/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/satdump.png"
+
+          # 4. 把 desktop 的 Icon= 改成相对名（AppImage 规范）
+          DESKTOP_FILE=$(find "$APPDIR" -maxdepth 1 -name "*.desktop" | head -1)
+          if [ -n "$DESKTOP_FILE" ]; then
+            sed -i 's|^Icon=.*|Icon=satdump|' "$DESKTOP_FILE"
+            grep '^Icon=' "$DESKTOP_FILE"
+          fi
+
+          # 5. .DirIcon 指向 AppDir 内部真实文件
+          ln -sf satdump.png "$APPDIR/.DirIcon"
+
+          wget -c https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          mkdir -p out
+          ./appimagetool "$APPDIR" out/SatDump-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4

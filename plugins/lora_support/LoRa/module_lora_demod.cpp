@@ -15,7 +15,6 @@ namespace fengyun4
 {
     namespace emwin
     {
-        // ================= 核心算法辅助函数 =================
         static uint8_t xorbits16(uint16_t data, uint16_t mask) {
             uint16_t v = data & mask;
             uint8_t r = 0;
@@ -70,7 +69,6 @@ namespace fengyun4
                                 ((reg >> 4) & 1) ^ ((reg >> 3) & 1));
             }
         }
-        // ====================================================
 
         LoRaDemodModule::LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
             : BaseDemodModule(input_file, output_file_hint, parameters)
@@ -87,7 +85,7 @@ namespace fengyun4
 
             MIN_SPS = 1.0f;
             MAX_SPS = 1e9f;
-            if (d_symbolrate <= 0) d_symbolrate = (int)d_samplerate;
+            if (d_symbolrate <= 0) d_symbolrate = (int)bw_hz;
 
             name = "Generic LoRa Demod";
             show_freq = true;
@@ -105,19 +103,41 @@ namespace fengyun4
         {
             BaseDemodModule::initb();
             
-            // 采样率自适应：使用 final_samplerate 动态计算样本点数
-            sample_num = (int)std::round(std::pow(2.0, sf) * (double)final_samplerate / (double)bw_hz);
+            // 自动获取采样率：如果底层 file_source 能够识别真实采样率（如 WAV 头），就采用它
+            if (input_data_type == DATA_FILE && file_source) {
+                int fs = (int)file_source->getSamplerate();
+                if (fs > 0) d_samplerate = fs;
+            }
+
+            sample_num = (int)std::round(std::pow(2.0, sf) * (double)d_samplerate / (double)bw_hz);
+            if (sample_num <= 0) sample_num = 1291;
+            
             bin_num = zero_padding_ratio * (1 << sf);
             fft_len = sample_num * zero_padding_ratio;
+            
+            if (fft_len <= 0) return;
 
-            logger->info("LoRa Demod Init: FS=%f, BW=%d, SF=%d", final_samplerate, bw_hz, sf);
+            logger->info("LoRa Demod Init: FS=%d, BW=%d, SF=%d", d_samplerate, bw_hz, sf);
             logger->info("Calculated sample_num=%d, bin_num=%d, fft_len=%d", sample_num, bin_num, fft_len);
 
-            init_chirps((double)final_samplerate);
+            init_chirps((double)d_samplerate);
 
             fft_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_len);
             fft_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_len);
+            
+            if (!fft_in || !fft_out) {
+                logger->error("Failed to allocate FFTW arrays for LoRa Demod");
+                return;
+            }
+            
+            // 关键优化：初始全清空一次，后面不再重复清空
+            memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
+            
             fft_plan = fftwf_plan_dft_1d(fft_len, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
+            if (!fft_plan) {
+                logger->error("Failed to create FFTW plan for LoRa Demod");
+                return;
+            }
 
             sample_buffer.reserve((size_t)sample_num * 128);
         }
@@ -146,26 +166,21 @@ namespace fengyun4
         void LoRaDemodModule::stop()
         {
             stop_requested.store(true);
-            // 唤醒可能阻塞在 read() 上的数据流
-            if (agc && agc->output_stream)
-                agc->output_stream->stopReader();
+            if (input_data_type == DATA_FILE && file_source)
+                file_source->output_stream->stopReader();
         }
 
         std::pair<float, int> LoRaDemodModule::dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up)
         {
-            if (pos >= buf.size()) return {0.0f, 0};
+            if (pos >= buf.size() || !fft_in || !fft_plan) return {0.0f, 0};
             const auto& chp = is_up ? chirp_down : chirp_up;
             size_t signal_len = std::min((size_t)sample_num, buf.size() - pos);
             
-            // 使用 memset 清空 FFTW 数组
-            memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
-            
+            // 极速优化：不再 memset，因为初始已经清零，且后续只覆盖前 sample_num 个。
             for (size_t i = 0; i < signal_len; ++i) {
-                // 不能直接用 complex_t 的 * 运算符（因为它不是 const 成员），只能手动算
                 complex_t a = buf[pos + i];
                 complex_t b = chp[i];
                 complex_t v(a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real);
-                
                 fft_in[i][0] = v.real;
                 fft_in[i][1] = v.imag;
             }
@@ -174,13 +189,15 @@ namespace fengyun4
 
             float best_mag = 0.0f;
             int best = 0;
+            // 极速优化：去除 std::hypot，直接比较平方和
             for (int i = 0; i < bin_num; ++i) {
-                float m1 = std::hypot(fft_out[i][0], fft_out[i][1]);
-                float m2 = std::hypot(fft_out[fft_len - bin_num + i][0], fft_out[fft_len - bin_num + i][1]);
-                float m = m1 + m2;
-                if (m > best_mag) { best_mag = m; best = i; }
+                float m1sq = fft_out[i][0]*fft_out[i][0] + fft_out[i][1]*fft_out[i][1];
+                float m2sq = fft_out[fft_len - bin_num + i][0]*fft_out[fft_len - bin_num + i][0] + 
+                             fft_out[fft_len - bin_num + i][1]*fft_out[fft_len - bin_num + i][1];
+                float msq = m1sq + m2sq;
+                if (msq > best_mag) { best_mag = msq; best = i; }
             }
-            return {best_mag, best};
+            return {std::sqrt(best_mag), best}; // 仅在最后计算一次 sqrt
         }
 
         int LoRaDemodModule::peak_idx_to_symbol(int peak_idx, int pre_bin)
@@ -209,7 +226,6 @@ namespace fengyun4
                     int diff = (pk.back() - pk0) % bin_num;
                     if (diff < 0) diff += bin_num;
                     if (diff > bin_num / 2) diff = bin_num - diff;
-                    
                     if (diff <= zero_padding_ratio * 10) pk.push_back(pk0);
                     else pk = {pk0};
                 } else {
@@ -366,13 +382,10 @@ namespace fengyun4
 
         void LoRaDemodModule::emit_payload(const uint8_t *data, int len)
         {
-            // 实时流模式下，推入 FIFO 给下游
-            if (input_data_type == DATA_DSP_STREAM && output_fifo)
-            {
+            if (input_data_type == DATA_DSP_STREAM && output_fifo) {
                 output_fifo->write((uint8_t *)data, len);
             }
 
-            // 写入十六进制调试文件
             if (!payload_out_hex.is_open()) {
                 std::string path = d_output_file_hint + ".hex.txt";
                 payload_out_hex.open(path, std::ios::app);
@@ -389,7 +402,6 @@ namespace fengyun4
                 payload_out_hex.flush();
             }
 
-            // 写入原始二进制文件（用于气象云图）
             if (!payload_out_bin.is_open()) {
                 std::string path = d_output_file_hint + ".bin";
                 payload_out_bin.open(path, std::ios::binary | std::ios::app);
@@ -404,210 +416,222 @@ namespace fengyun4
 
         void LoRaDemodModule::process()
         {
-            stop_requested.store(false);
-            reset_sync_state();
+            try {
+                stop_requested.store(false);
+                reset_sync_state();
 
-            if (input_data_type == DATA_FILE && file_source)
-                filesize = file_source->getFilesize();
-            else
-                filesize = 0;
-
-            if (!agc) {
-                logger->error("AGC block not initialized");
-                return;
-            }
-
-            BaseDemodModule::start();
-            time_t lastTime = 0;
-
-            while (demod_should_run() && !stop_requested.load()) {
-                int n = agc->output_stream->read();
-                if (n < 0) break;
-
-                if (n > 0 && agc->output_stream->readBuf) {
-                    complex_t *buf = agc->output_stream->readBuf;
-                    
-                    // SNR 估计与伪星座图
-                    snr_estimator.update(buf, n);
-                    current_snr = snr_estimator.snr();
-                    if (current_snr > peak_snr) peak_snr = current_snr;
-                    avg_snr = (avg_snr * total_snr_samples + current_snr) / (total_snr_samples + 1);
-                    total_snr_samples++;
-
-                    // 将原始 IQ 推入星座图 (必须用 std::hypot)
-                    for (int i = 0; i < n; i++) {
-                        complex_t s = buf[i];
-                        if (std::hypot(s.real, s.imag) > 1e-6) {
-                            constellation.pushComplex(&s, 1);
-                        }
-                    }
-
-                    // 去直流并入缓冲
-                    for (int i = 0; i < n; i++) {
-                        complex_t s = buf[i];
-                        dc_state.real = s.real * (1.0f - dc_alpha) + dc_state.real * dc_alpha;
-                        dc_state.imag = s.imag * (1.0f - dc_alpha) + dc_state.imag * dc_alpha;
-                        
-                        s.real -= dc_state.real;
-                        s.imag -= dc_state.imag;
-                        sample_buffer.push_back(s);
-                    }
+                if (!fft_in || !fft_out || !fft_plan) {
+                    logger->error("LoRa Demod process() aborted: FFTW was not correctly initialized.");
+                    return;
                 }
-                agc->output_stream->flush();
 
-                // 状态机推进
-                size_t overlap = (size_t)preamble_len * sample_num + 16 * sample_num;
-                while (true) {
-                    size_t pkt_start;
-                    try {
-                        pkt_start = detect(sample_buffer, read_pos);
-                    } catch (...) {
-                        if (sample_buffer.size() > overlap) read_pos = sample_buffer.size() - overlap;
-                        else read_pos = 0;
-                        break; 
-                    }
+                if (input_data_type == DATA_FILE && file_source) {
+                    filesize = file_source->getFilesize();
+                    file_source->start();
+                } else {
+                    filesize = 0;
+                }
 
-                    if (pkt_start + (size_t)(5 * sample_num) > sample_buffer.size()) {
-                        read_pos = pkt_start; break;
-                    }
+                std::shared_ptr<dsp::stream<complex_t>> in_stream = (input_data_type == DATA_FILE) ? file_source->output_stream : input_stream;
+                if (!in_stream) return;
 
-                    SyncResult sr;
-                    try {
-                        sr = sync(sample_buffer, pkt_start);
-                    } catch (...) {
-                        read_pos = pkt_start + sample_num; continue;
-                    }
+                time_t lastTime = 0;
 
-                    display_freq = sr.cfo;
+                while (demod_should_run() && !stop_requested.load()) {
+                    int n = in_stream->read();
+                    if (n < 0) break;
 
-                    size_t ns = sr.new_start;
-                    if (ns + (size_t)(8 * sample_num) > sample_buffer.size()) {
-                        read_pos = pkt_start; break;
-                    }
+                    if (n > 0 && in_stream->readBuf) {
+                        complex_t *buf = in_stream->readBuf;
+                        
+                        // 优化：降低 SNR 和 UI 刷新率，避免高 CPU 占用
+                        block_count++;
+                        if (block_count % 8 == 0) {
+                            snr_estimator.update(buf, n);
+                            current_snr = snr_estimator.snr();
+                            if (current_snr > peak_snr) peak_snr = current_snr;
+                            avg_snr = (avg_snr * total_snr_samples + current_snr) / (total_snr_samples + 1);
+                            total_snr_samples++;
 
-                    std::vector<uint16_t> hsym(8);
-                    for (int i = 0; i < 8; ++i) {
-                        auto r = dechirp(sample_buffer, ns + (size_t)i * sample_num);
-                        hsym[i] = (uint16_t)peak_idx_to_symbol(r.second, sr.preamble_bin);
-                    }
-
-                    auto comp = dynamic_compensation(hsym, sr.cfo);
-                    auto gc = gray_coding(comp);
-                    std::vector<uint16_t> first8(gc.begin(), gc.begin() + std::min<size_t>(8, gc.size()));
-                    auto cw = diag_deinterleave(first8, sf - 2);
-                    auto nibbles = hamming_decode(cw, 8);
-
-                    if (nibbles.size() < 5) { read_pos = ns + 7 * sample_num; continue; }
-                    
-                    int p_len = nibbles[0] * 16 + nibbles[1];
-                    bool crc_en = (nibbles[2] & 1) != 0;
-                    int cr_val = nibbles[2] >> 1;
-                    
-                    std::vector<uint8_t> cdata(12);
-                    for (int i = 0; i < 3; ++i)
-                        for (int j = 0; j < 4; ++j)
-                            cdata[i * 4 + j] = (uint8_t)((nibbles[i] >> (3 - j)) & 1);
-                    auto cs = calc_checksum(cdata);
-                    bool h_valid = (cs[0] == (nibbles[3] & 1)) &&
-                                   (cs[1] == ((nibbles[4] >> 3) & 1)) &&
-                                   (cs[2] == ((nibbles[4] >> 2) & 1)) &&
-                                   (cs[3] == ((nibbles[4] >> 1) & 1)) &&
-                                   (cs[4] == (nibbles[4] & 1));
-
-                    if (!h_valid) { read_pos = ns + 7 * sample_num; continue; }
-
-                    payload_len = p_len;
-                    coding_rate = cr_val;
-                    header_has_crc = crc_en;
-                    ldro = false;
-                    if (2.0 * (1 << sf) / bw_hz > 16e-3) ldro = true;
-
-                    int sym_num = calc_sym_num(true, payload_len, coding_rate, header_has_crc, sf, ldro);
-                    if (ns + (size_t)sym_num * sample_num > sample_buffer.size()) {
-                        read_pos = pkt_start; break;
-                    }
-
-                    std::vector<uint16_t> syms(sym_num);
-                    for (int i = 0; i < 8; ++i) syms[i] = hsym[i];
-                    for (int i = 8; i < sym_num; ++i) {
-                        auto r = dechirp(sample_buffer, ns + (size_t)i * sample_num);
-                        syms[i] = (uint16_t)peak_idx_to_symbol(r.second, sr.preamble_bin);
-                    }
-
-                    auto comp_all = dynamic_compensation(syms, sr.cfo);
-                    auto gc_all = gray_coding(comp_all);
-
-                    std::vector<uint8_t> nib_all(nibbles.begin(), nibbles.begin() + 5);
-                    int rdd = coding_rate + 4;
-                    for (size_t i = 8; i + (size_t)rdd <= gc_all.size(); i += rdd) {
-                        int ppm = sf;
-                        if (ldro) ppm -= 2;
-                        std::vector<uint16_t> chunk(gc_all.begin() + i, gc_all.begin() + i + rdd);
-                        auto c_chunk = diag_deinterleave(chunk, ppm);
-                        auto nb = hamming_decode(c_chunk, rdd);
-                        nib_all.insert(nib_all.end(), nb.begin(), nb.end());
-                    }
-
-                    if (nib_all.size() % 2 == 1) nib_all.push_back(0);
-                    int data_len = (int)nib_all.size() / 2;
-                    std::vector<uint8_t> data(data_len);
-                    for (int i = 0; i < data_len; ++i) {
-                        data[i] = (uint8_t)((nib_all[2 * i + 1] << 4) | nib_all[2 * i]);
-                    }
-
-                    bool crc_ok = false;
-                    if (header_has_crc) {
-                        std::vector<uint8_t> just(data.begin(), data.begin() + std::min<size_t>(payload_len, data.size()));
-                        dewhiten(just);
-                        auto checksum = calc_crc(just);
-                        if (payload_len + 1 < (int)data.size()) {
-                            if (checksum.first == data[payload_len] && checksum.second == data[payload_len + 1]) {
-                                crc_ok = true;
+                            for (int i = 0; i < n; i += 64) { // 每 64 个样本推入一次星座图
+                                complex_t s = buf[i];
+                                if (s.real*s.real + s.imag*s.imag > 1e-12) {
+                                    constellation.pushComplex(&s, 1);
+                                }
                             }
                         }
-                        for (int i = 0; i < payload_len && i < (int)just.size(); ++i) data[i] = just[i];
-                    } else {
-                        dewhiten(data);
-                        crc_ok = true;
+
+                        for (int i = 0; i < n; i++) {
+                            complex_t s = buf[i];
+                            dc_state.real = s.real * (1.0f - dc_alpha) + dc_state.real * dc_alpha;
+                            dc_state.imag = s.imag * (1.0f - dc_alpha) + dc_state.imag * dc_alpha;
+                            s.real -= dc_state.real;
+                            s.imag -= dc_state.imag;
+                            sample_buffer.push_back(s);
+                        }
+                    }
+                    in_stream->flush();
+
+                    size_t overlap = (size_t)preamble_len * sample_num + 16 * sample_num;
+                    while (true) {
+                        size_t pkt_start;
+                        try {
+                            pkt_start = detect(sample_buffer, read_pos);
+                        } catch (...) {
+                            if (sample_buffer.size() > overlap) read_pos = sample_buffer.size() - overlap;
+                            else read_pos = 0;
+                            break; 
+                        }
+
+                        if (pkt_start + (size_t)(5 * sample_num) > sample_buffer.size()) {
+                            read_pos = pkt_start; break;
+                        }
+
+                        SyncResult sr;
+                        try {
+                            sr = sync(sample_buffer, pkt_start);
+                        } catch (...) {
+                            read_pos = pkt_start + sample_num; continue;
+                        }
+
+                        display_freq = sr.cfo;
+
+                        size_t ns = sr.new_start;
+                        if (ns + (size_t)(8 * sample_num) > sample_buffer.size()) {
+                            read_pos = pkt_start; break;
+                        }
+
+                        std::vector<uint16_t> hsym(8);
+                        for (int i = 0; i < 8; ++i) {
+                            auto r = dechirp(sample_buffer, ns + (size_t)i * sample_num);
+                            hsym[i] = (uint16_t)peak_idx_to_symbol(r.second, sr.preamble_bin);
+                        }
+
+                        auto comp = dynamic_compensation(hsym, sr.cfo);
+                        auto gc = gray_coding(comp);
+                        std::vector<uint16_t> first8(gc.begin(), gc.begin() + std::min<size_t>(8, gc.size()));
+                        auto cw = diag_deinterleave(first8, sf - 2);
+                        auto nibbles = hamming_decode(cw, 8);
+
+                        if (nibbles.size() < 5) { read_pos = ns + 7 * sample_num; continue; }
+                        
+                        int p_len = nibbles[0] * 16 + nibbles[1];
+                        bool crc_en = (nibbles[2] & 1) != 0;
+                        int cr_val = nibbles[2] >> 1;
+                        
+                        std::vector<uint8_t> cdata(12);
+                        for (int i = 0; i < 3; ++i)
+                            for (int j = 0; j < 4; ++j)
+                                cdata[i * 4 + j] = (uint8_t)((nibbles[i] >> (3 - j)) & 1);
+                        auto cs = calc_checksum(cdata);
+                        bool h_valid = (cs[0] == (nibbles[3] & 1)) &&
+                                       (cs[1] == ((nibbles[4] >> 3) & 1)) &&
+                                       (cs[2] == ((nibbles[4] >> 2) & 1)) &&
+                                       (cs[3] == ((nibbles[4] >> 1) & 1)) &&
+                                       (cs[4] == (nibbles[4] & 1));
+
+                        if (!h_valid) { read_pos = ns + 7 * sample_num; continue; }
+
+                        payload_len = p_len;
+                        coding_rate = cr_val;
+                        header_has_crc = crc_en;
+                        ldro = false;
+                        if (2.0 * (1 << sf) / bw_hz > 16e-3) ldro = true;
+
+                        int sym_num = calc_sym_num(true, payload_len, coding_rate, header_has_crc, sf, ldro);
+                        if (ns + (size_t)sym_num * sample_num > sample_buffer.size()) {
+                            read_pos = pkt_start; break;
+                        }
+
+                        std::vector<uint16_t> syms(sym_num);
+                        for (int i = 0; i < 8; ++i) syms[i] = hsym[i];
+                        for (int i = 8; i < sym_num; ++i) {
+                            auto r = dechirp(sample_buffer, ns + (size_t)i * sample_num);
+                            syms[i] = (uint16_t)peak_idx_to_symbol(r.second, sr.preamble_bin);
+                        }
+
+                        auto comp_all = dynamic_compensation(syms, sr.cfo);
+                        auto gc_all = gray_coding(comp_all);
+
+                        std::vector<uint8_t> nib_all(nibbles.begin(), nibbles.begin() + 5);
+                        int rdd = coding_rate + 4;
+                        for (size_t i = 8; i + (size_t)rdd <= gc_all.size(); i += rdd) {
+                            int ppm = sf;
+                            if (ldro) ppm -= 2;
+                            std::vector<uint16_t> chunk(gc_all.begin() + i, gc_all.begin() + i + rdd);
+                            auto c_chunk = diag_deinterleave(chunk, ppm);
+                            auto nb = hamming_decode(c_chunk, rdd);
+                            nib_all.insert(nib_all.end(), nb.begin(), nb.end());
+                        }
+
+                        if (nib_all.size() % 2 == 1) nib_all.push_back(0);
+                        int data_len = (int)nib_all.size() / 2;
+                        std::vector<uint8_t> data(data_len);
+                        for (int i = 0; i < data_len; ++i) {
+                            data[i] = (uint8_t)((nib_all[2 * i + 1] << 4) | nib_all[2 * i]);
+                        }
+
+                        bool crc_ok = false;
+                        if (header_has_crc) {
+                            std::vector<uint8_t> just(data.begin(), data.begin() + std::min<size_t>(payload_len, data.size()));
+                            dewhiten(just);
+                            auto checksum = calc_crc(just);
+                            if (payload_len + 1 < (int)data.size()) {
+                                if (checksum.first == data[payload_len] && checksum.second == data[payload_len + 1]) {
+                                    crc_ok = true;
+                                }
+                            }
+                            for (int i = 0; i < payload_len && i < (int)just.size(); ++i) data[i] = just[i];
+                        } else {
+                            dewhiten(data);
+                            crc_ok = true;
+                        }
+
+                        if (crc_ok) {
+                            packets_ok++;
+                            logger->info("LoRa Packet OK! len=%d cfo=%.1f", payload_len, sr.cfo);
+                            emit_payload(data.data(), payload_len);
+                        } else {
+                            packets_crc_fail++;
+                        }
+
+                        read_pos = ns + (size_t)sym_num * sample_num;
+                        size_t back_len = (size_t)preamble_len * sample_num;
+                        if (read_pos > back_len) read_pos -= back_len;
+                        else read_pos = 0;
                     }
 
-                    if (crc_ok) {
-                        packets_ok++;
-                        logger->info("LoRa Packet OK! len=%d cfo=%.1f", payload_len, sr.cfo);
-                        emit_payload(data.data(), payload_len);
-                    } else {
-                        packets_crc_fail++;
+                    if (read_pos > sample_buffer.size()) read_pos = sample_buffer.size();
+                    
+                    if (read_pos > (size_t)sample_num * 64) {
+                        sample_buffer.erase(sample_buffer.begin(), sample_buffer.begin() + read_pos);
+                        read_pos = 0;
                     }
 
-                    read_pos = ns + (size_t)sym_num * sample_num;
-                    size_t back_len = (size_t)preamble_len * sample_num;
-                    if (read_pos > back_len) read_pos -= back_len;
-                    else read_pos = 0;
+                    if (input_data_type == DATA_FILE && file_source)
+                        progress = file_source->getPosition();
+
+                    if (time(NULL) % 10 == 0 && lastTime != time(NULL)) {
+                        lastTime = time(NULL);
+                        if (input_data_type == DATA_FILE && filesize > 0) {
+                            double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
+                            logger->info("Progress " + std::to_string(pct) + "%");
+                        } else {
+                            logger->info("Live Mode: Packets OK=%d, CRC fail=%d, SNR=%.1f dB", packets_ok, packets_crc_fail, current_snr);
+                        }
+                    }
                 }
 
-                if (read_pos > (size_t)sample_num * 64) {
-                    sample_buffer.erase(sample_buffer.begin(), sample_buffer.begin() + read_pos);
-                    read_pos = 0;
-                }
-
-                // 进度与日志
                 if (input_data_type == DATA_FILE && file_source)
-                    progress = file_source->getPosition();
+                    file_source->stop();
 
-                if (time(NULL) % 10 == 0 && lastTime != time(NULL)) {
-                    lastTime = time(NULL);
-                    if (input_data_type == DATA_FILE && filesize > 0) {
-                        double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
-                        logger->info("Progress " + std::to_string(pct) + "%");
-                    } else {
-                        logger->info("Live Mode: Packets OK=%d, CRC fail=%d, SNR=%.1f dB", packets_ok, packets_crc_fail, current_snr);
-                    }
-                }
+                if (payload_out_bin.is_open()) payload_out_bin.close();
+                if (payload_out_hex.is_open()) payload_out_hex.close();
+            } catch (const std::exception &e) {
+                logger->error("LoRa Demod thread caught exception: %s", e.what());
+            } catch (...) {
+                logger->error("LoRa Demod thread caught unknown exception");
             }
-
-            BaseDemodModule::stop();
-            if (payload_out_bin.is_open()) payload_out_bin.close();
-            if (payload_out_hex.is_open()) payload_out_hex.close();
         }
 
         void LoRaDemodModule::reset_sync_state()

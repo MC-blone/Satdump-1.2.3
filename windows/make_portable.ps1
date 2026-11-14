@@ -1,4 +1,3 @@
-```powershell
 param(
     [string]$source_path,
     [string]$triplet="x64-windows"
@@ -179,4 +178,3 @@ foreach ($dll_to_copy in $dlls_to_copy.Values)
 }
 
 Write-Output "Portable package created successfully."
-```
