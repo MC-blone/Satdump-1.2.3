@@ -22,7 +22,9 @@
                     "sf": 9,
                     "bw": 812500,
                     "preamble_len": 6,
-                    "zero_padding_ratio": 10
+                    "zero_padding_ratio": 10,
+                    "max_sps":6e6,
+                    "min_sps":9e5
                 }
             },
             "cadu": {

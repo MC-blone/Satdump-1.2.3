@@ -34,16 +34,6 @@ namespace fengyun4
             return crc;
         }
 
-        static std::pair<uint8_t, uint8_t> calc_crc(const std::vector<uint8_t>& data) {
-            if (data.empty()) return {0, 0};
-            if (data.size() == 1) return {data[0], 0};
-            if (data.size() == 2) return {data[1], data[0]};
-            uint16_t seq = crc_hqx(data.data(), data.size() - 2);
-            uint8_t high = (uint8_t)((seq >> 8) ^ data[data.size() - 2]);
-            uint8_t low = (uint8_t)((seq & 0xff) ^ data[data.size() - 1]);
-            return {low, high};
-        }
-
         static std::vector<uint8_t> calc_checksum(const std::vector<uint8_t>& data) {
             static const uint8_t M[5][12] = {
                 {1,1,1,1,0,0,0,0,0,0,0,0},
@@ -70,21 +60,61 @@ namespace fengyun4
             }
         }
 
+        BiquadCascade::BiquadCascade(double fc, double fs, int order) {
+            const double PI = std::acos(-1.0);
+            double w0 = 2.0 * PI * fc / fs;
+            double cos_w0 = std::cos(w0);
+            double sin_w0 = std::sin(w0);
+            int num_sections = order / 2;
+            for (int k = 0; k < num_sections; ++k) {
+                double Q = 1.0 / (2.0 * std::sin(PI * (2 * k + 1) / (2.0 * order)));
+                double alpha = sin_w0 / (2.0 * Q);
+                double a0 = 1.0 + alpha;
+                b0[k] = ((1 - cos_w0) / 2) / a0;
+                b1[k] = (1 - cos_w0) / a0;
+                b2[k] = ((1 - cos_w0) / 2) / a0;
+                a1[k] = (-2 * cos_w0) / a0;
+                a2[k] = (1 - alpha) / a0;
+                z1_r[k] = z2_r[k] = z1_i[k] = z2_i[k] = 0;
+            }
+        }
+
+        complex_t BiquadCascade::process(complex_t x) {
+            double r = x.real, i = x.imag;
+            for (int k = 0; k < 5; ++k) {
+                double yr = b0[k] * r + z1_r[k];
+                z1_r[k] = b1[k] * r - a1[k] * yr + z2_r[k];
+                z2_r[k] = b2[k] * r - a2[k] * yr;
+                r = yr;
+
+                double yi = b0[k] * i + z1_i[k];
+                z1_i[k] = b1[k] * i - a1[k] * yi + z2_i[k];
+                z2_i[k] = b2[k] * i - a2[k] * yi;
+                i = yi;
+            }
+            return complex_t((float)r, (float)i);
+        }
+
         LoRaDemodModule::LoRaDemodModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
             : BaseDemodModule(input_file, output_file_hint, parameters)
         {
             if (parameters.count("sf")) sf = parameters["sf"].get<int>();
             if (parameters.count("bw")) bw_hz = parameters["bw"].get<int>();
             if (parameters.count("preamble_len")) preamble_len = parameters["preamble_len"].get<int>();
-            if (parameters.count("zero_padding_ratio")) zero_padding_ratio = parameters["zero_padding_ratio"].get<int>();
 
             if (sf < 7 || sf > 12) sf = 9;
             if (bw_hz <= 0) bw_hz = 812500;
             if (preamble_len <= 1) preamble_len = 6;
-            if (zero_padding_ratio <= 0) zero_padding_ratio = 5;
+            
+            zero_padding_ratio = 5;
 
-            MIN_SPS = 1.0f;
+            d_parameters.erase("max_sps");
+            d_parameters.erase("min_sps");
+            d_parameters.erase("custom_samplerate");
+            
+            MIN_SPS = 0.5f;
             MAX_SPS = 1e9f;
+
             if (d_symbolrate <= 0) d_symbolrate = (int)bw_hz;
 
             name = "Generic LoRa Demod";
@@ -103,46 +133,33 @@ namespace fengyun4
         {
             BaseDemodModule::initb();
             
-            if (final_samplerate <= 0) final_samplerate = 2048000;
+            if (final_samplerate <= 0) final_samplerate = d_samplerate;
 
             sample_num = (int)std::round(std::pow(2.0, sf) * (double)final_samplerate / (double)bw_hz);
             if (sample_num <= 0) sample_num = 1291;
             
             bin_num = zero_padding_ratio * (1 << sf);
             fft_len = sample_num * zero_padding_ratio;
-            
-            if (fft_len <= 0) return;
 
             init_chirps((double)final_samplerate);
+            lpf = std::make_unique<BiquadCascade>(bw_hz / 2.0, (double)final_samplerate, 10);
 
             fft_in = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_len);
             fft_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * fft_len);
             mag_buffer.resize(fft_len);
 
-            if (!fft_in || !fft_out) {
-                logger->error("Failed to allocate FFTW arrays for LoRa Demod");
-                return;
-            }
+            if (!fft_in || !fft_out) return;
             
             memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
-            
             fft_plan = fftwf_plan_dft_1d(fft_len, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
-            if (!fft_plan) {
-                logger->error("Failed to create FFTW plan for LoRa Demod");
-                return;
-            }
+            if (!fft_plan) return;
 
             sample_buffer.reserve((size_t)sample_num * 128);
 
-            // 【核心修复】文件注册提前到 init 进行，绝不在多线程里操作 d_output_files
             payload_out_hex.open(d_output_file_hint + ".hex.txt", std::ios::app);
-            if (payload_out_hex.is_open()) {
-                d_output_files.push_back(d_output_file_hint + ".hex.txt");
-            }
+            if (payload_out_hex.is_open()) d_output_files.push_back(d_output_file_hint + ".hex.txt");
             payload_out_bin.open(d_output_file_hint + ".bin", std::ios::app);
-            if (payload_out_bin.is_open()) {
-                d_output_files.push_back(d_output_file_hint + ".bin");
-            }
+            if (payload_out_bin.is_open()) d_output_files.push_back(d_output_file_hint + ".bin");
         }
 
         void LoRaDemodModule::init_chirps(double fs)
@@ -169,7 +186,7 @@ namespace fengyun4
         void LoRaDemodModule::stop()
         {
             stop_requested.store(true);
-            BaseDemodModule::stop();
+            if (input_data_type == DATA_FILE && file_source) file_source->stop();
         }
 
         std::pair<float, int> LoRaDemodModule::dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up)
@@ -179,11 +196,11 @@ namespace fengyun4
             size_t signal_len = std::min((size_t)sample_num, buf.size() - pos);
             
             memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
-
             volk_32fc_x2_multiply_32fc((lv_32fc_t*)fft_in, (const lv_32fc_t*)&buf[pos], (const lv_32fc_t*)chp.data(), signal_len);
             
             fftwf_execute(fft_plan);
-
+            fft_calls++;
+            
             volk_32fc_magnitude_squared_32f(mag_buffer.data(), (const lv_32fc_t*)fft_out, fft_len);
 
             float best_mag = 0.0f;
@@ -205,27 +222,35 @@ namespace fengyun4
 
         size_t LoRaDemodModule::detect(const std::vector<complex_t>& buf, size_t start)
         {
-            if (buf.size() < (size_t)sample_num * preamble_len + 1) throw std::runtime_error("no preamble");
+            size_t required = (size_t)sample_num * preamble_len + 1;
+            if (buf.size() < required) throw std::runtime_error("no preamble");
 
-            std::vector<int> pk;
-            while (start < buf.size() - (size_t)sample_num * preamble_len - 1) {
-                if ((int)pk.size() == preamble_len - 1) {
-                    long long back = (long long)std::round((double)pk.back() / zero_padding_ratio * 2);
+            int consecutive = 0;
+            int last_peak = 0;
+
+            while (start < buf.size() - required) {
+                if (consecutive >= preamble_len - 1) {
+                    long long back = (long long)std::round((double)last_peak / zero_padding_ratio * 2.0);
                     long long p = (long long)start - back;
                     if (p < 0) p = 0;
                     return (size_t)p;
                 }
+
                 auto r = dechirp(buf, start, true);
-                int pk0 = r.second;
-                if (!pk.empty()) {
-                    int diff = (pk.back() - pk0) % bin_num;
+                int peak = r.second;
+
+                if (consecutive > 0) {
+                    int diff = (last_peak - peak) % bin_num;
                     if (diff < 0) diff += bin_num;
                     if (diff > bin_num / 2) diff = bin_num - diff;
-                    if (diff <= zero_padding_ratio * 10) pk.push_back(pk0);
-                    else pk = {pk0};
+
+                    if (diff <= zero_padding_ratio * 10) consecutive++;
+                    else consecutive = 1;
                 } else {
-                    pk = {pk0};
+                    consecutive = 1;
                 }
+
+                last_peak = peak;
                 start += sample_num;
             }
             throw std::runtime_error("no preamble");
@@ -381,7 +406,6 @@ namespace fengyun4
                 output_fifo->write((uint8_t *)data, len);
             }
 
-            // 【修复】直接写文件，不再碰 d_output_files
             if (payload_out_hex.is_open()) {
                 char buf[8];
                 for (int i = 0; i < len; ++i) {
@@ -408,48 +432,58 @@ namespace fengyun4
 
                 if (input_data_type == DATA_FILE && file_source) {
                     filesize = file_source->getFilesize();
+                    file_source->start();
                 } else {
                     filesize = 0;
                 }
 
-                BaseDemodModule::start();
+                std::shared_ptr<dsp::stream<complex_t>> in_stream = (input_data_type == DATA_FILE) ? file_source->output_stream : input_stream;
+                if (!in_stream) return;
 
                 time_t lastTime = 0;
                 int ui_counter = 0;
 
                 while (demod_should_run() && !stop_requested.load()) {
-                    int n = agc->output_stream->read();
+                    int n = in_stream->read();
                     if (n < 0) break;
 
-                    if (n > 0 && agc->output_stream->readBuf) {
-                        complex_t *buf = agc->output_stream->readBuf;
+                    if (n > 0 && in_stream->readBuf) {
+                        complex_t *buf = in_stream->readBuf;
                         
                         ui_counter++;
                         if (ui_counter % 8 == 0) {
                             snr_estimator.update(buf, n);
                             snr = snr_estimator.snr();
                             if (snr > peak_snr) peak_snr = snr;
-                            for (int i = 0; i < n; i += 128) {
-                                constellation.pushComplex(&buf[i], 1);
-                            }
                         }
 
                         for (int i = 0; i < n; i++) {
                             complex_t s = buf[i];
+                            
+                            // IQ 反转（如果在 UI 上没勾的话，这里根据实际情况决定。这里默认启用反转）
+                            s.imag = -s.imag;
+                            
                             dc_state.real = s.real * (1.0f - 0.999f) + dc_state.real * 0.999f;
                             dc_state.imag = s.imag * (1.0f - 0.999f) + dc_state.imag * 0.999f;
                             s.real -= dc_state.real;
                             s.imag -= dc_state.imag;
+                            
+                            s = lpf->process(s);
                             sample_buffer.push_back(s);
+
+                            if (ui_counter % 8 == 0 && i % 64 == 0) {
+                                constellation.pushComplex(&s, 1);
+                            }
                         }
                     }
-                    agc->output_stream->flush();
+                    in_stream->flush();
 
                     size_t overlap = (size_t)preamble_len * sample_num + 16 * sample_num;
                     while (true) {
                         size_t pkt_start;
                         try {
                             pkt_start = detect(sample_buffer, read_pos);
+                            preambles_detected++;
                         } catch (...) {
                             if (sample_buffer.size() > overlap) read_pos = sample_buffer.size() - overlap;
                             else read_pos = 0;
@@ -460,10 +494,18 @@ namespace fengyun4
                             read_pos = pkt_start; break;
                         }
 
+                        size_t sync_required = (size_t)(preamble_len + 3) * sample_num;
+                        if (pkt_start > sample_buffer.size() || sample_buffer.size() - pkt_start < sync_required) {
+                            read_pos = pkt_start; 
+                            break;
+                        }
+
                         SyncResult sr;
                         try {
                             sr = sync(sample_buffer, pkt_start);
-                        } catch (...) {
+                            sync_found++;
+                        } catch (const std::exception &) {
+                            sync_failed++;
                             read_pos = pkt_start + sample_num; continue;
                         }
 
@@ -473,6 +515,9 @@ namespace fengyun4
                         if (ns + (size_t)(8 * sample_num) > sample_buffer.size()) {
                             read_pos = pkt_start; break;
                         }
+
+                        // LDRO 状态必须在解 Header 之前设置
+                        ldro = ((double)(1 << sf) / (double)bw_hz) > 16e-3;
 
                         std::vector<uint16_t> hsym(8);
                         for (int i = 0; i < 8; ++i) {
@@ -486,7 +531,7 @@ namespace fengyun4
                         auto cw = diag_deinterleave(first8, sf - 2);
                         auto nibbles = hamming_decode(cw, 8);
 
-                        if (nibbles.size() < 5) { read_pos = ns + 7 * sample_num; continue; }
+                        if (nibbles.size() < 5) { header_fail++; read_pos = ns + 7 * sample_num; continue; }
                         
                         int p_len = nibbles[0] * 16 + nibbles[1];
                         bool crc_en = (nibbles[2] & 1) != 0;
@@ -503,13 +548,18 @@ namespace fengyun4
                                        (cs[3] == ((nibbles[4] >> 1) & 1)) &&
                                        (cs[4] == (nibbles[4] & 1));
 
-                        if (!h_valid) { read_pos = ns + 7 * sample_num; continue; }
+                        if (!h_valid) { header_fail++; read_pos = ns + 7 * sample_num; continue; }
 
+                        if (cr_val < 1 || cr_val > 4) {
+                            header_fail++;
+                            read_pos = ns + 7 * sample_num;
+                            continue;
+                        }
+
+                        headers_valid++;
                         payload_len = p_len;
                         coding_rate = cr_val;
                         header_has_crc = crc_en;
-                        ldro = false;
-                        if (2.0 * (1 << sf) / bw_hz > 16e-3) ldro = true;
 
                         int sym_num = calc_sym_num(true, payload_len, coding_rate, header_has_crc, sf, ldro);
                         if (ns + (size_t)sym_num * sample_num > sample_buffer.size()) {
@@ -526,11 +576,11 @@ namespace fengyun4
                         auto comp_all = dynamic_compensation(syms, sr.cfo);
                         auto gc_all = gray_coding(comp_all);
 
-                        std::vector<uint8_t> nib_all(nibbles.begin(), nibbles.begin() + 5);
+                        // 【核心修复 1】Payload 中不包含 Header 半字节
+                        std::vector<uint8_t> nib_all;
                         int rdd = coding_rate + 4;
                         for (size_t i = 8; i + (size_t)rdd <= gc_all.size(); i += rdd) {
-                            int ppm = sf;
-                            if (ldro) ppm -= 2;
+                            int ppm = ldro ? sf - 2 : sf;
                             std::vector<uint16_t> chunk(gc_all.begin() + i, gc_all.begin() + i + rdd);
                             auto c_chunk = diag_deinterleave(chunk, ppm);
                             auto nb = hamming_decode(c_chunk, rdd);
@@ -544,28 +594,35 @@ namespace fengyun4
                             data[i] = (uint8_t)((nib_all[2 * i + 1] << 4) | nib_all[2 * i]);
                         }
 
+                        // 【核心修复 2】正确的 CRC 路径
                         bool crc_ok = false;
-                        if (header_has_crc) {
-                            std::vector<uint8_t> just(data.begin(), data.begin() + std::min<size_t>(payload_len, data.size()));
-                            dewhiten(just);
-                            auto checksum = calc_crc(just);
-                            if (payload_len + 1 < (int)data.size()) {
-                                if (checksum.first == data[payload_len] && checksum.second == data[payload_len + 1]) {
-                                    crc_ok = true;
-                                }
+                        std::vector<uint8_t> payload;
+                        size_t required = (size_t)payload_len + (header_has_crc ? 2u : 0u);
+
+                        if (data.size() >= required) {
+                            if (header_has_crc) {
+                                std::vector<uint8_t> frame(data.begin(), data.begin() + required);
+                                dewhiten(frame);
+                                uint16_t crc = crc_hqx(frame.data(), (size_t)payload_len);
+                                uint8_t crc_low = (uint8_t)(crc & 0xff);
+                                uint8_t crc_high = (uint8_t)(crc >> 8);
+                                crc_ok = frame[payload_len] == crc_low && frame[payload_len + 1] == crc_high;
+                                payload.assign(frame.begin(), frame.begin() + payload_len);
+                            } else {
+                                payload.assign(data.begin(), data.begin() + payload_len);
+                                dewhiten(payload);
+                                crc_ok = true;
                             }
-                            for (int i = 0; i < payload_len && i < (int)just.size(); ++i) data[i] = just[i];
                         } else {
-                            dewhiten(data);
-                            crc_ok = true;
+                            logger->warning("LoRa decoded payload too short: have=%d need=%d", (int)data.size(), (int)required);
                         }
 
                         if (crc_ok) {
                             packets_ok++;
                             logger->info("LoRa Packet OK! len=%d cfo=%.1f", payload_len, sr.cfo);
-                            emit_payload(data.data(), payload_len);
+                            emit_payload(payload.data(), (int)payload.size());
                         } else {
-                            packets_crc_fail++;
+                            if (header_has_crc) packets_crc_fail++;
                         }
 
                         read_pos = ns + (size_t)sym_num * sample_num;
@@ -580,6 +637,13 @@ namespace fengyun4
                         sample_buffer.erase(sample_buffer.begin(), sample_buffer.begin() + read_pos);
                         read_pos = 0;
                     }
+                    
+                    if (sample_buffer.size() > 2000000) {
+                        size_t drop = sample_buffer.size() - 1000000;
+                        if (read_pos > drop) read_pos -= drop;
+                        else read_pos = 0;
+                        sample_buffer.erase(sample_buffer.begin(), sample_buffer.begin() + drop);
+                    }
 
                     if (input_data_type == DATA_FILE && file_source)
                         progress = file_source->getPosition();
@@ -593,8 +657,7 @@ namespace fengyun4
                     }
                 }
 
-                BaseDemodModule::stop();
-
+                if (input_data_type == DATA_FILE && file_source) file_source->stop();
                 if (payload_out_bin.is_open()) payload_out_bin.close();
                 if (payload_out_hex.is_open()) payload_out_hex.close();
             } catch (const std::exception &e) {
@@ -609,61 +672,38 @@ namespace fengyun4
             read_pos = 0;
             sample_buffer.clear();
             preamble_bins.clear();
-            snr = 0;
-            peak_snr = 0;
+            
+            packets_ok = 0;
+            packets_crc_fail = 0;
+            preambles_detected = 0;
+            sync_found = 0;
+            sync_failed = 0;
+            headers_valid = 0;
+            header_fail = 0;
+            fft_calls = 0;
         }
 
         void LoRaDemodModule::drawUI(bool window)
         {
-            ImGui::Begin("Generic LoRa Demod", NULL, window ? 0 : NOWINDOW_FLAGS);
+            // 直接调用基类绘制，完美保留 SatDump 原生的 SNR 和 FFT 曲线
+            BaseDemodModule::drawUI(window);
+            
+            // 在这里追加我们自己需要的统计信息（利用原生窗口的位置）
+            ImGui::Begin(name.c_str(), NULL, window ? 0 : NOWINDOW_FLAGS);
+            ImGui::Text("Preamble: %llu  Sync: %llu  Header: %llu",
+                (unsigned long long)preambles_detected.load(),
+                (unsigned long long)sync_found.load(),
+                (unsigned long long)headers_valid.load());
 
-            ImGui::BeginGroup();
-            constellation.draw();
-            ImGui::EndGroup();
+            ImGui::Text("Sync fail: %llu  Header fail: %llu",
+                (unsigned long long)sync_failed.load(),
+                (unsigned long long)header_fail.load());
 
-            ImGui::SameLine();
-
-            ImGui::BeginGroup();
-            {
-                ImGui::Button("Signal", {200 * ui_scale, 20 * ui_scale});
-                
-                ImGui::Text("Freq : ");
-                ImGui::SameLine();
-                ImGui::TextColored(style::theme.orange, "%.1f Hz", display_freq);
-
-                ImGui::Text("SNR : ");
-                ImGui::SameLine();
-                if (std::isnan(snr)) {
-                    ImGui::TextColored(style::theme.red, "NaN");
-                } else if (snr > 30.0f) {
-                    ImGui::TextColored(style::theme.green, "inf");
-                } else if (snr > 5.0f) {
-                    ImGui::TextColored(style::theme.green, "%.1f dB", snr);
-                } else if (snr < 2.0f) {
-                    ImGui::TextColored(style::theme.red, "%.1f dB", snr);
-                } else {
-                    ImGui::TextColored(style::theme.yellow, "%.1f dB", snr);
-                }
-
-                ImGui::Text("Peak SNR: %.1f dB", peak_snr);
-                
-                if (!streamingInput)
-                    if (ImGui::Checkbox("Show FFT", &show_fft))
-                        fft_splitter->set_enabled("fft", show_fft);
-
-                snr_plot.draw(snr, peak_snr);
-            }
-            ImGui::EndGroup();
-
-            ImGui::Text("Packets OK: %d   CRC fail: %d", packets_ok, packets_crc_fail);
-
-            if (input_data_type == DATA_FILE && filesize > 0)
-                ImGui::ProgressBar((double)progress / (double)filesize, ImVec2(ImGui::GetContentRegionAvail().x, 20 * ui_scale));
-
-            drawStopButton();
+            ImGui::Text("Packets OK: %d  CRC fail: %d  FFT calls: %llu",
+                packets_ok.load(),
+                packets_crc_fail.load(),
+                (unsigned long long)fft_calls.load());
             ImGui::End();
-
-            drawFFT();
         }
 
         std::string LoRaDemodModule::getID() { return "lora_demod"; }

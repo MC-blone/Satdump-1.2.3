@@ -15,61 +15,63 @@ namespace fengyun4
 {
     namespace emwin
     {
+        struct BiquadCascade
+        {
+            double b0[5], b1[5], b2[5], a1[5], a2[5];
+            double z1_r[5], z2_r[5], z1_i[5], z2_i[5];
+            BiquadCascade(double fc, double fs, int order);
+            complex_t process(complex_t x);
+        };
+
         class LoRaDemodModule : public demod::BaseDemodModule
         {
         protected:
-            // ---------- 配置参数 ----------
             int sf = 9;
             int bw_hz = 812500;
             int preamble_len = 6;
-            int zero_padding_ratio = 5; // 降为 5 以提高 FFT 速度
+            int zero_padding_ratio = 5; // 用户已验证 5 速度和精度最好
 
-            // ---------- 派生尺寸 ----------
             int sample_num = 1291;
             int bin_num = 2560;
             int fft_len = 6455;
 
-            // ---------- FFTW & VOLK ----------
             fftwf_complex *fft_in = nullptr;
             fftwf_complex *fft_out = nullptr;
             fftwf_plan fft_plan = nullptr;
-            std::vector<float> mag_buffer; // 用于 volk 快速求模
+            std::vector<float> mag_buffer;
 
-            // ---------- Chirp ----------
             std::vector<complex_t> chirp_up;
             std::vector<complex_t> chirp_down;
 
-            // ---------- 连续输入缓冲 ----------
             std::vector<complex_t> sample_buffer;
             size_t read_pos = 0;
 
-            // ---------- 同步与解码状态 ----------
             std::vector<int> preamble_bins;
             int preamble_bin = 0;
-            double cfo_hz = 0.0;
             
             int payload_len = 0;
             int coding_rate = 1;
             bool header_has_crc = true;
             bool ldro = false;
 
-            // 去直流状态
             complex_t dc_state;
-            const float dc_alpha = 0.999f;
+            std::unique_ptr<BiquadCascade> lpf;
 
-            // ---------- 输出文件 ----------
             std::ofstream payload_out_bin;
             std::ofstream payload_out_hex;
 
-            // 停止机制
             std::atomic<bool> stop_requested{false};
 
-            // ---------- 统计与 UI ----------
-            int packets_ok = 0;
-            int packets_crc_fail = 0;
-            double display_freq = 0.0;
+            // 详尽的统计指标
+            std::atomic<int> packets_ok{0};
+            std::atomic<int> packets_crc_fail{0};
+            std::atomic<uint64_t> preambles_detected{0};
+            std::atomic<uint64_t> sync_found{0};
+            std::atomic<uint64_t> sync_failed{0};
+            std::atomic<uint64_t> headers_valid{0};
+            std::atomic<uint64_t> header_fail{0};
+            std::atomic<uint64_t> fft_calls{0};
 
-            // ---------- 内部方法 ----------
             void init_chirps(double fs);
             std::pair<float, int> dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up = true);
             int peak_idx_to_symbol(int peak_idx, int pre_bin);
