@@ -68,7 +68,7 @@ namespace fengyun4
             int last_syms = 0;
             
             // SNR 相关
-            dsp::M2M4SNREstimator snr_estimator;
+            M2M4SNREstimator snr_estimator;
             float current_snr = 0;
             float peak_snr = 0;
             float avg_snr = 0;
