@@ -2,14 +2,10 @@
     "fengyun4_a_emwin_lora": {
         "name": "FengYun-4A EMAIB LoRa",
         "live": true,
-        "live_cfg": {
-            "pkt_size": 10240,
-            "default": [
-                [1, 0],
-                [2, 0],
-                [3, 0]
-            ]
-        },
+        "live_cfg": [
+            [1, 0],
+            [2, 0]
+        ],
         "frequencies": [
             ["EMWIN", 1697e6]
         ],
@@ -29,7 +25,7 @@
                     "zero_padding_ratio": 10
                 }
             },
-            "products": {
+            "cadu": {
                 "emwin_text_decoder": {
                     "sf": 9
                 }

@@ -22,22 +22,22 @@ namespace fengyun4
             int sf = 9;
             int bw_hz = 812500;
             int preamble_len = 6;
-            int zero_padding_ratio = 10;
+            int zero_padding_ratio = 5; // 降为 5 以提高 FFT 速度
 
             // ---------- 派生尺寸 ----------
             int sample_num = 1291;
-            int bin_num = 5120;
-            int fft_len = 12910;
+            int bin_num = 2560;
+            int fft_len = 6455;
 
-            // ---------- FFTW ----------
+            // ---------- FFTW & VOLK ----------
             fftwf_complex *fft_in = nullptr;
             fftwf_complex *fft_out = nullptr;
             fftwf_plan fft_plan = nullptr;
+            std::vector<float> mag_buffer; // 用于 volk 快速求模
 
-            // ---------- VOLK 优化缓存 ----------
+            // ---------- Chirp ----------
             std::vector<complex_t> chirp_up;
             std::vector<complex_t> chirp_down;
-            std::vector<float> mag_buffer; // 用于 volk 求模
 
             // ---------- 连续输入缓冲 ----------
             std::vector<complex_t> sample_buffer;

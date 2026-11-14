@@ -41,7 +41,7 @@ namespace fengyun4
 
         std::vector<ModuleDataType> EmwinTextDecoderModule::getInputTypes()
         {
-            return {DATA_FILE, DATA_DSP_STREAM}; // 支持实时流和文件
+            return {DATA_FILE, DATA_DSP_STREAM}; 
         }
 
         std::vector<ModuleDataType> EmwinTextDecoderModule::getOutputTypes()
@@ -54,7 +54,6 @@ namespace fengyun4
             if (text.empty())
                 return;
 
-            // 只有在有输出路径时才保存文件
             if (!d_output_file_hint.empty())
             {
                 std::string base_dir = d_output_file_hint;
@@ -88,13 +87,12 @@ namespace fengyun4
                     if (!text.empty() && text.back() != '\n')
                         outf << "\n";
                     outf.close();
-                    d_output_files.push_back(full_path);
+                    // 【核心修复】不再调用 d_output_files.push_back(full_path); 避免跨线程破坏 vector
                 }
             }
 
             logger->info("EMWIN text segment saved (%d bytes)", (int)text.size());
 
-            // 【关键】推入 UI 界面实时展示队列
             if (is_gui)
             {
                 std::lock_guard<std::mutex> lk(msg_mtx);
@@ -114,7 +112,6 @@ namespace fengyun4
             
             if (input_data_type == DATA_FILE)
             {
-                // 【离线】将 .soft 重定向为 .bin
                 if (actual_input.find(".soft") != std::string::npos) {
                     size_t pos = actual_input.find(".soft");
                     actual_input = actual_input.substr(0, pos) + ".bin";
@@ -140,7 +137,6 @@ namespace fengyun4
             }
             else
             {
-                // 【实时流】不需要打开文件，直接从内存 FIFO 读取
                 filesize = 0;
                 logger->info("Using input payload (LIVE STREAM)");
             }
@@ -154,7 +150,6 @@ namespace fengyun4
 
             time_t lastTime = 0;
 
-            // 只要还活跃就继续循环
             while (input_data_type == DATA_FILE ? !data_in.eof() : input_active.load())
             {
                 int n = 0;
@@ -171,7 +166,6 @@ namespace fengyun4
                 {
                     if (!input_fifo)
                         break;
-                    // 【实时】阻塞等待上一级发来的 LoRa 数据
                     input_fifo->read((uint8_t *)rd.data(), buf_size);
                     if (!input_active.load())
                         break;
@@ -229,7 +223,7 @@ namespace fengyun4
 
         void EmwinTextDecoderModule::drawUI(bool window)
         {
-            is_gui = true; // 实时通知 process() 产生文本时推入 UI 队列
+            is_gui = true;
 
             ImGuiIO &io = ImGui::GetIO();
 
@@ -250,7 +244,6 @@ namespace fengyun4
             }
             ImGui::End();
 
-            // 【实时内容展示窗口】
             ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.6f), ImGuiCond_FirstUseEver);
             bool msg_open = ImGui::Begin("EMWIN Messages", NULL, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoCollapse);
 
@@ -264,7 +257,6 @@ namespace fengyun4
                 ImGui::TableSetupColumn("Message", 0, -1);
                 ImGui::TableHeadersRow();
 
-                // 最新的消息在最上面
                 for (int i = (int)msg_history.size() - 1; i >= 0; i--)
                 {
                     try

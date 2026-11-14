@@ -76,7 +76,6 @@
             ]
         ],
         "parameters": {
-            },
             "samplerate": {
                 "value": 6e6
             },

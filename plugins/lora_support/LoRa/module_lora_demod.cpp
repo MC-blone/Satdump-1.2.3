@@ -81,7 +81,7 @@ namespace fengyun4
             if (sf < 7 || sf > 12) sf = 9;
             if (bw_hz <= 0) bw_hz = 812500;
             if (preamble_len <= 1) preamble_len = 6;
-            if (zero_padding_ratio <= 0) zero_padding_ratio = 10;
+            if (zero_padding_ratio <= 0) zero_padding_ratio = 5;
 
             MIN_SPS = 1.0f;
             MAX_SPS = 1e9f;
@@ -103,7 +103,6 @@ namespace fengyun4
         {
             BaseDemodModule::initb();
             
-            // 关键：读取的是 agc 出来的流，所以必须使用 final_samplerate 来计算样本数
             if (final_samplerate <= 0) final_samplerate = 2048000;
 
             sample_num = (int)std::round(std::pow(2.0, sf) * (double)final_samplerate / (double)bw_hz);
@@ -113,9 +112,6 @@ namespace fengyun4
             fft_len = sample_num * zero_padding_ratio;
             
             if (fft_len <= 0) return;
-
-            logger->info("LoRa Demod Init: FS=%.0f, BW=%d, SF=%d", final_samplerate, bw_hz, sf);
-            logger->info("Calculated sample_num=%d, bin_num=%d, fft_len=%d", sample_num, bin_num, fft_len);
 
             init_chirps((double)final_samplerate);
 
@@ -137,6 +133,16 @@ namespace fengyun4
             }
 
             sample_buffer.reserve((size_t)sample_num * 128);
+
+            // 【核心修复】文件注册提前到 init 进行，绝不在多线程里操作 d_output_files
+            payload_out_hex.open(d_output_file_hint + ".hex.txt", std::ios::app);
+            if (payload_out_hex.is_open()) {
+                d_output_files.push_back(d_output_file_hint + ".hex.txt");
+            }
+            payload_out_bin.open(d_output_file_hint + ".bin", std::ios::app);
+            if (payload_out_bin.is_open()) {
+                d_output_files.push_back(d_output_file_hint + ".bin");
+            }
         }
 
         void LoRaDemodModule::init_chirps(double fs)
@@ -172,13 +178,13 @@ namespace fengyun4
             const auto& chp = is_up ? chirp_down : chirp_up;
             size_t signal_len = std::min((size_t)sample_num, buf.size() - pos);
             
-            // VOLK 优化：相乘
+            memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
+
             volk_32fc_x2_multiply_32fc((lv_32fc_t*)fft_in, (const lv_32fc_t*)&buf[pos], (const lv_32fc_t*)chp.data(), signal_len);
             
             fftwf_execute(fft_plan);
 
-            // VOLK 优化：求模
-            volk_32fc_magnitude_32f(mag_buffer.data(), (const lv_32fc_t*)fft_out, fft_len);
+            volk_32fc_magnitude_squared_32f(mag_buffer.data(), (const lv_32fc_t*)fft_out, fft_len);
 
             float best_mag = 0.0f;
             int best = 0;
@@ -186,7 +192,7 @@ namespace fengyun4
                 float m = mag_buffer[i] + mag_buffer[fft_len - bin_num + i];
                 if (m > best_mag) { best_mag = m; best = i; }
             }
-            return {best_mag, best};
+            return {std::sqrt(best_mag), best};
         }
 
         int LoRaDemodModule::peak_idx_to_symbol(int peak_idx, int pre_bin)
@@ -375,11 +381,7 @@ namespace fengyun4
                 output_fifo->write((uint8_t *)data, len);
             }
 
-            if (!payload_out_hex.is_open()) {
-                std::string path = d_output_file_hint + ".hex.txt";
-                payload_out_hex.open(path, std::ios::app);
-                if (payload_out_hex.is_open()) d_output_files.push_back(path);
-            }
+            // 【修复】直接写文件，不再碰 d_output_files
             if (payload_out_hex.is_open()) {
                 char buf[8];
                 for (int i = 0; i < len; ++i) {
@@ -390,11 +392,6 @@ namespace fengyun4
                 payload_out_hex.flush();
             }
 
-            if (!payload_out_bin.is_open()) {
-                std::string path = d_output_file_hint + ".bin";
-                payload_out_bin.open(path, std::ios::binary | std::ios::app);
-                if (payload_out_bin.is_open()) d_output_files.push_back(path);
-            }
             if (payload_out_bin.is_open()) {
                 payload_out_bin.write((const char *)data, len);
                 payload_out_bin.flush();
@@ -407,10 +404,7 @@ namespace fengyun4
                 stop_requested.store(false);
                 reset_sync_state();
 
-                if (!fft_in || !fft_out || !fft_plan) {
-                    logger->error("LoRa Demod process() aborted: FFTW was not correctly initialized.");
-                    return;
-                }
+                if (!fft_in || !fft_out || !fft_plan) return;
 
                 if (input_data_type == DATA_FILE && file_source) {
                     filesize = file_source->getFilesize();
@@ -421,6 +415,7 @@ namespace fengyun4
                 BaseDemodModule::start();
 
                 time_t lastTime = 0;
+                int ui_counter = 0;
 
                 while (demod_should_run() && !stop_requested.load()) {
                     int n = agc->output_stream->read();
@@ -429,18 +424,20 @@ namespace fengyun4
                     if (n > 0 && agc->output_stream->readBuf) {
                         complex_t *buf = agc->output_stream->readBuf;
                         
-                        // 删除了自定义SNR，使用基类的 snr_estimator
-                        snr_estimator.update(buf, n);
-                        snr = snr_estimator.snr();
-                        if (snr > peak_snr) peak_snr = snr;
-
-                        // 星座图：由于 LoRa 是宽带信号，推入时直接按 1/10 抽样即可
-                        constellation.pushComplex(buf, n);
+                        ui_counter++;
+                        if (ui_counter % 8 == 0) {
+                            snr_estimator.update(buf, n);
+                            snr = snr_estimator.snr();
+                            if (snr > peak_snr) peak_snr = snr;
+                            for (int i = 0; i < n; i += 128) {
+                                constellation.pushComplex(&buf[i], 1);
+                            }
+                        }
 
                         for (int i = 0; i < n; i++) {
                             complex_t s = buf[i];
-                            dc_state.real = s.real * (1.0f - dc_alpha) + dc_state.real * dc_alpha;
-                            dc_state.imag = s.imag * (1.0f - dc_alpha) + dc_state.imag * dc_alpha;
+                            dc_state.real = s.real * (1.0f - 0.999f) + dc_state.real * 0.999f;
+                            dc_state.imag = s.imag * (1.0f - 0.999f) + dc_state.imag * 0.999f;
                             s.real -= dc_state.real;
                             s.imag -= dc_state.imag;
                             sample_buffer.push_back(s);
@@ -587,13 +584,11 @@ namespace fengyun4
                     if (input_data_type == DATA_FILE && file_source)
                         progress = file_source->getPosition();
 
-                    if (time(NULL) % 10 == 0 && lastTime != time(NULL)) {
+                    if (time(NULL) % 5 == 0 && lastTime != time(NULL)) {
                         lastTime = time(NULL);
                         if (input_data_type == DATA_FILE && filesize > 0) {
                             double pct = round(((double)progress / (double)filesize) * 1000.0) / 10.0;
                             logger->info("Progress " + std::to_string(pct) + "%");
-                        } else {
-                            logger->info("Live Mode: Packets OK=%d, CRC fail=%d, SNR=%.1f dB", packets_ok, packets_crc_fail, snr);
                         }
                     }
                 }
@@ -622,7 +617,6 @@ namespace fengyun4
         {
             ImGui::Begin("Generic LoRa Demod", NULL, window ? 0 : NOWINDOW_FLAGS);
 
-            // --- 恢复星座图 ---
             ImGui::BeginGroup();
             constellation.draw();
             ImGui::EndGroup();
@@ -653,7 +647,6 @@ namespace fengyun4
 
                 ImGui::Text("Peak SNR: %.1f dB", peak_snr);
                 
-                // --- 恢复内置 FFT 绘制 ---
                 if (!streamingInput)
                     if (ImGui::Checkbox("Show FFT", &show_fft))
                         fft_splitter->set_enabled("fft", show_fft);
@@ -670,7 +663,6 @@ namespace fengyun4
             drawStopButton();
             ImGui::End();
 
-            // --- 绘制内置 FFT ---
             drawFFT();
         }
 
