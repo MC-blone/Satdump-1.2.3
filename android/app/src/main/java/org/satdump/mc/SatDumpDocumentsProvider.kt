@@ -1,3 +1,5 @@
+package org.satdump.mc
+
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.os.CancellationSignal

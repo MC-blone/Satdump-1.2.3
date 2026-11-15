@@ -26,7 +26,7 @@
         </activity>
 
     <provider
-        android:name="SatDumpDocumentsProvider"
+        android:name=".SatDumpDocumentsProvider" 
         android:authorities="org.satdump.mc.documents"
         android:exported="true"
         android:grantUriPermissions="true"
@@ -35,7 +35,7 @@
             <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
         </intent-filter>
     </provider>
-
+    
     </application>
 
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
