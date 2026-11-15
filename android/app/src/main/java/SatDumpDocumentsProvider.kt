@@ -1,5 +1,3 @@
-package com.altillimity.satdump
-
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.os.CancellationSignal
@@ -15,9 +13,8 @@ class SatDumpDocumentsProvider : DocumentsProvider() {
     companion object {
         private const val TAG = "SatDumpProvider"
         private const val ROOT_ID = "satdump_root"
-        private const val ROOT_LABEL = "SatDump" // 截图左侧显示的应用名称
+        private const val ROOT_LABEL = "SatDump" 
         
-        // 定义查询的列
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID, Root.COLUMN_MIME_TYPES, Root.COLUMN_FLAGS,
             Root.COLUMN_ICON, Root.COLUMN_TITLE, Root.COLUMN_SUMMARY,
@@ -34,7 +31,7 @@ class SatDumpDocumentsProvider : DocumentsProvider() {
         return true
     }
 
-    // 1. 告诉系统你暴露的根目录信息 (截图左侧的列表项)
+    // 告诉系统你暴露的根目录信息 (截图左侧的列表项)
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
         val row = result.newRow()
@@ -44,31 +41,35 @@ class SatDumpDocumentsProvider : DocumentsProvider() {
         row.add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_SEARCH)
         row.add(Root.COLUMN_TITLE, ROOT_LABEL)
         row.add(Root.COLUMN_MIME_TYPES, "*/*")
-        row.add(Root.COLUMN_ICON, R.mipmap.ic_launcher) // 使用你项目的应用图标
+        // 使用系统内置的文件夹图标，避免因为默认包找不到 R 类而报错
+        row.add(Root.COLUMN_ICON, android.R.drawable.ic_menu_agenda) 
         row.add(Root.COLUMN_DOCUMENT_ID, ROOT_ID)
         
         return result
     }
 
-    // 2. 当你点击左侧的 SatDump 后，右侧显示的目录列表
+    // 当用户点开某个文件夹时，返回里面的文件列表
     override fun queryChildDocuments(parentDocumentId: String, projection: Array<out String>?, sortOrder: String?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val parent = getFileForDocId(parentDocumentId)
         
         parent.listFiles()?.forEach { file ->
-            includeFile(result, file)
+            // 如果文件处于隐藏状态，可以选择不显示，这里默认全部显示
+            includeFile(result, file, parentDocumentId)
         }
         return result
     }
 
-    // 3. 查询单个文档的元数据
+    // 查询单个文档的元数据
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
-        includeFile(result, getFileForDocId(documentId))
+        val file = getFileForDocId(documentId)
+        val parentId = if (file.parentFile == context!!.filesDir) ROOT_ID else file.parentFile?.name ?: ROOT_ID
+        includeFile(result, file, parentId)
         return result
     }
 
-    // 4. 让其他应用能够读取/写入文件
+    // 让其他应用能够读取/写入文件
     override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
         val file = getFileForDocId(documentId)
         val accessMode = ParcelFileDescriptor.parseMode(mode)
@@ -88,16 +89,27 @@ class SatDumpDocumentsProvider : DocumentsProvider() {
             return context!!.filesDir
         }
         // 防止路径穿越攻击 (../)
-        if (documentId.contains("/") || documentId.contains("..")) {
+        if (documentId.contains("..")) {
             throw FileNotFoundException("Invalid document ID")
         }
-        return File(context!!.filesDir, documentId)
+        
+        // 因为可能存在子文件夹 (resources/pipelines)，这里直接构建绝对路径
+        val file = File(context!!.filesDir, documentId)
+        if (!file.exists()) {
+            throw FileNotFoundException("File not found: $documentId")
+        }
+        return file
     }
 
     // 将 File 对象的数据填入 Cursor 行中
-    private fun includeFile(cursor: MatrixCursor, file: File) {
-        // 为了简洁，直接用文件名作为 DocumentId (因为只暴露 filesDir 下的文件)
-        val documentId = file.name
+    private fun includeFile(cursor: MatrixCursor, file: File, parentDocumentId: String) {
+        // 用相对路径作为 DocumentId，以支持嵌套文件夹
+        val documentId = if (parentDocumentId == ROOT_ID) {
+            file.name
+        } else {
+            "$parentDocumentId/${file.name}"
+        }
+        
         val row = cursor.newRow()
         
         row.add(Document.COLUMN_DOCUMENT_ID, documentId)
@@ -112,6 +124,8 @@ class SatDumpDocumentsProvider : DocumentsProvider() {
         } else {
             row.add(Document.COLUMN_MIME_TYPE, "application/octet-stream")
             if (file.canWrite()) flags = flags or Document.FLAG_SUPPORTS_WRITE
+            // 允许删除
+            if (file.canWrite()) flags = flags or Document.FLAG_SUPPORTS_DELETE 
         }
         row.add(Document.COLUMN_FLAGS, flags)
     }
