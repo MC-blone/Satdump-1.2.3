@@ -25,17 +25,24 @@
             </intent-filter>
         </activity>
 
-    <provider
-        android:name=".SatDumpDocumentsProvider" 
-        android:authorities="org.satdump.mc.documents"
-        android:exported="true"
-        android:grantUriPermissions="true"
-        android:permission="android.permission.MANAGE_DOCUMENTS">
-        <intent-filter>
-            <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
-        </intent-filter>
-    </provider>
-    
+        <activity
+            android:name="android.app.Activity"
+            android:exported="true"
+            android:taskAffinity="org.satdump.mc.WakeUp"
+            android:excludeFromRecents="true"
+            android:noHistory="true" />
+
+        <provider
+            android:name="SatDumpDocumentsProvider"
+            android:authorities="org.satdump.mc.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
     </application>
 
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
@@ -43,7 +50,10 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.hardware.usb.host" />
     <uses-permission android:name="android.permission.USB_PERMISSION" />
+    
     <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
         android:resource="@xml/device_filter" />
+        
     <uses-permission android:name="libusb.android.USB_PERMISSION" />
-</manifest>
+
+</manifest>.
