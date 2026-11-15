@@ -15,6 +15,20 @@ namespace fengyun4
 {
     namespace emwin
     {
+        static int next_fast_fft_size(int n)
+        {
+            for (int v = n;; ++v)
+            {
+                int t = v;
+                const int factors[] = {2, 3, 5, 7};
+                for (int p : factors)
+                    while (t % p == 0)
+                        t /= p;
+                if (t == 1)
+                    return v;
+            }
+        }
+
         static uint8_t xorbits16(uint16_t data, uint16_t mask) {
             uint16_t v = data & mask;
             uint8_t r = 0;
@@ -101,21 +115,22 @@ namespace fengyun4
             if (parameters.count("sf")) sf = parameters["sf"].get<int>();
             if (parameters.count("bw")) bw_hz = parameters["bw"].get<int>();
             if (parameters.count("preamble_len")) preamble_len = parameters["preamble_len"].get<int>();
+            if (parameters.count("zero_padding_ratio")) zero_padding_ratio = parameters["zero_padding_ratio"].get<double>();
+            if (parameters.count("target_sps")) target_sps = parameters["target_sps"].get<float>();
 
             if (sf < 7 || sf > 12) sf = 9;
             if (bw_hz <= 0) bw_hz = 812500;
             if (preamble_len <= 1) preamble_len = 6;
-            
-            zero_padding_ratio = 5;
+            if (zero_padding_ratio <= 0.0) zero_padding_ratio = 10.0;
+
+            if (!std::isfinite(target_sps) || target_sps < 1.25f || target_sps > 8.0f)
+                target_sps = 2.0f;
 
             d_parameters.erase("max_sps");
             d_parameters.erase("min_sps");
             d_parameters.erase("custom_samplerate");
-            
-            MIN_SPS = 0.5f;
-            MAX_SPS = 1e9f;
 
-            if (d_symbolrate <= 0) d_symbolrate = (int)bw_hz;
+            if (d_symbolrate <= 0) d_symbolrate = bw_hz;
 
             name = "Generic LoRa Demod";
             show_freq = true;
@@ -131,15 +146,32 @@ namespace fengyun4
 
         void LoRaDemodModule::init()
         {
+            float input_sps = (float)d_samplerate / (float)bw_hz;
+            if (input_sps < 1.0f) {
+                logger->error("LoRa input sample rate is below bandwidth");
+                return;
+            }
+
+            float selected_sps = std::min(target_sps, input_sps);
+            MIN_SPS = selected_sps;
+            MAX_SPS = selected_sps;
+
             BaseDemodModule::initb();
-            
-            if (final_samplerate <= 0) final_samplerate = d_samplerate;
+
+            logger->info("LoRa Demod init: orig_samplerate=%ld, final_samplerate=%f", d_samplerate, final_samplerate);
 
             sample_num = (int)std::round(std::pow(2.0, sf) * (double)final_samplerate / (double)bw_hz);
-            if (sample_num <= 0) sample_num = 1291;
+            if (sample_num <= 0) return;
+
+            int target_fft = (int)std::round((double)sample_num * zero_padding_ratio);
+            fft_len = next_fast_fft_size(target_fft);
+            fft_scale = (double)fft_len / (double)sample_num;
             
-            bin_num = zero_padding_ratio * (1 << sf);
-            fft_len = sample_num * zero_padding_ratio;
+            bin_num = (int)std::round((double)fft_len * (double)bw_hz / (double)final_samplerate);
+            if (bin_num <= 0 || bin_num * 2 >= fft_len) {
+                logger->error("Invalid LoRa FFT dimensions");
+                return;
+            }
 
             init_chirps((double)final_samplerate);
             lpf = std::make_unique<BiquadCascade>(bw_hz / 2.0, (double)final_samplerate, 10);
@@ -186,7 +218,7 @@ namespace fengyun4
         void LoRaDemodModule::stop()
         {
             stop_requested.store(true);
-            if (input_data_type == DATA_FILE && file_source) file_source->stop();
+            BaseDemodModule::stop(); // 停止基类的 SmartResampler 等
         }
 
         std::pair<float, int> LoRaDemodModule::dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up)
@@ -201,7 +233,7 @@ namespace fengyun4
             fftwf_execute(fft_plan);
             fft_calls++;
             
-            volk_32fc_magnitude_squared_32f(mag_buffer.data(), (const lv_32fc_t*)fft_out, fft_len);
+            volk_32fc_magnitude_32f(mag_buffer.data(), (const lv_32fc_t*)fft_out, fft_len);
 
             float best_mag = 0.0f;
             int best = 0;
@@ -209,14 +241,14 @@ namespace fengyun4
                 float m = mag_buffer[i] + mag_buffer[fft_len - bin_num + i];
                 if (m > best_mag) { best_mag = m; best = i; }
             }
-            return {std::sqrt(best_mag), best};
+            return {best_mag, best};
         }
 
         int LoRaDemodModule::peak_idx_to_symbol(int peak_idx, int pre_bin)
         {
             int normalized = (peak_idx + bin_num - pre_bin) % bin_num;
             if (normalized < 0) normalized += bin_num;
-            double sym = (double)normalized / zero_padding_ratio;
+            double sym = (double)normalized / fft_scale;
             return (int)std::round(std::fmod(sym, (double)(1 << sf)));
         }
 
@@ -230,7 +262,7 @@ namespace fengyun4
 
             while (start < buf.size() - required) {
                 if (consecutive >= preamble_len - 1) {
-                    long long back = (long long)std::round((double)last_peak / zero_padding_ratio * 2.0);
+                    long long back = (long long)std::round((double)last_peak / fft_scale * 2.0);
                     long long p = (long long)start - back;
                     if (p < 0) p = 0;
                     return (size_t)p;
@@ -244,7 +276,7 @@ namespace fengyun4
                     if (diff < 0) diff += bin_num;
                     if (diff > bin_num / 2) diff = bin_num - diff;
 
-                    if (diff <= zero_padding_ratio * 10) consecutive++;
+                    if (diff <= fft_scale * 10) consecutive++;
                     else consecutive = 1;
                 } else {
                     consecutive = 1;
@@ -272,8 +304,8 @@ namespace fengyun4
             auto r = dechirp(buf, start, false);
             int pkd_bin = r.second;
             long long off;
-            if (pkd_bin + 1 > bin_num / 2) off = (long long)std::round((double)(pkd_bin - bin_num) / zero_padding_ratio);
-            else off = (long long)std::round((double)pkd_bin / zero_padding_ratio);
+            if (pkd_bin + 1 > bin_num / 2) off = (long long)std::round((double)(pkd_bin - bin_num) / fft_scale);
+            else off = (long long)std::round((double)pkd_bin / fft_scale);
             long long st = (long long)start + off;
             if (st < 0) st = 0;
             start = (size_t)st;
@@ -432,23 +464,21 @@ namespace fengyun4
 
                 if (input_data_type == DATA_FILE && file_source) {
                     filesize = file_source->getFilesize();
-                    file_source->start();
                 } else {
                     filesize = 0;
                 }
 
-                std::shared_ptr<dsp::stream<complex_t>> in_stream = (input_data_type == DATA_FILE) ? file_source->output_stream : input_stream;
-                if (!in_stream) return;
+                BaseDemodModule::start();
 
                 time_t lastTime = 0;
                 int ui_counter = 0;
 
                 while (demod_should_run() && !stop_requested.load()) {
-                    int n = in_stream->read();
+                    int n = agc->output_stream->read();
                     if (n < 0) break;
 
-                    if (n > 0 && in_stream->readBuf) {
-                        complex_t *buf = in_stream->readBuf;
+                    if (n > 0 && agc->output_stream->readBuf) {
+                        complex_t *buf = agc->output_stream->readBuf;
                         
                         ui_counter++;
                         if (ui_counter % 8 == 0) {
@@ -460,7 +490,6 @@ namespace fengyun4
                         for (int i = 0; i < n; i++) {
                             complex_t s = buf[i];
                             
-                            // IQ 反转（如果在 UI 上没勾的话，这里根据实际情况决定。这里默认启用反转）
                             s.imag = -s.imag;
                             
                             dc_state.real = s.real * (1.0f - 0.999f) + dc_state.real * 0.999f;
@@ -476,7 +505,7 @@ namespace fengyun4
                             }
                         }
                     }
-                    in_stream->flush();
+                    agc->output_stream->flush();
 
                     size_t overlap = (size_t)preamble_len * sample_num + 16 * sample_num;
                     while (true) {
@@ -516,8 +545,7 @@ namespace fengyun4
                             read_pos = pkt_start; break;
                         }
 
-                        // LDRO 状态必须在解 Header 之前设置
-                        ldro = ((double)(1 << sf) / (double)bw_hz) > 16e-3;
+                        ldro = true;
 
                         std::vector<uint16_t> hsym(8);
                         for (int i = 0; i < 8; ++i) {
@@ -576,7 +604,6 @@ namespace fengyun4
                         auto comp_all = dynamic_compensation(syms, sr.cfo);
                         auto gc_all = gray_coding(comp_all);
 
-                        // 【核心修复 1】Payload 中不包含 Header 半字节
                         std::vector<uint8_t> nib_all;
                         int rdd = coding_rate + 4;
                         for (size_t i = 8; i + (size_t)rdd <= gc_all.size(); i += rdd) {
@@ -594,7 +621,22 @@ namespace fengyun4
                             data[i] = (uint8_t)((nib_all[2 * i + 1] << 4) | nib_all[2 * i]);
                         }
 
-                        // 【核心修复 2】正确的 CRC 路径
+                        // 保存 CRC 校验前的原始文件和 Hex 文本
+                        {
+                            std::ofstream raw_bin("lora_pre_crc.bin", std::ios::app | std::ios::binary);
+                            raw_bin.write((const char*)data.data(), data.size());
+                            raw_bin.close();
+                            
+                            std::ofstream raw_hex("lora_pre_crc.hex.txt", std::ios::app);
+                            char hexbuf[8];
+                            for (int i = 0; i < data_len; ++i) {
+                                snprintf(hexbuf, sizeof(hexbuf), "%02X ", data[i]);
+                                raw_hex << hexbuf;
+                            }
+                            raw_hex << "\n";
+                            raw_hex.close();
+                        }
+
                         bool crc_ok = false;
                         std::vector<uint8_t> payload;
                         size_t required = (size_t)payload_len + (header_has_crc ? 2u : 0u);
@@ -657,7 +699,8 @@ namespace fengyun4
                     }
                 }
 
-                if (input_data_type == DATA_FILE && file_source) file_source->stop();
+                BaseDemodModule::stop();
+
                 if (payload_out_bin.is_open()) payload_out_bin.close();
                 if (payload_out_hex.is_open()) payload_out_hex.close();
             } catch (const std::exception &e) {
@@ -685,24 +728,15 @@ namespace fengyun4
 
         void LoRaDemodModule::drawUI(bool window)
         {
-            // 直接调用基类绘制，完美保留 SatDump 原生的 SNR 和 FFT 曲线
             BaseDemodModule::drawUI(window);
-            
-            // 在这里追加我们自己需要的统计信息（利用原生窗口的位置）
-            ImGui::Begin(name.c_str(), NULL, window ? 0 : NOWINDOW_FLAGS);
-            ImGui::Text("Preamble: %llu  Sync: %llu  Header: %llu",
-                (unsigned long long)preambles_detected.load(),
-                (unsigned long long)sync_found.load(),
-                (unsigned long long)headers_valid.load());
 
-            ImGui::Text("Sync fail: %llu  Header fail: %llu",
-                (unsigned long long)sync_failed.load(),
-                (unsigned long long)header_fail.load());
+            ImGui::Begin("LoRa Decoder Stats", NULL, window ? 0 : NOWINDOW_FLAGS);
 
-            ImGui::Text("Packets OK: %d  CRC fail: %d  FFT calls: %llu",
-                packets_ok.load(),
-                packets_crc_fail.load(),
-                (unsigned long long)fft_calls.load());
+            ImGui::Text("Preamble: %llu", (unsigned long long)preambles_detected.load());
+            ImGui::Text("Sync: %llu", (unsigned long long)sync_found.load());
+            ImGui::Text("Header: %llu", (unsigned long long)headers_valid.load());
+            ImGui::Text("FFT calls: %llu", (unsigned long long)fft_calls.load());
+
             ImGui::End();
         }
 
@@ -710,7 +744,7 @@ namespace fengyun4
 
         std::vector<std::string> LoRaDemodModule::getParameters()
         {
-            return {"samplerate", "sf", "bw", "preamble_len", "zero_padding_ratio", "baseband_format"};
+            return {"samplerate", "sf", "bw", "preamble_len", "zero_padding_ratio", "target_sps", "baseband_format"};
         }
 
         std::shared_ptr<ProcessingModule> LoRaDemodModule::getInstance(std::string input_file, std::string output_file_hint, nlohmann::json parameters)
