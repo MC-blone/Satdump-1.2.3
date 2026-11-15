@@ -56,4 +56,4 @@
         
     <uses-permission android:name="libusb.android.USB_PERMISSION" />
 
-</manifest>.
+</manifest>
