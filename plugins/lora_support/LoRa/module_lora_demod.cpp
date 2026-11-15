@@ -166,12 +166,23 @@ namespace fengyun4
             int target_fft = (int)std::round((double)sample_num * zero_padding_ratio);
             fft_len = next_fast_fft_size(target_fft);
             fft_scale = (double)fft_len / (double)sample_num;
+
+            int calc_bin = (int)std::round((double)fft_len * (double)bw_hz / (double)final_samplerate);
             
-            bin_num = (int)std::round((double)fft_len * (double)bw_hz / (double)final_samplerate);
-            if (bin_num <= 0 || bin_num * 2 >= fft_len) {
-                logger->error("Invalid LoRa FFT dimensions");
+            if (calc_bin * 2 >= fft_len) {
+                bin_num = (fft_len / 2) - 2;
+            } else {
+                bin_num = calc_bin;
+            }
+            bin_num = (bin_num / 2) * 2;
+
+            if (bin_num <= 0) {
+                logger->error("Invalid LoRa FFT dimensions: bin_num=%d, fft_len=%d", bin_num, fft_len);
                 return;
             }
+
+            logger->info("LoRa Demod FFT dimensions: sample_num=%d, bin_num=%d, fft_len=%d, fft_scale=%.2f",
+                         sample_num, bin_num, fft_len, fft_scale);
 
             init_chirps((double)final_samplerate);
             lpf = std::make_unique<BiquadCascade>(bw_hz / 2.0, (double)final_samplerate, 10);
@@ -184,7 +195,10 @@ namespace fengyun4
             
             memset(fft_in, 0, sizeof(fftwf_complex) * fft_len);
             fft_plan = fftwf_plan_dft_1d(fft_len, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
-            if (!fft_plan) return;
+            if (!fft_plan) {
+                logger->error("FFTW plan creation failed!");
+                return;
+            }
 
             sample_buffer.reserve((size_t)sample_num * 128);
 
@@ -218,7 +232,7 @@ namespace fengyun4
         void LoRaDemodModule::stop()
         {
             stop_requested.store(true);
-            BaseDemodModule::stop(); // 停止基类的 SmartResampler 等
+            BaseDemodModule::stop();
         }
 
         std::pair<float, int> LoRaDemodModule::dechirp(const std::vector<complex_t>& buf, size_t pos, bool is_up)
@@ -508,6 +522,8 @@ namespace fengyun4
                     agc->output_stream->flush();
 
                     size_t overlap = (size_t)preamble_len * sample_num + 16 * sample_num;
+                    if (overlap > sample_buffer.size()) overlap = sample_buffer.size();
+                    
                     while (true) {
                         size_t pkt_start;
                         try {

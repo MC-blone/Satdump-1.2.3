@@ -14,14 +14,14 @@ if (!(Test-Path "$binary_path\satdump.exe")) {
     $binary_path = $build_path
 }
 
-# ---- 探测插件目录：兼容 VS 多配置生成器的两种布局 ----
+# ---- Detect plugins dir: handle VS multi-config layouts ----
 $config = "Release"
 $plugin_candidates = @(
-    (Join-Path $binary_path "plugins"),                              # build\Release\plugins
-    (Join-Path $binary_path "plugins\$config"),                      # build\Release\plugins\Release
-    (Join-Path $build_path "plugins\$config"),                       # build\plugins\Release  ← ARM64 命中这里
-    (Join-Path $build_path "$config\plugins"),                       # build\Release\plugins
-    (Join-Path $build_path "plugins")                                # build\plugins
+    (Join-Path $binary_path "plugins"),
+    (Join-Path $binary_path "plugins\$config"),
+    (Join-Path $build_path "plugins\$config"),
+    (Join-Path $build_path "$config\plugins"),
+    (Join-Path $build_path "plugins")
 ) | Select-Object -Unique
 
 $plugin_path = $plugin_candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -196,7 +196,7 @@ foreach ($dll_to_copy in $dlls_to_copy.Values)
 Write-Output "Portable package created successfully."
 
 # ============================================================
-# 打包后检查：列出所有产物及其位置，并报告缺失的运行时依赖
+# POST-BUILD INSPECTION (ASCII only, safe for PS 5.1 / ANSI)
 # ============================================================
 
 Write-Output ""
@@ -225,7 +225,7 @@ foreach ($f in $portable_files) {
 Write-Output ""
 Write-Output ("Total: {0} file(s) in portable/" -f $portable_files.Count)
 
-# ---- 反向检查：每个产物的依赖是否都在 portable/ 里 ----
+# ---- Reverse check: every binary's deps present in portable/? ----
 Write-Output ""
 Write-Output "--- Dependency check (missing from portable/) ---"
 
@@ -234,7 +234,7 @@ foreach ($f in Get-ChildItem $portable_root -Recurse -File -Filter "*.dll") {
     $packaged_names[$f.Name.ToLowerInvariant()] = $true
 }
 
-# 系统 DLL 白名单：这些由 Windows 自带，不需要打包
+# System DLL allowlist: provided by Windows, do not package
 $system_dlls = @(
     "kernel32.dll","user32.dll","gdi32.dll","advapi32.dll","shell32.dll",
     "ole32.dll","oleaut32.dll","ws2_32.dll","crypt32.dll","bcrypt.dll",
@@ -263,7 +263,7 @@ foreach ($f in $portable_files) {
         $k = $d.ToLowerInvariant()
         if ($packaged_names.ContainsKey($k)) { continue }
         if ($system_set.ContainsKey($k))     { continue }
-        if ($k -like "api-ms-win-*")         { continue }  # API set 虚拟 DLL
+        if ($k -like "api-ms-win-*")         { continue }
         if ($k -like "ext-ms-*")             { continue }
         $missing += $d
     }
@@ -284,7 +284,7 @@ foreach ($f in $portable_files) {
 }
 
 if (-not $any_missing) {
-    Write-Output "  (none — all non-system dependencies are present)"
+    Write-Output "  (none - all non-system dependencies are present)"
 } else {
     Write-Output ""
     Write-Output "--- Summary: distinct missing DLLs ---"
@@ -293,11 +293,11 @@ if (-not $any_missing) {
         Write-Output ("  {0,-32} required by: {1}" -f $k, $users)
     }
     Write-Output ""
-    Write-Output "HINT: 把这些 DLL 从对应的构建/vcpkg install 目录手动补进 portable/，"
-    Write-Output "      或把它们的所在目录加入脚本里 `$available_dlls 的搜索范围。"
+    Write-Output "HINT: copy these DLLs from the build/vcpkg install dirs into portable/,"
+    Write-Output "      or add their directories to the `$available_dlls search path."
 }
 
-# ---- 额外：把源目录/构建目录里那些名字可疑但没被拷进来的 DLL 也提示一下 ----
+# ---- Extra: source-side DLLs not packaged (candidates for manual copy) ----
 Write-Output ""
 Write-Output "--- Source-side DLLs NOT packaged (candidates for manual copy) ---"
 
@@ -318,7 +318,6 @@ foreach ($d in $src_dlls) {
     $k = $d.Name.ToLowerInvariant()
     if ($packaged_full.ContainsKey($k)) { continue }
     if ($system_set.ContainsKey($k))    { continue }
-    # 只关心名字在“缺失清单”里出现过的，或名字像第三方运行库的
     $interesting = $false
     if ($missing_report.ContainsKey($k)) { $interesting = $true }
     if ($k -match '^(volk|libvolk|fftw|sndfile|soxr|zstd|lz4|hdf5|airspy|hackrf|limesuite|rtlsdr|bladerf|uhd|soapy)') {
@@ -330,7 +329,7 @@ foreach ($d in $src_dlls) {
 }
 
 if ($unpackaged.Count -eq 0) {
-    Write-Output "  (none found — 也可能是确实没编译出来，需要回头检查构建步骤)"
+    Write-Output "  (none found - library may not have been built at all; check build step)"
 } else {
     foreach ($d in ($unpackaged | Sort-Object FullName -Unique)) {
         Write-Output ("  {0}  ({1:N0} bytes)" -f $d.FullName, $d.Length)

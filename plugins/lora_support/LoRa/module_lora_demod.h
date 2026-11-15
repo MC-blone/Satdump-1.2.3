@@ -29,15 +29,13 @@ namespace fengyun4
             int sf = 9;
             int bw_hz = 812500;
             int preamble_len = 6;
-            double zero_padding_ratio = 10.0; // 这里保留为浮点
-            
-            // 新增：目标 SPS 和自适应缩放
-            float target_sps = 2.0f;
+            double zero_padding_ratio = 10.0;
             double fft_scale = 10.0;
+            float target_sps = 2.0f;
 
-            int sample_num = 1024; // 默认预期值，会在 init 中重新计算
-            int bin_num = 5120;
-            int fft_len = 10240;
+            int sample_num = 1291;
+            int bin_num = 2560;
+            int fft_len = 6455;
 
             fftwf_complex *fft_in = nullptr;
             fftwf_complex *fft_out = nullptr;
