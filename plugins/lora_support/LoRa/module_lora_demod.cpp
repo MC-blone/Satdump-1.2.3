@@ -614,7 +614,7 @@ namespace fengyun4
                                 crc_ok = true;
                             }
                         } else {
-                            logger->warning("LoRa decoded payload too short: have=%d need=%d", (int)data.size(), (int)required);
+                            logger->warn("LoRa decoded payload too short: have=%d need=%d", (int)data.size(), (int)required);
                         }
 
                         if (crc_ok) {

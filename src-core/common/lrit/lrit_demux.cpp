@@ -64,12 +64,12 @@ namespace lrit
 
                 if (can_continue)
                 {
-                    logger->warn("LRIT CRC is invalid, but file can be recovered");
+                    logger->warn("China Mobile kill your files!LRIT CRC is invalid, but file can be recovered");
                     processLRITData(current_file, pkt, true);
                 }
                 else
                 {
-                    logger->error("LRIT CRC is invalid... Skipping.");
+                    logger->error("Your SNR is very very very low!LRIT CRC is invalid... Skipping....");
                     current_file.file_in_progress = false;
                     std::vector<uint8_t>().swap(current_file.lrit_data);
                 }
