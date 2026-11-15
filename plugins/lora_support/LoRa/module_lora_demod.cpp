@@ -48,6 +48,26 @@ namespace fengyun4
             return crc;
         }
 
+        // 完全复现 Python 的 calc_crc(payload)，包含 0/1/2 长度特殊处理
+        static std::pair<uint8_t, uint8_t> calc_crc(const std::vector<uint8_t>& data)
+        {
+            if (data.empty())
+                return {0, 0};
+
+            if (data.size() == 1)
+                return {data[0], 0};
+
+            if (data.size() == 2)
+                return {data[1], data[0]};
+
+            uint16_t seq = crc_hqx(data.data(), data.size() - 2);
+
+            uint8_t high = (uint8_t)((seq >> 8) ^ data[data.size() - 2]);
+            uint8_t low = (uint8_t)((seq & 0xff) ^ data[data.size() - 1]);
+
+            return {low, high};
+        }
+
         static std::vector<uint8_t> calc_checksum(const std::vector<uint8_t>& data) {
             static const uint8_t M[5][12] = {
                 {1,1,1,1,0,0,0,0,0,0,0,0},
@@ -655,24 +675,36 @@ namespace fengyun4
 
                         bool crc_ok = false;
                         std::vector<uint8_t> payload;
+
                         size_t required = (size_t)payload_len + (header_has_crc ? 2u : 0u);
 
                         if (data.size() >= required) {
+                            // 只提取 Payload，不包含 CRC
+                            payload.assign(data.begin(), data.begin() + payload_len);
+
+                            // Python 只对 Payload 去白化
+                            dewhiten(payload);
+
                             if (header_has_crc) {
-                                std::vector<uint8_t> frame(data.begin(), data.begin() + required);
-                                dewhiten(frame);
-                                uint16_t crc = crc_hqx(frame.data(), (size_t)payload_len);
-                                uint8_t crc_low = (uint8_t)(crc & 0xff);
-                                uint8_t crc_high = (uint8_t)(crc >> 8);
-                                crc_ok = frame[payload_len] == crc_low && frame[payload_len + 1] == crc_high;
-                                payload.assign(frame.begin(), frame.begin() + payload_len);
+                                // 完全复现 Python calc_crc(payload)
+                                auto checksum = calc_crc(payload);
+
+                                // CRC 字节仍然来自未去白化的原始 data
+                                uint8_t received_low = data[payload_len];
+                                uint8_t received_high = data[payload_len + 1];
+
+                                logger->info("CRC: RX=%02X%02X CALC=%02X%02X",
+                                             received_low, received_high,
+                                             checksum.first, checksum.second);
+
+                                crc_ok = received_low == checksum.first &&
+                                         received_high == checksum.second;
                             } else {
-                                payload.assign(data.begin(), data.begin() + payload_len);
-                                dewhiten(payload);
                                 crc_ok = true;
                             }
                         } else {
-                            logger->warn("LoRa decoded payload too short: have=%d need=%d", (int)data.size(), (int)required);
+                            logger->warn("LoRa decoded payload too short: have=%d need=%d",
+                                         (int)data.size(), (int)required);
                         }
 
                         if (crc_ok) {
