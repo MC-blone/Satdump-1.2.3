@@ -4,6 +4,7 @@
 #include "common/codings/deframing/bpsk_ccsds_deframer.h"
 #include "common/codings/viterbi/viterbi_3_4.h"
 #include <fstream>
+#include <ctime>
 
 // ★ 引入需要的头文件
 #include "common/ccsds/ccsds_aos/demuxer.h"
@@ -15,11 +16,12 @@ namespace metop
     class MetOpAHRPTDecoderModule : public ProcessingModule
     {
     protected:
-        int d_viterbi_outsync_after;
+        int   d_viterbi_outsync_after;
         float d_viterbi_ber_thresold;
+        int   d_cadu_size;                     // ★ 可配置 CADU 大小(默认 1024)
 
         uint8_t *viterbi_out;
-        int8_t *soft_buffer;
+        int8_t  *soft_buffer;
 
         std::ifstream data_in;
         std::ofstream data_out;
@@ -31,12 +33,17 @@ namespace metop
 
         int errors[4];
 
-        // ★ 终极修复：正确的命名空间和类名
         noaa_metop::avhrr::AVHRRReader avhrr_reader;
         iasi::IASIIMGReader iasi_reader_img;
-        
+
         ccsds::ccsds_aos::Demuxer demuxer_vcid9;
         ccsds::ccsds_aos::Demuxer demuxer_vcid10;
+
+        // ★ Fix 状态管理
+        bool   use_fix           = false;
+        int    consecutive_syncs = 0;
+        time_t last_sync_time    = 0;
+        bool   fixing_active     = false;   // UI 据此显示 SYNCED(FIX)
 
         // UI Stuff
         float ber_history[200];

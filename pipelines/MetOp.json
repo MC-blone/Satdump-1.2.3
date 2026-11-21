@@ -3,20 +3,11 @@
         "name": "MetOp AHRPT",
         "live": true,
         "live_cfg": [
-            [
-                1,
-                0
-            ],
-            [
-                2,
-                0
-            ]
+            [1, 0],
+            [2, 0]
         ],
         "frequencies": [
-            [
-                "Main",
-                1701.3e6
-            ]
+            ["Main", 1701.3e6]
         ],
         "parameters": {
             "samplerate": {
@@ -33,6 +24,12 @@
                 "value": false,
                 "name": "Ignore Integrated TLE",
                 "description": "This is normally NOT needed or recommended, but if \nEUMETSAT admin messages are broken, this may be required."
+            },
+            "Use Fix": {
+                "type": "bool",
+                "value": false,
+                "name": "Use Fix",
+                "description": "Force-emit CADU frames when the Deframer is in NOSYNC but Viterbi is still locked. Only enable when the normal pipeline keeps dropping frames."
             }
         },
         "work": {
@@ -56,24 +53,16 @@
             }
         }
     },
+
     "metop_ahrpt_fix": {
         "name": "MetOp AHRPT(Fix)",
         "live": true,
         "live_cfg": [
-            [
-                1,
-                0
-            ],
-            [
-                2,
-                0
-            ]
+            [1, 0],
+            [2, 0]
         ],
         "frequencies": [
-            [
-                "Main",
-                1701.3e6
-            ]
+            ["Main", 1701.3e6]
         ],
         "parameters": {
             "samplerate": {
@@ -90,6 +79,12 @@
                 "value": true,
                 "name": "Ignore Integrated TLE",
                 "description": "This is normally NOT needed or recommended, but if \nEUMETSAT admin messages are broken, this may be required."
+            },
+            "Use Fix": {
+                "type": "bool",
+                "value": true,
+                "name": "Use Fix",
+                "description": "Force-emit CADU frames when the Deframer is in NOSYNC but Viterbi is still locked. Only enable when the normal pipeline keeps dropping frames."
             }
         },
         "work": {
@@ -113,15 +108,13 @@
             }
         }
     },
+
     "metop_dump": {
         "name": "MetOp X-Band Dump",
         "live": false,
         "live_cfg": [],
         "frequencies": [
-            [
-                "Main",
-                7800e6
-            ]
+            ["Main", 7800e6]
         ],
         "parameters": {
             "samplerate": {
