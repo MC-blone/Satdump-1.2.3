@@ -6,10 +6,9 @@
 #include <fstream>
 #include <ctime>
 
-// ★ 引入需要的头文件
 #include "common/ccsds/ccsds_aos/demuxer.h"
-#include "../instruments/avhrr/avhrr_reader.h"      // AVHRR 在 plugin 根目录
-#include "instruments/iasi/iasi_imaging_reader.h"   // IASI 在当前 metop 目录下
+#include "../instruments/avhrr/avhrr_reader.h"
+#include "instruments/iasi/iasi_imaging_reader.h"
 
 namespace metop
 {
@@ -18,7 +17,7 @@ namespace metop
     protected:
         int   d_viterbi_outsync_after;
         float d_viterbi_ber_thresold;
-        int   d_cadu_size;                     // ★ 可配置 CADU 大小(默认 1024)
+        int   d_cadu_size;
 
         uint8_t *viterbi_out;
         int8_t  *soft_buffer;
@@ -39,20 +38,23 @@ namespace metop
         ccsds::ccsds_aos::Demuxer demuxer_vcid9;
         ccsds::ccsds_aos::Demuxer demuxer_vcid10;
 
-        // ★ Fix 状态管理
+        // ★ Fix 状态
         bool   use_fix           = false;
         int    consecutive_syncs = 0;
         time_t last_sync_time    = 0;
-        bool   fixing_active     = false;   // UI 据此显示 SYNCED(FIX)
+        bool   fixing_active     = false;
 
-        // UI Stuff
-        float ber_history[200];
+        // ★ UI
+        bool   show_fix_window   = false;
+        float  ber_history[200];
 
     public:
         MetOpAHRPTDecoderModule(std::string input_file, std::string output_file_hint, nlohmann::json parameters);
         ~MetOpAHRPTDecoderModule();
-        void process();
-        void drawUI(bool window);
+        void init() override;
+        void stop() override;
+        void process() override;
+        void drawUI(bool window) override;
         std::vector<ModuleDataType> getInputTypes();
         std::vector<ModuleDataType> getOutputTypes();
 
